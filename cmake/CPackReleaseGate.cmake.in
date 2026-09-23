@@ -1,0 +1,256 @@
+if(NOT DEFINED CPACK_BUILD_CONFIG OR NOT CPACK_BUILD_CONFIG STREQUAL "Release")
+    message(FATAL_ERROR
+        "Standalone release packaging is Release-only; CPACK_BUILD_CONFIG is "
+        "'${CPACK_BUILD_CONFIG}'.")
+endif()
+
+if(NOT @FO4CS_VERIFY_SHADERS@ OR
+   NOT @BUILD_TESTING@ OR
+   NOT @FO4CS_BUILD_TESTS@)
+    message(FATAL_ERROR
+        "Release packaging requires strict shader verification, BUILD_TESTING, "
+        "and FO4CS_BUILD_TESTS in the configuration that built the DLL.")
+endif()
+
+if("@FO4CS_ALLOW_UNPINNED_COMMONLIBF4@" STREQUAL "ON")
+    message(FATAL_ERROR
+        "Standalone release packaging rejects FO4CS_ALLOW_UNPINNED_COMMONLIBF4=ON, "
+        "even when the current checkout happens to match the pin.")
+endif()
+if(NOT "@FO4CS_COMMONLIB_PIN_VERIFIED@" STREQUAL "TRUE")
+    message(FATAL_ERROR "The configured CommonLibF4 checkout was not pin-verified")
+endif()
+
+set(_fo4cs_source_archive "@FO4CS_RELEASE_SOURCE_ARCHIVE@")
+set(_fo4cs_source_hash_file "@FO4CS_RELEASE_SOURCE_ARCHIVE_HASH@")
+if(NOT EXISTS "${_fo4cs_source_archive}" OR
+   NOT EXISTS "${_fo4cs_source_hash_file}")
+    message(FATAL_ERROR
+        "Binary packaging is blocked until the adjacent Corresponding Source "
+        "ZIP and checksum are built by the release-source-package target.")
+endif()
+file(SHA256 "${_fo4cs_source_archive}" _fo4cs_actual_source_hash)
+string(TOLOWER "${_fo4cs_actual_source_hash}" _fo4cs_actual_source_hash)
+file(READ "${_fo4cs_source_hash_file}" _fo4cs_source_hash_evidence)
+string(REGEX MATCH "^([0-9A-Fa-f]+)[ \\t]+[^\\r\\n]+"
+    _fo4cs_source_hash_match "${_fo4cs_source_hash_evidence}")
+string(TOLOWER "${CMAKE_MATCH_1}" _fo4cs_expected_source_hash)
+if(NOT _fo4cs_source_hash_match OR
+   NOT _fo4cs_actual_source_hash STREQUAL _fo4cs_expected_source_hash)
+    message(FATAL_ERROR "The Corresponding Source ZIP checksum is missing or stale")
+endif()
+execute_process(
+    COMMAND "@FO4CS_POWERSHELL_EXECUTABLE@" -NoProfile -File
+        "@CMAKE_CURRENT_SOURCE_DIR@/scripts/verify_source_package.ps1"
+        -ArchivePath "${_fo4cs_source_archive}"
+        -ArchiveHashPath "${_fo4cs_source_hash_file}"
+        -ProjectRoot "@CMAKE_CURRENT_SOURCE_DIR@"
+        -CommonLibSource "@_commonlib_source@"
+        -GitExecutable "@GIT_EXECUTABLE@"
+        -Version "@PROJECT_VERSION@"
+        -ExpectedCommonLibCommit "@FO4CS_COMMONLIBF4_COMMIT@"
+        -ExpectedCommonLibSharedCommit "@FO4CS_COMMONLIB_SHARED_COMMIT@"
+        -VcpkgRoot "@_vcpkg_source_root@"
+        -VcpkgInstalledRoot "@VCPKG_INSTALLED_DIR@"
+        -VcpkgDownloadsRoot "@FO4CS_VCPKG_DOWNLOADS_ROOT@"
+        -VcpkgTriplet "@VCPKG_TARGET_TRIPLET@"
+        -VcpkgSourceLock "@FO4CS_VCPKG_SOURCE_LOCK@"
+    RESULT_VARIABLE _fo4cs_source_verify_result
+    OUTPUT_VARIABLE _fo4cs_source_verify_output
+    ERROR_VARIABLE _fo4cs_source_verify_error)
+if(NOT _fo4cs_source_verify_result EQUAL 0)
+    message(FATAL_ERROR
+        "The Corresponding Source archive does not match the current build inputs:\n"
+        "${_fo4cs_source_verify_output}${_fo4cs_source_verify_error}")
+endif()
+string(STRIP "${_fo4cs_source_verify_output}" _fo4cs_source_verify_output)
+message(STATUS "${_fo4cs_source_verify_output}")
+
+set(_fo4cs_plugin_binary "@FO4CS_RELEASE_PLUGIN_BINARY@")
+set(_fo4cs_binary_test_marker "@FO4CS_RELEASE_BINARY_TEST_MARKER@")
+if(NOT EXISTS "${_fo4cs_plugin_binary}" OR
+   NOT EXISTS "${_fo4cs_binary_test_marker}")
+    message(FATAL_ERROR
+        "Binary packaging is blocked until the current Release DLL passes its "
+        "VERSIONINFO/export/PE/runtime-import contract.")
+endif()
+file(READ "${_fo4cs_binary_test_marker}" _fo4cs_binary_test_evidence)
+string(JSON _binary_schema ERROR_VARIABLE _binary_schema_error GET
+    "${_fo4cs_binary_test_evidence}" SchemaVersion)
+string(JSON _binary_version ERROR_VARIABLE _binary_version_error GET
+    "${_fo4cs_binary_test_evidence}" Version)
+string(JSON _tested_binary_hash ERROR_VARIABLE _binary_hash_error GET
+    "${_fo4cs_binary_test_evidence}" BinarySHA256)
+string(JSON _binary_verified_utc ERROR_VARIABLE _binary_time_error GET
+    "${_fo4cs_binary_test_evidence}" VerifiedUTC)
+foreach(_error IN ITEMS
+        "${_binary_schema_error}" "${_binary_version_error}"
+        "${_binary_hash_error}" "${_binary_time_error}")
+    if(NOT _error STREQUAL "NOTFOUND")
+        message(FATAL_ERROR "The Release binary-test evidence is malformed: ${_error}")
+    endif()
+endforeach()
+file(SHA256 "${_fo4cs_plugin_binary}" _current_plugin_hash)
+string(TOUPPER "${_current_plugin_hash}" _current_plugin_hash)
+string(TOUPPER "${_tested_binary_hash}" _tested_binary_hash)
+if(NOT _binary_schema STREQUAL "1" OR
+   NOT _binary_version STREQUAL "@PROJECT_VERSION@.0" OR
+   NOT _current_plugin_hash STREQUAL _tested_binary_hash OR
+   _binary_verified_utc STREQUAL "")
+    message(FATAL_ERROR "The current DLL does not match its Release binary-test evidence")
+endif()
+
+set(_fo4cs_runtime_marker "@FO4CS_RELEASE_RUNTIME_MARKER@")
+if(NOT EXISTS "${_fo4cs_runtime_marker}")
+    message(FATAL_ERROR
+        "Standalone release packaging is blocked: no verified Fallout 4 "
+        "1.10.163 DFLight corpus marker exists. Build the release-package target "
+        "with FO4CS_FALLOUT4_PATH configured. Vanilla DXBC remains user-derived "
+        "and is never included in the archive.")
+endif()
+file(READ "${_fo4cs_runtime_marker}" _fo4cs_runtime_evidence)
+
+function(fo4cs_json_get output key)
+    string(JSON _value ERROR_VARIABLE _error GET "${_fo4cs_runtime_evidence}" "${key}")
+    if(NOT _error STREQUAL "NOTFOUND")
+        message(FATAL_ERROR
+            "The DFLight verification marker has no valid '${key}' field: ${_error}")
+    endif()
+    set("${output}" "${_value}" PARENT_SCOPE)
+endfunction()
+
+fo4cs_json_get(_schema SchemaVersion)
+fo4cs_json_get(_target_runtime TargetRuntime)
+fo4cs_json_get(_runtime Runtime)
+fo4cs_json_get(_fallout_hash Fallout4SHA256)
+fo4cs_json_get(_corpus_path CorpusPath)
+fo4cs_json_get(_shader_count ShaderCount)
+fo4cs_json_get(_corpus_hash AggregateSHA256)
+fo4cs_json_get(_verified_utc VerifiedUTC)
+
+if(NOT _schema STREQUAL "1")
+    message(FATAL_ERROR "Unsupported DFLight marker schema '${_schema}'")
+endif()
+if(NOT _target_runtime STREQUAL "1.10.163" OR
+   NOT _runtime STREQUAL "1.10.163.0")
+    message(FATAL_ERROR
+        "The DFLight marker targets '${_target_runtime}'/'${_runtime}', not 1.10.163")
+endif()
+foreach(_hash IN ITEMS "${_fallout_hash}" "${_corpus_hash}")
+    string(LENGTH "${_hash}" _hash_length)
+    if(NOT _hash_length EQUAL 64 OR NOT _hash MATCHES "^[0-9A-Fa-f]+$")
+        message(FATAL_ERROR "The DFLight marker contains an invalid SHA-256 value")
+    endif()
+endforeach()
+if(NOT _shader_count MATCHES "^[0-9]+$" OR _shader_count LESS 1000)
+    message(FATAL_ERROR
+        "The DFLight marker reports only '${_shader_count}' validated shaders")
+endif()
+if(NOT IS_DIRECTORY "${_corpus_path}")
+    message(FATAL_ERROR "The verified DFLight corpus no longer exists: ${_corpus_path}")
+endif()
+file(REAL_PATH "${_corpus_path}" _actual_corpus_path)
+file(REAL_PATH "@FO4CS_DFLIGHT_CORPUS_DIR@" _configured_corpus_path)
+string(TOLOWER "${_actual_corpus_path}" _actual_corpus_path_compare)
+string(TOLOWER "${_configured_corpus_path}" _configured_corpus_path_compare)
+if(NOT _actual_corpus_path_compare STREQUAL _configured_corpus_path_compare)
+    message(FATAL_ERROR
+        "The verification marker names a different corpus than this build configuration")
+endif()
+file(GLOB _corpus_files LIST_DIRECTORIES FALSE "${_corpus_path}/*.dxbc")
+list(SORT _corpus_files)
+list(LENGTH _corpus_files _current_shader_count)
+if(NOT _current_shader_count EQUAL _shader_count)
+    message(FATAL_ERROR
+        "The DFLight corpus changed after verification: marker=${_shader_count}, "
+        "current=${_current_shader_count}")
+endif()
+set(_current_corpus_hash_input "")
+set(_first_corpus_file TRUE)
+foreach(_corpus_file IN LISTS _corpus_files)
+    file(READ "${_corpus_file}" _dxbc_magic LIMIT 4 HEX)
+    string(TOUPPER "${_dxbc_magic}" _dxbc_magic)
+    if(NOT _dxbc_magic STREQUAL "44584243")
+        message(FATAL_ERROR "The verified corpus now contains invalid DXBC: ${_corpus_file}")
+    endif()
+    file(SHA256 "${_corpus_file}" _shader_hash)
+    string(TOUPPER "${_shader_hash}" _shader_hash)
+    get_filename_component(_shader_name "${_corpus_file}" NAME)
+    if(NOT _first_corpus_file)
+        string(APPEND _current_corpus_hash_input "\n")
+    endif()
+    set(_first_corpus_file FALSE)
+    string(APPEND _current_corpus_hash_input "${_shader_name}:${_shader_hash}")
+endforeach()
+string(SHA256 _current_corpus_hash "${_current_corpus_hash_input}")
+string(TOUPPER "${_current_corpus_hash}" _current_corpus_hash)
+string(TOUPPER "${_corpus_hash}" _marker_corpus_hash)
+if(NOT _current_corpus_hash STREQUAL _marker_corpus_hash)
+    message(FATAL_ERROR "The DFLight corpus content changed after verification")
+endif()
+
+set(_fallout_executable "@FO4CS_FALLOUT4_PATH@/Fallout4.exe")
+if(NOT EXISTS "${_fallout_executable}")
+    message(FATAL_ERROR "The configured Fallout4.exe no longer exists")
+endif()
+file(SHA256 "${_fallout_executable}" _current_fallout_hash)
+string(TOUPPER "${_current_fallout_hash}" _current_fallout_hash)
+string(TOUPPER "${_fallout_hash}" _marker_fallout_hash)
+if(NOT _current_fallout_hash STREQUAL _marker_fallout_hash)
+    message(FATAL_ERROR "Fallout4.exe changed after runtime verification")
+endif()
+if(_verified_utc STREQUAL "")
+    message(FATAL_ERROR "The DFLight marker has no verification timestamp")
+endif()
+
+set(_fo4cs_corpus_test_marker "@FO4CS_RELEASE_CORPUS_TEST_MARKER@")
+set(_fo4cs_shader_tools_test "@FO4CS_SHADER_TOOLS_TEST_BINARY@")
+if(NOT EXISTS "${_fo4cs_corpus_test_marker}")
+    message(FATAL_ERROR
+        "Binary packaging is blocked: the exhaustive ShaderTools corpus test "
+        "has not produced release evidence.")
+endif()
+if(NOT EXISTS "${_fo4cs_shader_tools_test}")
+    message(FATAL_ERROR "The Release ShaderTools test executable is missing")
+endif()
+file(READ "${_fo4cs_corpus_test_marker}" _fo4cs_corpus_test_evidence)
+function(fo4cs_test_json_get output key)
+    string(JSON _value ERROR_VARIABLE _error GET
+        "${_fo4cs_corpus_test_evidence}" "${key}")
+    if(NOT _error STREQUAL "NOTFOUND")
+        message(FATAL_ERROR
+            "The corpus-test marker has no valid '${key}' field: ${_error}")
+    endif()
+    set("${output}" "${_value}" PARENT_SCOPE)
+endfunction()
+fo4cs_test_json_get(_test_schema SchemaVersion)
+fo4cs_test_json_get(_test_corpus_path CorpusPath)
+fo4cs_test_json_get(_test_shader_count ShaderCount)
+fo4cs_test_json_get(_test_binary_hash TestExecutableSHA256)
+fo4cs_test_json_get(_test_runtime_marker_hash RuntimeMarkerSHA256)
+fo4cs_test_json_get(_test_verified_utc VerifiedUTC)
+if(NOT _test_schema STREQUAL "1" OR
+   NOT _test_shader_count EQUAL _shader_count OR
+   _test_verified_utc STREQUAL "")
+    message(FATAL_ERROR "The exhaustive ShaderTools corpus evidence is invalid")
+endif()
+file(REAL_PATH "${_test_corpus_path}" _test_corpus_real_path)
+string(TOLOWER "${_test_corpus_real_path}" _test_corpus_real_path)
+if(NOT _test_corpus_real_path STREQUAL _actual_corpus_path_compare)
+    message(FATAL_ERROR "The ShaderTools proof used a different DFLight corpus")
+endif()
+file(SHA256 "${_fo4cs_shader_tools_test}" _current_test_binary_hash)
+file(SHA256 "${_fo4cs_runtime_marker}" _current_runtime_marker_hash)
+string(TOUPPER "${_current_test_binary_hash}" _current_test_binary_hash)
+string(TOUPPER "${_current_runtime_marker_hash}" _current_runtime_marker_hash)
+string(TOUPPER "${_test_binary_hash}" _test_binary_hash)
+string(TOUPPER "${_test_runtime_marker_hash}" _test_runtime_marker_hash)
+if(NOT _current_test_binary_hash STREQUAL _test_binary_hash OR
+   NOT _current_runtime_marker_hash STREQUAL _test_runtime_marker_hash)
+    message(FATAL_ERROR
+        "The test executable or runtime evidence changed after exhaustive proof")
+endif()
+
+message(STATUS
+    "Using Fallout 4 ${_runtime} DFLight evidence: ${_shader_count} shaders, "
+    "aggregate SHA-256 ${_corpus_hash}")

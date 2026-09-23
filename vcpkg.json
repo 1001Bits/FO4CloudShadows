@@ -1,0 +1,17 @@
+{
+  "name": "fo4-cloud-shadows",
+  "version-string": "1.0.0",
+  "description": "Standalone Cloud Shadows mod for Fallout 4",
+  "license": "GPL-3.0-only",
+  "builtin-baseline": "36118ef68885436fd2a999188216337365856ad4",
+  "dependencies": [
+    {
+      "name": "spdlog",
+      "features": [
+        "wchar"
+      ]
+    },
+    "nlohmann-json",
+    "detours"
+  ]
+}

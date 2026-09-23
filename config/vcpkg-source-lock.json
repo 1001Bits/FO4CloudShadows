@@ -1,0 +1,40 @@
+{
+  "SchemaVersion": 1,
+  "VcpkgBaseline": "36118ef68885436fd2a999188216337365856ad4",
+  "Triplet": "x64-windows-static-md",
+  "TripletSHA256": "340b298dc62b444353afe2799ba0d05407d0d1489d6ef0f3625de5068c01857b",
+  "Packages": [
+    {
+      "Name": "detours",
+      "PortVersion": "2025-06-20",
+      "SourcePackage": "microsoft/Detours",
+      "SourceRevision": "9764cebcb1a75940e68fa83d6730ffaf0f669401",
+      "Archive": "microsoft-Detours-9764cebcb1a75940e68fa83d6730ffaf0f669401.tar.gz",
+      "ArchiveSHA256": "6c4397d5eab3372af971b18f5a07d61ad7a61ab7abecbcded4ce5381058e8313"
+    },
+    {
+      "Name": "fmt",
+      "PortVersion": "12.1.0",
+      "SourcePackage": "fmtlib/fmt",
+      "SourceRevision": "12.1.0",
+      "Archive": "fmtlib-fmt-12.1.0.tar.gz",
+      "ArchiveSHA256": "ea7de4299689e12b6dddd392f9896f08fb0777ac7168897a244a6d6085043fea"
+    },
+    {
+      "Name": "nlohmann-json",
+      "PortVersion": "3.12.0#2",
+      "SourcePackage": "nlohmann/json",
+      "SourceRevision": "v3.12.0",
+      "Archive": "nlohmann-json-v3.12.0.tar.gz",
+      "ArchiveSHA256": "4b92eb0c06d10683f7447ce9406cb97cd4b453be18d7279320f7b2f025c10187"
+    },
+    {
+      "Name": "spdlog",
+      "PortVersion": "1.17.0",
+      "SourcePackage": "gabime/spdlog",
+      "SourceRevision": "v1.17.0",
+      "Archive": "gabime-spdlog-v1.17.0.tar.gz",
+      "ArchiveSHA256": "d8862955c6d74e5846b3f580b1605d2428b11d97a410d86e2fb13e857cd3a744"
+    }
+  ]
+}

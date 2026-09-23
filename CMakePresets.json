@@ -1,0 +1,92 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "fast-universal",
+      "displayName": "Fast universal OG + AE + VR developer build",
+      "generator": "Visual Studio 17 2022",
+      "binaryDir": "${sourceDir}/out/build/fast-universal",
+      "architecture": {
+        "value": "x64",
+        "strategy": "set"
+      },
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": {
+          "type": "FILEPATH",
+          "value": "$env{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        },
+        "VCPKG_TARGET_TRIPLET": "x64-windows-static-md"
+      }
+    },
+    {
+      "name": "validation",
+      "displayName": "Universal focused validation build",
+      "inherits": "fast-universal",
+      "binaryDir": "${sourceDir}/out/build/validation",
+      "cacheVariables": {
+        "BUILD_TESTING": true,
+        "FO4CS_BUILD_TESTS": true
+      }
+    },
+    {
+      "name": "windows-vs2022",
+      "displayName": "Compatibility alias for universal developer build",
+      "inherits": "fast-universal",
+      "binaryDir": "${sourceDir}/out/build/windows-vs2022"
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "fast-universal",
+      "configurePreset": "fast-universal",
+      "configuration": "Release",
+      "targets": [
+        "FO4CloudShadows"
+      ]
+    },
+    {
+      "name": "stage",
+      "configurePreset": "fast-universal",
+      "configuration": "Release",
+      "targets": [
+        "stage"
+      ]
+    },
+    {
+      "name": "validation",
+      "configurePreset": "validation",
+      "configuration": "Release",
+      "targets": [
+        "validation-build"
+      ]
+    },
+    {
+      "name": "release",
+      "configurePreset": "windows-vs2022",
+      "configuration": "Release",
+      "targets": [
+        "FO4CloudShadows"
+      ]
+    }
+  ],
+  "testPresets": [
+    {
+      "name": "validation",
+      "configurePreset": "validation",
+      "configuration": "Release",
+      "filter": {
+        "include": {
+          "label": "core"
+        }
+      },
+      "output": {
+        "outputOnFailure": true
+      }
+    }
+  ]
+}

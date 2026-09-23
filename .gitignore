@@ -1,0 +1,36 @@
+# CMake and IDE output
+/build/
+/out/
+/.vs/
+/.idea/
+CMakeUserPresets.json
+*.user
+*.suo
+*.vcxproj.user
+
+# vcpkg manifest output is reproducible from vcpkg.json
+/vcpkg_installed/
+
+# Generated packages, symbols, and captures
+/*.zip
+/*.7z
+*.pdb
+*.rdc
+/captures/
+
+# Generated source-tree convenience mirror. shaders/ is canonical; CMake stages it
+# directly. Run the explicit sync-runtime-assets target only for manual testing.
+/Data/Shaders/CloudShadows/
+/Data/Shaders/Features/CloudShadows.ini
+/Data/Interface/FO4CloudShadows/Fonts/Jost/
+/Data/F4SE/Plugins/FO4CloudShadows.dll
+/Data/F4SE/Plugins/FO4CloudShadows.pdb
+
+# Logs and local settings
+*.log
+/Data/Shaders/Features/CloudShadows.json
+/Data/Shaders/Features/FO4CloudShadows.assets.json
+
+# OS
+Thumbs.db
+.DS_Store

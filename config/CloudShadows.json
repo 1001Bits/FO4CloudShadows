@@ -1,0 +1,9 @@
+{
+  "ProjectionModelVersion": 4,
+  "Enabled": true,
+  "GodrayCloudOcclusion": false,
+  "Opacity": 2.0,
+  "CloudHeight": 10000.0,
+  "CaptureMethod": 0,
+  "Hotkeys": false
+}

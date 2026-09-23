@@ -1,0 +1,40 @@
+{
+  "modName": "FO4CloudShadows",
+  "displayName": "Cloud Shadows",
+  "minMcmVersion": 1,
+  "content": [
+    { "type": "section", "text": "Cloud Shadows" },
+    {
+      "id": "bEnabled:CloudShadows",
+      "type": "switcher",
+      "text": "Enable cloud shadows",
+      "help": "Shadows from the moving clouds dim direct sunlight outdoors. F10 temporarily toggles the effect for comparison. Default: enabled.",
+      "valueOptions": { "sourceType": "ModSettingBool" }
+    },
+    {
+      "id": "fOpacity:CloudShadows",
+      "type": "slider",
+      "text": "Shadow opacity",
+      "help": "Controls how strongly clouds dim direct sunlight. Default: 2.0.",
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "iCaptureMethod:CloudShadows",
+      "type": "dropdown",
+      "text": "Cloud shadow method",
+      "help": "Cubemap: six cloud faces around the player (default). Sun-oriented 2D map: a single map facing the sun; cheaper, but its coverage is finite and fades near its edge.",
+      "valueOptions": { "sourceType": "ModSettingInt", "options": [ "Cubemap", "Sun-oriented 2D map" ] }
+    },
+    {
+      "id": "bHotkeys:CloudShadows",
+      "type": "switcher",
+      "text": "Enable hotkeys and the F11 menu",
+      "help": "Off by default. When on: F11 opens the in-game Cloud Shadows menu (saves when closed), F10 toggles cloud shadows for a quick comparison, F8 cycles the sky-alignment preview, F7 hides the preview and status. Default: off.",
+      "valueOptions": { "sourceType": "ModSettingBool" }
+    },
+    { "type": "spacer" },
+    { "type": "text", "text": "Changes save automatically and apply within two seconds." },
+    { "type": "text", "text": "Hotkeys are off unless enabled above. Values saved by the F11 menu show here after restarting Fallout." },
+    { "type": "text", "text": "With ENB's own cloud shadows enabled (enbseries.ini EnableCloudShadows=true) this mod stays inactive and ENB draws the cloud shadows. Restart the game after changing that ENB setting." }
+  ]
+}
