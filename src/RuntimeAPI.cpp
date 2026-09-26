@@ -6,6 +6,8 @@
 #include <winver.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <bit>
 #include <charconv>
 #include <fstream>
@@ -21,6 +23,42 @@ namespace
     static_assert(std::endian::native == std::endian::little);
 
     constexpr std::uint64_t kMaximumAddressCount = 10'000'000;
+
+    // Per-thread, per-frame memory of readable spans. Only positive results
+    // are kept; a span freed mid-frame is still read under the callers' SEH
+    // guards, exactly as before a validation that raced the free.
+    std::atomic<std::uint64_t> g_validationEpoch{ 1 };
+    struct ValidatedSpan
+    {
+        std::uintptr_t first{};
+        std::uintptr_t last{};
+        std::uint64_t epoch{};
+    };
+    thread_local std::array<ValidatedSpan, 16> t_validatedSpans{};
+    thread_local std::uint32_t t_nextValidatedSpan = 0;
+
+    [[nodiscard]] bool IsRecentlyValidated(
+        std::uintptr_t address, std::uintptr_t end) noexcept
+    {
+        const auto epoch = g_validationEpoch.load(std::memory_order_relaxed);
+        for (const auto& span : t_validatedSpans) {
+            if (span.epoch == epoch && address >= span.first && end <= span.last)
+                return true;
+        }
+        return false;
+    }
+
+    void RememberValidated(std::uintptr_t address, std::uintptr_t end) noexcept
+    {
+        const std::uintptr_t page = FO4CS::ResidentPages::PageSize();
+        if (page == 0 || end > (std::numeric_limits<std::uintptr_t>::max)() - page)
+            return;
+        auto& span = t_validatedSpans[t_nextValidatedSpan++ % t_validatedSpans.size()];
+        span.first = address - address % page;
+        // Page granularity: every byte of every covered page was proven.
+        span.last = end % page == 0 ? end : end + (page - end % page);
+        span.epoch = g_validationEpoch.load(std::memory_order_relaxed);
+    }
 
     void AssignError(std::string& destination, std::string_view value) noexcept
     {
@@ -449,9 +487,15 @@ namespace FO4CS
 
         const auto end = address + byteCount;
         if (kind == AddressKind::kReadable) {
+            if (IsRecentlyValidated(address, end))
+                return true;
             const auto resident = ResidentPages::Check(address, byteCount);
-            if (resident != ResidentPages::Result::Unknown)
-                return resident == ResidentPages::Result::Readable;
+            if (resident != ResidentPages::Result::Unknown) {
+                if (resident != ResidentPages::Result::Readable)
+                    return false;
+                RememberValidated(address, end);
+                return true;
+            }
         }
         auto cursor = address;
         while (cursor < end) {
@@ -495,7 +539,14 @@ namespace FO4CS
                 return false;
             cursor = (std::min)(end, regionEnd);
         }
+        if (kind == AddressKind::kReadable)
+            RememberValidated(address, end);
         return true;
+    }
+
+    void RuntimeAPI::AdvanceValidationEpoch() noexcept
+    {
+        g_validationEpoch.fetch_add(1, std::memory_order_relaxed);
     }
 
     std::filesystem::path RuntimeAPI::AddressDatabasePath() const

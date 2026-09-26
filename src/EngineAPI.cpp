@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <cmath>
+#include <mutex>
 
 namespace
 {
@@ -93,17 +94,27 @@ namespace
         }
     }
 
+    // A failed exact-ID/RVA resolution is deterministic for the loaded
+    // image: remember it instead of re-taking the database lock and building
+    // an error string on every per-frame accessor call.
+    constexpr std::uintptr_t kResolutionFailed =
+        (std::numeric_limits<std::uintptr_t>::max)();
+
     [[nodiscard]] std::uintptr_t ResolveCachedAddress(
         std::atomic<std::uintptr_t>& cache,
         const ReviewedSymbol& symbol,
         AddressKind kind) noexcept
     {
         auto address = cache.load(std::memory_order_acquire);
+        if (address == kResolutionFailed)
+            return 0;
         if (address != 0)
             return address;
         address = ResolveReviewedSymbol(symbol, kind);
         if (address != 0)
             cache.store(address, std::memory_order_release);
+        else if (RuntimeAPI::GetSingleton().IsInitialized())
+            cache.store(kResolutionFailed, std::memory_order_release);
         return address;
     }
 
@@ -420,6 +431,10 @@ namespace FO4CS::EngineAPI
         static std::atomic<std::uintptr_t> getEntryCache{ 0 };
         static std::atomic<bool> requested{ false };
         static void* entry = nullptr;
+        // F11 open/close can race the host-menu thread; the lazy string entry
+        // and the requested flag change together.
+        static std::mutex requestMutex;
+        std::lock_guard lock(requestMutex);
         if (!show && !requested.load(std::memory_order_acquire))
             return true; // Never hide a cursor menu this plugin did not request.
         auto* queue = ResolveIndirectObject<UIMessageQueueObject>(

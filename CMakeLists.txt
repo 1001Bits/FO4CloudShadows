@@ -279,32 +279,24 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
         COMMAND "$<TARGET_FILE:FO4CloudShadowsShaderToolsTests>")
     set_tests_properties(shadertools-contract PROPERTIES LABELS core TIMEOUT 60)
 
-    add_executable(FO4CloudShadowsSkyCloudMrtTests EXCLUDE_FROM_ALL
-        tests/SkyCloudCompatibilityTests.cpp
-        tests/SkyCloudMrtPatcherTests.cpp
-        src/ShaderTools/DXBCPatcher.cpp
-        src/ShaderTools/SkyCloudMrtPatcher.cpp)
-    target_compile_features(FO4CloudShadowsSkyCloudMrtTests PRIVATE cxx_std_23)
-    target_compile_definitions(FO4CloudShadowsSkyCloudMrtTests PRIVATE
+    add_executable(FO4CloudShadowsSkyCloudCompatibilityTests EXCLUDE_FROM_ALL
+        tests/SkyCloudCompatibilityTests.cpp)
+    target_compile_features(FO4CloudShadowsSkyCloudCompatibilityTests PRIVATE cxx_std_23)
+    target_compile_definitions(FO4CloudShadowsSkyCloudCompatibilityTests PRIVATE
         NOMINMAX WIN32_LEAN_AND_MEAN)
-    target_precompile_headers(FO4CloudShadowsSkyCloudMrtTests PRIVATE
-        tests/ShaderToolsTestPCH.h)
-    target_include_directories(FO4CloudShadowsSkyCloudMrtTests PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    target_link_libraries(FO4CloudShadowsSkyCloudMrtTests PRIVATE
-        spdlog::spdlog d3d11.lib d3dcompiler.lib)
-    target_compile_options(FO4CloudShadowsSkyCloudMrtTests PRIVATE
-        /W4 /WX /utf-8 /permissive- /Zc:__cplusplus /Zc:preprocessor
-        /Zc:threadSafeInit)
-    set_target_properties(FO4CloudShadowsSkyCloudMrtTests PROPERTIES
+    target_link_libraries(FO4CloudShadowsSkyCloudCompatibilityTests PRIVATE
+        d3d11.lib d3dcompiler.lib)
+    target_compile_options(FO4CloudShadowsSkyCloudCompatibilityTests PRIVATE
+        /W4 /WX /utf-8 /permissive- /Zc:__cplusplus /Zc:preprocessor)
+    set_target_properties(FO4CloudShadowsSkyCloudCompatibilityTests PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin/$<CONFIG>")
-    add_test(NAME sky-cloud-mrt-contract
-        COMMAND "$<TARGET_FILE:FO4CloudShadowsSkyCloudMrtTests>")
-    set_tests_properties(sky-cloud-mrt-contract PROPERTIES
-        LABELS core TIMEOUT 30)
+    add_test(NAME sky-cloud-compatibility-contract
+        COMMAND "$<TARGET_FILE:FO4CloudShadowsSkyCloudCompatibilityTests>")
+    set_tests_properties(sky-cloud-compatibility-contract PROPERTIES
+        LABELS core TIMEOUT 60)
 
     add_executable(FO4CloudShadowsRendererTests EXCLUDE_FROM_ALL
-        tests/CloudRendererTests.cpp src/CloudMotionResolver.cpp
+        tests/CloudRendererTests.cpp
         src/CloudGeometryCapture.cpp src/CloudCubePreview.cpp src/GodrayCloudShader.cpp)
     target_compile_features(FO4CloudShadowsRendererTests PRIVATE cxx_std_23)
     target_compile_definitions(FO4CloudShadowsRendererTests PRIVATE
@@ -364,7 +356,7 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
         FO4CloudShadowsMcmSettingsTests
         FO4CloudShadowsWorldAnchorTests
         FO4CloudShadowsFrameRateTests
-        FO4CloudShadowsShaderToolsTests FO4CloudShadowsSkyCloudMrtTests
+        FO4CloudShadowsShaderToolsTests FO4CloudShadowsSkyCloudCompatibilityTests
         FO4CloudShadowsRendererTests FO4CloudShadowsGodraySettingsTests
         FO4CloudShadowsRuntimeLifecycleTests
         FO4CloudShadowsCpuStageProfilerTests FO4CloudShadowsResidentPageValidationTests)
@@ -375,26 +367,38 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}/cmake/VerifyReleaseContract.cmake"
         VERBATIM)
     add_dependencies(validation-build release-contract-check)
-    add_test(NAME binary-contract
-        COMMAND "${FO4CS_POWERSHELL_EXECUTABLE}" -NoProfile -File
-            "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_built_binary.ps1"
-            -BinaryPath "$<TARGET_FILE:FO4CloudShadows>"
-            -DumpbinPath "${FO4CS_DUMPBIN_EXECUTABLE}"
-            -ExpectedVersion "${PROJECT_VERSION}.0")
-    set_tests_properties(binary-contract PROPERTIES LABELS core TIMEOUT 60)
-    if(NOT FO4CS_ENABLE_DEVELOPER_TOOLS AND NOT FO4CS_ENABLE_PRIVATE_PROFILING)
-        add_test(NAME release-features-contract
+    # The binary and acceptance-protocol contracts and the release package are
+    # driven by the release tooling in scripts/, which is not part of every
+    # source checkout. They are registered only where that tooling exists.
+    set(_fo4cs_scripts "${CMAKE_CURRENT_SOURCE_DIR}/scripts")
+    if(EXISTS "${_fo4cs_scripts}/verify_built_binary.ps1")
+        add_test(NAME binary-contract
             COMMAND "${FO4CS_POWERSHELL_EXECUTABLE}" -NoProfile -File
-                "${CMAKE_CURRENT_SOURCE_DIR}/scripts/verify_built_binary.ps1"
+                "${_fo4cs_scripts}/verify_built_binary.ps1"
                 -BinaryPath "$<TARGET_FILE:FO4CloudShadows>"
                 -DumpbinPath "${FO4CS_DUMPBIN_EXECUTABLE}"
-                -ExpectedVersion "${PROJECT_VERSION}.0" -RequireReleaseFeatures)
-        set_tests_properties(release-features-contract PROPERTIES LABELS core TIMEOUT 60)
+                -ExpectedVersion "${PROJECT_VERSION}.0")
+        set_tests_properties(binary-contract PROPERTIES LABELS core TIMEOUT 60)
+        if(NOT FO4CS_ENABLE_DEVELOPER_TOOLS AND NOT FO4CS_ENABLE_PRIVATE_PROFILING)
+            add_test(NAME release-features-contract
+                COMMAND "${FO4CS_POWERSHELL_EXECUTABLE}" -NoProfile -File
+                    "${_fo4cs_scripts}/verify_built_binary.ps1"
+                    -BinaryPath "$<TARGET_FILE:FO4CloudShadows>"
+                    -DumpbinPath "${FO4CS_DUMPBIN_EXECUTABLE}"
+                    -ExpectedVersion "${PROJECT_VERSION}.0" -RequireReleaseFeatures)
+            set_tests_properties(release-features-contract PROPERTIES LABELS core TIMEOUT 60)
+        endif()
     endif()
-    add_test(NAME acceptance-protocol-contract
-        COMMAND "${FO4CS_POWERSHELL_EXECUTABLE}" -NoProfile -File
-            "${CMAKE_CURRENT_SOURCE_DIR}/tests/AcceptanceProtocolTests.ps1")
-    set_tests_properties(acceptance-protocol-contract PROPERTIES LABELS core TIMEOUT 30)
+    if(EXISTS "${_fo4cs_scripts}/run_ingame_acceptance.ps1")
+        add_test(NAME acceptance-protocol-contract
+            COMMAND "${FO4CS_POWERSHELL_EXECUTABLE}" -NoProfile -File
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/AcceptanceProtocolTests.ps1")
+        set_tests_properties(acceptance-protocol-contract PROPERTIES LABELS core TIMEOUT 30)
+    endif()
+endif()
+
+if(BUILD_TESTING AND FO4CS_BUILD_TESTS AND
+   EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/package_candidate.ps1")
     add_custom_target(release-package
         COMMAND "${CMAKE_COMMAND}" -DACTIVE_CONFIG=$<CONFIG>
             -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/RequireReleaseConfig.cmake"
@@ -430,11 +434,21 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/config/MCM/"
     FILES_MATCHING PATTERN "*.json" PATTERN "*.ini")
 install(FILES ${FO4CS_FONT_FILES}
     DESTINATION "Data/Interface/FO4CloudShadows/Fonts/Jost" COMPONENT Runtime)
-install(FILES LICENSE EXCEPTIONS.md THIRD_PARTY_NOTICES.md SOURCE_DELIVERY.md
-    README.md DESTINATION "." COMPONENT Runtime)
-install(DIRECTORY licenses/ DESTINATION licenses COMPONENT Runtime)
-install(DIRECTORY docs/ DESTINATION docs COMPONENT Runtime
-    FILES_MATCHING PATTERN "*.md")
+# Licence texts and documentation ship with release packages built from the
+# full project tree; a source-only checkout installs the runtime alone.
+foreach(_fo4cs_document IN ITEMS LICENSE EXCEPTIONS.md THIRD_PARTY_NOTICES.md
+        SOURCE_DELIVERY.md README.md)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${_fo4cs_document}")
+        install(FILES "${_fo4cs_document}" DESTINATION "." COMPONENT Runtime)
+    endif()
+endforeach()
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/licenses")
+    install(DIRECTORY licenses/ DESTINATION licenses COMPONENT Runtime)
+endif()
+if(IS_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/docs")
+    install(DIRECTORY docs/ DESTINATION docs COMPONENT Runtime
+        FILES_MATCHING PATTERN "*.md")
+endif()
 
 # Fast developer staging never depends on shader/corpus tests.  It does depend
 # on the DLL, and always takes HLSL directly from the canonical shaders/ tree.
@@ -477,7 +491,7 @@ add_custom_target(sync-runtime-assets
     COMMENT "Synchronizing and verifying the canonical Data convenience mirror"
     VERBATIM)
 
-if(FO4CS_GAME_PATH)
+if(FO4CS_GAME_PATH AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/scripts/deploy_stage.ps1")
     find_program(FO4CS_POWERSHELL_EXECUTABLE
         NAMES pwsh.exe pwsh powershell.exe powershell REQUIRED)
     add_custom_target(deploy

@@ -118,6 +118,12 @@ namespace FO4CS
             std::size_t byteCount,
             AddressKind kind) const noexcept;
 
+        // Readable spans proven valid are remembered per thread until the
+        // next authoritative frame boundary calls this. Engine singletons and
+        // shader objects outlive a frame, so one proof per frame replaces
+        // roughly a hundred working-set queries.
+        static void AdvanceValidationEpoch() noexcept;
+
         [[nodiscard]] std::filesystem::path AddressDatabasePath() const;
         [[nodiscard]] std::string LastError() const;
 

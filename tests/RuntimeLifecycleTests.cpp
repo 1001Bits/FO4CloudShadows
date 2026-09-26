@@ -1,9 +1,12 @@
 // Tests the state owner used by WorldClouds and actual callback retirement.
 #include "CloudFramePublication.h"
+#include "GraphicsProxyCompat.h"
+#include "MainViewViewport.h"
 #include "RendererLifetime.h"
 #include <array>
 #include <atomic>
 #include <iostream>
+#include <limits>
 #include <semaphore>
 #include <stdexcept>
 #include <thread>
@@ -71,36 +74,41 @@ void TestPublication()
     const auto lastEyeFrame = frame.PublishedEpoch();
     const auto lastReadIndex = frame.ReadIndex();
     for (unsigned i = 0; i < 10000; ++i) {
-        Require(frame.CompletePresent(true, true) == Result::Retained &&
+        Require(frame.CompletePresent(true, false) == Result::Retained &&
             frame.PublishedEpoch() == lastEyeFrame && frame.ReadIndex() == lastReadIndex,
-            "repeated VR companion presents cannot withdraw or swap the last eye frame");
+            "repeated presents without a main-view render cannot withdraw or swap the last frame");
     }
     frame.Begin();
     cubes[frame.WriteIndex()] = 0; // The next real Sky can be entirely clear.
-    Require(frame.CompletePresent(true, true) == Result::Published &&
+    Require(frame.CompletePresent(true, false) == Result::Published &&
         frame.PublishedEpoch() > lastEyeFrame && cubes[frame.ReadIndex()] == 0,
         "a cloudless VR Sky replaces the previous cloud field");
     frame.Begin();
     frame.Reject();
-    Require(frame.CompletePresent(true, true) == Result::Withdrawn &&
+    Require(frame.CompletePresent(true, false) == Result::Withdrawn &&
         frame.PublishedEpoch() == 0,
-        "a rejected VR layer cannot reuse an older cloud field");
+        "a rejected layer cannot reuse an older cloud field");
     frame.Begin();
-    Require(frame.CompletePresent(true, true) == Result::Published,
-        "VR publication recovers on the next authenticated Sky");
-    Require(frame.CompletePresent(false, true) == Result::Withdrawn &&
-        frame.CompletePresent(true, true) == Result::Withdrawn,
-        "world transitions invalidate VR fields and duplicate presents cannot resurrect them");
+    Require(frame.CompletePresent(true, false) == Result::Published,
+        "publication recovers on the next authenticated Sky");
+    Require(frame.CompletePresent(false, false) == Result::Withdrawn &&
+        frame.CompletePresent(true, false) == Result::Withdrawn,
+        "world transitions invalidate fields and duplicate presents cannot resurrect them");
     frame.Begin();
-    Require(frame.CompletePresent(true, true) == Result::Published,
+    Require(frame.CompletePresent(true, false) == Result::Published,
         "new exterior Sky can publish again");
     frame.Withdraw();
-    Require(frame.CompletePresent(true, true) == Result::Withdrawn,
-        "master disable discards the VR field even during companion-only presentation");
+    Require(frame.CompletePresent(true, false) == Result::Withdrawn,
+        "master disable discards the field even during render-less presentation");
     frame.Begin();
     Require(frame.CompletePresent(true, false) == Result::Published &&
-        frame.CompletePresent(true, false) == Result::Withdrawn,
-        "flat presentation still withdraws a frame with no Sky");
+        frame.CompletePresent(true, true) == Result::Withdrawn,
+        "a rendered main view without a Sky withdraws the field on every runtime");
+    frame.Begin();
+    Require(frame.CompletePresent(true, true) == Result::Published &&
+        frame.CompletePresent(true, false) == Result::Retained &&
+        frame.CompletePresent(true, false) == Result::Retained,
+        "flat frame-generation presents without a render keep the field");
 }
 
 class TrackedObject final : public IUnknown
@@ -171,12 +179,142 @@ void TestRetirement()
     }
 }
 
+class ForwardingDevice final : public IUnknown
+{
+public:
+    enum class Unwrap { Native, Unsupported, Self };
+    explicit ForwardingDevice(IUnknown* native) : native_(native) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** destination) override
+    {
+        if (!destination) return E_POINTER;
+        *destination = nullptr;
+        if (id == FO4CS::GraphicsProxyCompat::kReShadeUnwrappedObject) {
+            ++unwrapQueries;
+            if (unwrap == Unwrap::Unsupported) return E_NOINTERFACE;
+            *destination = unwrap == Unwrap::Self ? this : native_.Get();
+            static_cast<IUnknown*>(*destination)->AddRef();
+            return S_OK;
+        }
+        if (id != __uuidof(IUnknown)) return E_NOINTERFACE;
+        *destination = this;
+        AddRef();
+        return S_OK;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++references; }
+    ULONG STDMETHODCALLTYPE Release() override { return --references; }
+    ULONG references{ 1 };
+    unsigned unwrapQueries{};
+    Unwrap unwrap{ Unwrap::Native };
+private:
+    Microsoft::WRL::ComPtr<IUnknown> native_;
+};
+
+void TestGraphicsProxyCapture()
+{
+    namespace Compat = FO4CS::GraphicsProxyCompat;
+    std::atomic<unsigned> destroyed{};
+    Microsoft::WRL::ComPtr<IUnknown> native;
+    native.Attach(new TrackedObject(destroyed));
+    Microsoft::WRL::ComPtr<IUnknown> captured;
+    {
+        ForwardingDevice proxy(native.Get());
+        const auto gameDevice = static_cast<IUnknown*>(&proxy);
+        {
+            const auto unchanged = Compat::ShaderCaptureDevice(gameDevice, false);
+            Require(unchanged.Get() == gameDevice && proxy.unwrapQueries == 0 &&
+                proxy.references == 2,
+                "ordinary and ENB devices retain their own receiver without a private query");
+        }
+        Require(proxy.references == 1, "ordinary device capture balances its reference");
+        captured = Compat::ShaderCaptureDevice(gameDevice, true);
+        Require(captured.Get() == native.Get() && proxy.unwrapQueries == 1 &&
+            proxy.references == 1,
+            "ReShade capture retains the native device without replacing the game proxy");
+        proxy.unwrap = ForwardingDevice::Unwrap::Unsupported;
+        Require(!Compat::ShaderCaptureDevice(gameDevice, true),
+            "a proxy without the native-interface contract cannot be captured as native");
+        proxy.unwrap = ForwardingDevice::Unwrap::Self;
+        Require(!Compat::ShaderCaptureDevice(gameDevice, true) && proxy.references == 1,
+            "self-unwrapping is rejected without leaking a reference");
+
+        // ReShade and Upscaling forward private data: both receivers can read
+        // the same marker, even though their methods require different This.
+        const auto proxyAddress = reinterpret_cast<std::uintptr_t>(gameDevice);
+        const auto nativeAddress = reinterpret_cast<std::uintptr_t>(native.Get());
+        const auto target = reinterpret_cast<std::uintptr_t>(&TestGraphicsProxyCapture);
+        const auto thunk = reinterpret_cast<std::uintptr_t>(&TestRetirement);
+        Compat::ComRouteData sharedMarker{ Compat::ComRouteData::kMagic,
+            Compat::ComRouteData::kVersion, target, proxyAddress };
+        Require(sharedMarker.Matches(proxyAddress, thunk) &&
+            !sharedMarker.Matches(nativeAddress, thunk),
+            "forwarded proxy private data cannot route a call on the native receiver");
+        sharedMarker.receiver = nativeAddress;
+        Require(sharedMarker.Matches(nativeAddress, thunk) &&
+            !sharedMarker.Matches(proxyAddress, thunk),
+            "native route markers cannot be called on a wrapping receiver either");
+        Require(!sharedMarker.Matches(nativeAddress, target),
+            "a copied route must not recurse through the capture thunk");
+        sharedMarker.version = 1;
+        Require(!sharedMarker.Matches(nativeAddress, thunk),
+            "legacy unscoped route data is rejected");
+        native.Reset();
+    }
+    Require(destroyed == 0, "native capture survives the game proxy's release");
+    captured.Reset();
+    Require(destroyed == 1, "native capture releases the last retained reference");
+    Require(!Compat::ShaderCaptureDevice<IUnknown>(nullptr, true),
+        "missing proxy device is harmless");
+}
+
+void TestUpscaledSkyViewport()
+{
+    using FO4CS::IsMainSkyViewport;
+    D3D11_VIEWPORT view{ 0, 0, 1920, 1080, 0.01f, 1 };
+    Require(IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "native flat Sky remains a main view");
+    view.Width = 1280;
+    view.Height = 720;
+    Require(IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "AE Upscaling's 1280x720 scene within a 1920x1080 target captures clouds");
+    view.Width = 853;
+    view.Height = 480;
+    Require(IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "rounded render scales remain valid");
+    view.TopLeftX = 8;
+    Require(!IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "an offset secondary viewport cannot establish the main Sky origin");
+    view.TopLeftX = 0;
+    view.Width = 512;
+    view.Height = 512;
+    Require(!IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "a square reflection viewport is not the main widescreen view");
+    view = { 0, 0, 4992, 2688, 0.01f, 1 };
+    Require(IsMainSkyViewport(view, 1, 4992, 2688, true),
+        "the full native VR stereo view remains valid");
+    view.Width /= 2;
+    Require(!IsMainSkyViewport(view, 1, 4992, 2688, true),
+        "one VR eye cannot be treated as a full stereo viewport");
+    view.Height /= 2;
+    Require(!IsMainSkyViewport(view, 1, 4992, 2688, true),
+        "flat upscaling support cannot admit a reduced VR mirror viewport");
+    view = { 0, 0, 1920, 1080, 0.01f, 1 };
+    Require(!IsMainSkyViewport(view, 2, 1920, 1080, false) &&
+        !IsMainSkyViewport(view, 0, 1920, 1080, false) &&
+        !IsMainSkyViewport(view, 1, 1280, 720, false),
+        "ambiguous or out-of-bounds viewports remain rejected");
+    view.Width = std::numeric_limits<float>::quiet_NaN();
+    Require(!IsMainSkyViewport(view, 1, 1920, 1080, false),
+        "non-finite viewport dimensions cannot enter capture");
+}
+
 int main()
 {
     try {
         TestPublication();
         TestRetirement();
-        std::cout << "PASS: current cloud-frame publication and concurrent renderer retirement\n";
+        TestGraphicsProxyCapture();
+        TestUpscaledSkyViewport();
+        std::cout << "PASS: cloud-frame publication, renderer retirement, graphics proxies and scaled Sky\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "FAIL: " << error.what() << '\n';

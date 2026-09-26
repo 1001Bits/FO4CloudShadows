@@ -30,7 +30,6 @@ namespace FO4CS::GodraysIntegration
         // Bit 0 = directional volume-geometry PS, bit 1 = directional
         // screen-integral PS. Full flat-runtime proof requires both bits.
         std::uint32_t authenticatedDirectionalVariants{ 0 };
-        std::uint32_t authenticatedSunMaskVariants{ 0 };
         std::uint32_t patchFailures{ 0 };
         std::uint64_t renderVolumeCalls{ 0 };
         std::uint64_t submittedCloudOcclusionDraws{ 0 };

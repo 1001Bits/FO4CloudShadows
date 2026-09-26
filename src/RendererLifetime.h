@@ -12,7 +12,10 @@ namespace FO4CS::RendererLifetime
     {
         inline std::shared_mutex callbacks;
         inline std::mutex retiredMutex;
-        inline std::vector<Microsoft::WRL::ComPtr<IUnknown>> retired;
+        // Never destroyed: a static destructor would release D3D objects
+        // under the loader lock at process exit.
+        inline std::vector<Microsoft::WRL::ComPtr<IUnknown>>& retired =
+            *new std::vector<Microsoft::WRL::ComPtr<IUnknown>>();
         inline std::atomic<bool> pending{ false };
         inline thread_local unsigned depth = 0;
     }

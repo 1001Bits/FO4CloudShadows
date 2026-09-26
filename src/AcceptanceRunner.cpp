@@ -1624,10 +1624,14 @@ namespace CloudShadows::AcceptanceRunner
 				return true;
 			// External acceptance is a developer-only service. Normal gameplay must
 			// not keep a thread waking every 25 ms and polling the plugin directory.
-			// The harness creates a PID-specific enable marker; checking for it only
-			// four times per 60-Hz second keeps the service fully opt-in.
-			if (presentOrdinal != 1u && (presentOrdinal % 15u) != 0u)
+			// The harness creates a PID-specific enable marker; checking for it
+			// about once per second, independent of frame rate (and of a slow
+			// mod-manager virtual file system), keeps the service fully opt-in.
+			static ULONGLONG nextMarkerPoll = 0;
+			const ULONGLONG now = GetTickCount64();
+			if (presentOrdinal != 1u && now < nextMarkerPoll)
 				return false;
+			nextMarkerPoll = now + 1000;
 			if (s_protocolIdentity.executablePath.empty())
 				s_protocolIdentity = BuildProtocolIdentity();
 			std::error_code markerError;

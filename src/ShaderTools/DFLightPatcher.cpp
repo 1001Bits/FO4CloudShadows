@@ -319,23 +319,16 @@ namespace SIE
 
 
 	void DFLightPatcher::ProcessDXBCDirectory(
-		ID3D11Device* device,
 		const std::filesystem::path& dir,
-		const DXBCPatch& patch,
-		uint32_t factorTempRegister)
+		const std::stop_token& stop)
 	{
 		std::error_code fsError;
-		if (!std::filesystem::exists(dir, fsError) || fsError) {
-			SPDLOG_WARN("[DFLightPatcher] DFLight DXBC path not found: {}", dir.string());
+		if (!std::filesystem::exists(dir, fsError) || fsError)
 			return;
-		}
 
-		uint32_t loaded = 0, patched = 0, signatureSkipped = 0;
-		uint32_t failed = 0, disasmFailed = 0, duplicates = 0;
-		std::array<uint32_t, 10> variants{};
-
+		uint32_t loaded = 0, candidates = 0, known = 0, skipped = 0, failed = 0;
 		std::filesystem::directory_iterator it(dir, fsError), end;
-		for (; !fsError && it != end; it.increment(fsError)) {
+		for (; !fsError && it != end && !stop.stop_requested(); it.increment(fsError)) {
 			const auto& entry = *it;
 			std::error_code entryError;
 			if (!entry.is_regular_file(entryError) || entryError ||
@@ -346,17 +339,13 @@ namespace SIE
 			std::ifstream file(entry.path(), std::ios::binary | std::ios::ate);
 			if (!file.is_open())
 				continue;
-
 			const std::streamoff fileSize = file.tellg();
 			if (fileSize <= 0 ||
-				static_cast<uint64_t>(fileSize) > kMaxCapturedShaderBytes ||
-				static_cast<uint64_t>(fileSize) >
-					static_cast<uint64_t>(std::numeric_limits<std::streamsize>::max())) {
+				static_cast<uint64_t>(fileSize) > kMaxCapturedShaderBytes) {
 				failed++;
 				continue;
 			}
 			file.seekg(0, std::ios::beg);
-
 			std::vector<uint8_t> fileData(static_cast<size_t>(fileSize));
 			file.read(reinterpret_cast<char*>(fileData.data()),
 				static_cast<std::streamsize>(fileSize));
@@ -366,165 +355,166 @@ namespace SIE
 			}
 			loaded++;
 
-			ID3DBlob* vanillaBlob = nullptr;
-			if (FAILED(D3DCreateBlob(fileData.size(), &vanillaBlob)))
-				continue;
-			memcpy(vanillaBlob->GetBufferPointer(), fileData.data(), fileData.size());
-
-			DXBCPatcher::SunShadowPatchInfo patchInfo;
-			ID3DBlob* patchedBlob = DXBCPatcher::PatchSunShadowShader(
-				vanillaBlob, patch, factorTempRegister, &patchInfo);
-			vanillaBlob->Release();
-
-			if (!patchedBlob) {
-				if (patchInfo.signatureMatched)
-					failed++;
-				else
-					signatureSkipped++;
-				continue;
-			}
-			if (patchInfo.signatureVariant >= 1 && patchInfo.signatureVariant <= variants.size())
-				variants[patchInfo.signatureVariant - 1]++;
-			else {
-				patchedBlob->Release();
-				failed++;
-				continue;
-			}
-
+			// Hash first: a shader the runtime already captured or classified
+			// costs nothing more than this read.
+			const uint64_t hash = HashDXBC(fileData.data(), fileData.size());
 			{
-				ID3DBlob* disasmBlob = nullptr;
-				HRESULT disasmHr = D3DDisassemble(
-					patchedBlob->GetBufferPointer(),
-					patchedBlob->GetBufferSize(),
-					0, nullptr, &disasmBlob);
-				if (disasmBlob)
-					disasmBlob->Release();
-				if (FAILED(disasmHr)) {
-					disasmFailed++;
-					patchedBlob->Release();
+				std::shared_lock mapLock(patchedMapMutex);
+				if (patchedByHash.contains(hash) || unsupportedHashes.contains(hash)) {
+					known++;
 					continue;
 				}
 			}
-
-			ID3D11PixelShader* ps = nullptr;
-			HRESULT createHr;
+			StoreBytecode(hash, fileData.data(), fileData.size());
 			{
-				ScopedPatchedShaderCreation guard;
-				createHr = device->CreatePixelShader(
-					patchedBlob->GetBufferPointer(),
-					patchedBlob->GetBufferSize(),
-					nullptr, &ps);
-			}
-			patchedBlob->Release();
-
-			if (FAILED(createHr) || !ps) {
-				failed++;
-				continue;
-			}
-
-			uint64_t hash = HashDXBC(fileData.data(), fileData.size());
-			bool inserted = false;
-			{
-				std::unique_lock mapLock(patchedMapMutex);
-				auto [existing, wasInserted] = patchedByHash.emplace(hash, ps);
-				inserted = wasInserted;
-				if (!wasInserted) {
-					ps->Release();
-					duplicates++;
+				std::shared_lock mapLock(patchedMapMutex);
+				if (unsupportedHashes.contains(hash)) {
+					skipped++;
+					continue;
 				}
 			}
-			// Retain the validated stock bytes so a new D3D device can recreate
-			// the strict shader even when this optional loose corpus disappears.
-			StoreBytecode(hash, fileData.data(), fileData.size());
-			if (inserted)
-				patched++;
+			candidates++;
+			if (!GetOrCreatePatchedShader(hash))
+				failed++;
 		}
 		if (fsError) {
-			SPDLOG_ERROR("[DFLightPatcher] Error scanning {}: {}", dir.string(), fsError.message());
+			SPDLOG_ERROR("[DFLightPatcher] Error scanning the optional DFLight corpus: {}",
+				fsError.message());
 		}
-
-		SPDLOG_INFO("[DFLightPatcher] DFLight strict sunlight splice: {} blobs loaded, {} patched, "
-			"{} duplicates, {} signature-skipped, {} failed, {} disasm-failed, "
-			"variants={}/{}/{}/{}/{}/{}/{}/{}/{}/{}",
-			loaded, patched, duplicates, signatureSkipped, failed, disasmFailed,
-			variants[0], variants[1], variants[2], variants[3], variants[4],
-			variants[5], variants[6], variants[7], variants[8], variants[9]);
+		SPDLOG_INFO("[DFLightPatcher] Optional corpus: {} blobs read, {} already known, "
+			"{} new sunlight candidates, {} signature-skipped, {} failed",
+			loaded, known, candidates, skipped, failed);
 	}
 
-	void DFLightPatcher::Initialize(ID3D11Device* device)
+	bool DFLightPatcher::EnsurePayload()
 	{
-		std::lock_guard lifecycleLock(lifecycleMutex);
-		if (!device) {
-			SPDLOG_ERROR("[DFLightPatcher] Initialize called with null device");
-			return;
-		}
-		if (initialized.load(std::memory_order_acquire) && patchDevice == device) {
-			RematchRecordedShaders();
-			return;
-		}
-		if (initialized.load(std::memory_order_acquire) || patchDevice) {
-			SPDLOG_WARN("[DFLightPatcher] D3D device changed; rebuilding all patched shaders");
-			ReleaseResources(false);
-		}
-
+		if (payloadReady.load(std::memory_order_acquire))
+			return true;
+		std::lock_guard payloadLock(payloadMutex);
+		if (payloadReady.load(std::memory_order_acquire))
+			return true;
+		if (payloadFailed)
+			return false;
 		uint32_t factorTempRegister = 0xFFFFFFFF;
 		auto dfLightPatch = BuildCloudShadowPatch(factorTempRegister);
 		if (dfLightPatch.preRetInstructions.empty() || factorTempRegister == 0xFFFFFFFF) {
-			SPDLOG_ERROR("[DFLightPatcher] DFLight patch is empty, aborting init");
-			return;
+			// The payload is a fixed snippet; a failure is permanent.
+			payloadFailed = true;
+			SPDLOG_ERROR("[DFLightPatcher] DFLight patch payload is empty; sunlight patching disabled");
+			return false;
 		}
-
-		cachedSunPatch = dfLightPatch;
+		cachedSunPatch = std::move(dfLightPatch);
 		cachedFactorTempRegister = factorTempRegister;
-		if (patchDevice)
-			patchDevice->Release();
-		patchDevice = device;
-		patchDevice->AddRef();
-		// Initialization and operational readiness are deliberately separate.
-		// A valid payload with zero mapped sunlight shaders is not usable yet.
-		initialized.store(true, std::memory_order_release);
-		ready.store(false, std::memory_order_release);
+		payloadReady.store(true, std::memory_order_release);
+		return true;
+	}
 
-		auto& runtime = FO4CS::RuntimeAPI::GetSingleton();
-		const bool vrTarget =
-			runtime.Target() ==
-			FO4CS::F4SECompat::RuntimeTarget::kVR;
-		const auto host = runtime.Host();
-		if (!host.executablePath.empty() &&
-			host.executablePath.has_parent_path()) {
-			const auto corpusPath = host.executablePath.parent_path() /
-				(vrTarget
-					? std::filesystem::path("Data/Shaders/VanillaDXBC/DFLightVR/PS")
-					: std::filesystem::path("Data/Shaders/VanillaDXBC/DFLight/PS"));
-			ProcessDXBCDirectory(
-				device,
-				corpusPath,
-				dfLightPatch,
-				factorTempRegister);
-		} else {
-			SPDLOG_WARN(
-				"[DFLightPatcher] Optional DFLight corpus skipped: "
-				"validated host executable directory is unavailable");
+	void DFLightPatcher::StopClassification() noexcept
+	{
+		std::lock_guard classifierLock(classifierMutex);
+		if (classifier.joinable()) {
+			classifier.request_stop();
+			classifier.join();
 		}
+	}
 
-		// Bootstrap initialization can occur after the game created its DFLight
-		// shaders. Strictly patch and register every captured candidate now.
-		uint32_t rematched = RematchRecordedShaders();
-		uint32_t hashCount = 0;
-		{
-			std::shared_lock mapLock(patchedMapMutex);
-			hashCount = static_cast<uint32_t>(patchedByHash.size());
-		}
-		ready.store(hashCount != 0, std::memory_order_release);
-		if (hashCount == 0) {
-			if (vrTarget) {
-				SPDLOG_WARN("[DFLightPatcher] Initialized but NOT READY: no exact VR DFLight sunlight terminal match was attested in the loaded corpus or captured runtime bytecode; VR sunlight patching remains fail-closed");
-			} else {
-				SPDLOG_WARN("[DFLightPatcher] Initialized but NOT READY: no strictly validated sunlight shader is available yet");
+	void DFLightPatcher::WaitForClassification() noexcept
+	{
+		std::lock_guard classifierLock(classifierMutex);
+		if (classifier.joinable())
+			classifier.join();
+	}
+
+	void DFLightPatcher::ClassifyInBackground(
+		const std::stop_token& stop,
+		const std::filesystem::path& corpus)
+	{
+		try {
+			std::vector<uint64_t> capturedHashes;
+			{
+				std::shared_lock readLock(bytecodeMutex);
+				capturedHashes.reserve(bytecodeByHash.size());
+				for (const auto& [hash, bytes] : bytecodeByHash)
+					capturedHashes.push_back(hash);
 			}
-		} else {
-			SPDLOG_INFO("[DFLightPatcher] READY: {} unique strict hashes, {} runtime variants prepared",
-				hashCount, rematched);
+			uint32_t created = 0;
+			for (uint64_t hash : capturedHashes) {
+				if (stop.stop_requested())
+					return;
+				if (GetOrCreatePatchedShader(hash))
+					++created;
+			}
+			SPDLOG_INFO("[DFLightPatcher] Background strict scan: {} captured candidates, {} sunlight variants ready",
+				capturedHashes.size(), created);
+			if (!corpus.empty() && !stop.stop_requested())
+				ProcessDXBCDirectory(corpus, stop);
+			if (stop.stop_requested())
+				return;
+
+			uint32_t hashCount = 0;
+			{
+				std::shared_lock mapLock(patchedMapMutex);
+				hashCount = static_cast<uint32_t>(patchedByHash.size());
+			}
+			if (hashCount == 0) {
+				SPDLOG_WARN("[DFLightPatcher] Initialized but NOT READY: no strictly validated "
+					"sunlight shader is available yet; later shader loads are classified as they appear");
+			} else {
+				SPDLOG_INFO("[DFLightPatcher] READY: {} unique strict hashes", hashCount);
+			}
+		} catch (const std::exception& error) {
+			SPDLOG_ERROR("[DFLightPatcher] Background classification failed: {}", error.what());
+		} catch (...) {
+			SPDLOG_ERROR("[DFLightPatcher] Background classification failed");
+		}
+	}
+
+	void DFLightPatcher::Initialize(ID3D11Device* device) noexcept
+	{
+		try {
+			if (!device) {
+				SPDLOG_ERROR("[DFLightPatcher] Initialize called with null device");
+				return;
+			}
+			{
+				std::lock_guard lifecycleLock(lifecycleMutex);
+				if (initialized.load(std::memory_order_acquire) && patchDevice == device)
+					return;
+			}
+			// A previous pass must finish before its device is released; it
+			// takes the lifecycle lock per shader, so join outside that lock.
+			StopClassification();
+			std::lock_guard lifecycleLock(lifecycleMutex);
+			if (initialized.load(std::memory_order_acquire) || patchDevice) {
+				SPDLOG_WARN("[DFLightPatcher] D3D device changed; rebuilding all patched shaders");
+				ReleaseResources(false);
+			}
+			if (!EnsurePayload())
+				return;
+			patchDevice = device;
+			patchDevice->AddRef();
+			// Initialization and operational readiness are deliberately separate.
+			// A valid payload with zero mapped sunlight shaders is not usable yet.
+			initialized.store(true, std::memory_order_release);
+			ready.store(false, std::memory_order_release);
+
+			std::filesystem::path corpus;
+			auto& runtime = FO4CS::RuntimeAPI::GetSingleton();
+			const auto host = runtime.Host();
+			if (!host.executablePath.empty() && host.executablePath.has_parent_path()) {
+				corpus = host.executablePath.parent_path() /
+					(runtime.Target() == FO4CS::F4SECompat::RuntimeTarget::kVR
+						? std::filesystem::path("Data/Shaders/VanillaDXBC/DFLightVR/PS")
+						: std::filesystem::path("Data/Shaders/VanillaDXBC/DFLight/PS"));
+			}
+			std::lock_guard classifierLock(classifierMutex);
+			classifier = std::jthread([this, corpus](std::stop_token stop) {
+				ClassifyInBackground(stop, corpus);
+			});
+		} catch (const std::exception& error) {
+			SPDLOG_ERROR("[DFLightPatcher] Initialize failed: {}", error.what());
+		} catch (...) {
+			SPDLOG_ERROR("[DFLightPatcher] Initialize failed");
 		}
 	}
 
@@ -555,26 +545,26 @@ namespace SIE
 		if (g_creatingPatchedShader)
 			return nullptr;
 
-		bool unsupported = false;
+		const auto backedOff = [this, hash]() {
+			const auto failure = retryableFailures.find(hash);
+			return failure != retryableFailures.end() &&
+				std::chrono::steady_clock::now() < failure->second.retryAfter;
+		};
 		{
 			std::shared_lock mapLock(patchedMapMutex);
 			auto existing = patchedByHash.find(hash);
 			if (existing != patchedByHash.end())
 				return existing->second;
-			unsupported = unsupportedHashes.contains(hash);
-		}
-		if (unsupported) {
-			DiscardBytecode(hash);
-			return nullptr;
+			if (unsupportedHashes.contains(hash) || backedOff())
+				return nullptr;
 		}
 
-		// Protect the borrowed device pointer and cached payload against Release()
-		// while the slow patch/create path is active. Initialize() invokes this
-		// path recursively during rematching, hence the recursive mutex.
+		// Protect the borrowed device pointer against Release() while the slow
+		// patch/create path is active. The lock is taken per shader, so the
+		// background pass never holds it across more than one compile.
 		std::lock_guard lifecycleLock(lifecycleMutex);
 		if (!initialized.load(std::memory_order_acquire) || !patchDevice ||
-			cachedSunPatch.preRetInstructions.empty() ||
-			cachedFactorTempRegister == 0xFFFFFFFF) {
+			!payloadReady.load(std::memory_order_acquire)) {
 			return nullptr;
 		}
 
@@ -583,26 +573,32 @@ namespace SIE
 			auto existing = patchedByHash.find(hash);
 			if (existing != patchedByHash.end())
 				return existing->second;
-			unsupported = unsupportedHashes.contains(hash);
-		}
-		if (unsupported) {
-			DiscardBytecode(hash);
-			return nullptr;
+			if (unsupportedHashes.contains(hash) || backedOff())
+				return nullptr;
 		}
 
+		// A deterministic rejection is permanent for this hash.
 		auto markUnsupported = [this, hash]() {
 			// Keep lock ordering map -> bytecode consistent with StoreBytecode().
 			std::unique_lock mapLock(patchedMapMutex);
 			unsupportedHashes.insert(hash);
+			retryableFailures.erase(hash);
 			DiscardBytecode(hash);
 		};
-		auto logRetryableFailure = [hash](const char* stage, HRESULT hr) {
-			static std::atomic<uint32_t> failureCount{ 0 };
-			const uint32_t n = ++failureCount;
-			if (n <= 10 || (n % 50) == 0) {
-				SPDLOG_WARN("[DFLightPatcher] Retryable runtime patch failure #{} at {} "
-					"for hash=0x{:016x} (hr=0x{:08X})",
-					n, stage, hash, static_cast<uint32_t>(hr));
+		// A transient failure backs off exponentially (1 s .. 60 s).
+		auto recordRetryableFailure = [this, hash](const char* stage, HRESULT hr) {
+			uint32_t failures = 0;
+			{
+				std::unique_lock mapLock(patchedMapMutex);
+				auto& state = retryableFailures[hash];
+				failures = ++state.failures;
+				state.retryAfter = std::chrono::steady_clock::now() +
+					std::chrono::seconds((std::min)(60u, 1u << (std::min)(failures, 6u)));
+			}
+			if (failures <= 2 || (failures & (failures - 1)) == 0) {
+				SPDLOG_WARN("[DFLightPatcher] Runtime patch failure #{} at {} "
+					"for hash=0x{:016x} (hr=0x{:08X}); backing off",
+					failures, stage, hash, static_cast<uint32_t>(hr));
 			}
 		};
 
@@ -618,7 +614,7 @@ namespace SIE
 		ID3DBlob* vanillaBlob = nullptr;
 		const HRESULT blobHr = D3DCreateBlob(bytes.size(), &vanillaBlob);
 		if (FAILED(blobHr) || !vanillaBlob) {
-			logRetryableFailure("D3DCreateBlob", blobHr);
+			recordRetryableFailure("D3DCreateBlob", blobHr);
 			return nullptr;
 		}
 		memcpy(vanillaBlob->GetBufferPointer(), bytes.data(), bytes.size());
@@ -628,13 +624,17 @@ namespace SIE
 			vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo);
 		vanillaBlob->Release();
 		if (!patchedBlob) {
-			if (!patchInfo.signatureMatched)
-				markUnsupported();
-			else
-				logRetryableFailure("strict splice", E_FAIL);
+			if (patchInfo.signatureMatched) {
+				SPDLOG_WARN("[DFLightPatcher] Strict splice rejected matched hash=0x{:016x}; "
+					"it stays vanilla", hash);
+			}
+			markUnsupported();
 			return nullptr;
 		}
 
+#if defined(FO4CS_ENABLE_DEVELOPER_TOOLS) && FO4CS_ENABLE_DEVELOPER_TOOLS
+		// Developer builds additionally prove the spliced bytecode parses.
+		// CreatePixelShader validates it in every build.
 		ID3DBlob* disasmBlob = nullptr;
 		HRESULT disasmHr = D3DDisassemble(
 			patchedBlob->GetBufferPointer(), patchedBlob->GetBufferSize(),
@@ -643,9 +643,11 @@ namespace SIE
 			disasmBlob->Release();
 		if (FAILED(disasmHr)) {
 			patchedBlob->Release();
-			logRetryableFailure("D3DDisassemble", disasmHr);
+			SPDLOG_WARN("[DFLightPatcher] Spliced hash=0x{:016x} does not disassemble; it stays vanilla", hash);
+			markUnsupported();
 			return nullptr;
 		}
+#endif
 
 		ID3D11PixelShader* created = nullptr;
 		HRESULT createHr;
@@ -657,13 +659,14 @@ namespace SIE
 		}
 		patchedBlob->Release();
 		if (FAILED(createHr) || !created) {
-			logRetryableFailure("CreatePixelShader", createHr);
+			recordRetryableFailure("CreatePixelShader", createHr);
 			return nullptr;
 		}
 
 		ID3D11PixelShader* result = created;
 		{
 			std::unique_lock mapLock(patchedMapMutex);
+			retryableFailures.erase(hash);
 			auto [it, inserted] = patchedByHash.emplace(hash, created);
 			if (!inserted) {
 				created->Release();
@@ -693,39 +696,47 @@ namespace SIE
 		bytecodeByHash.erase(it);
 	}
 
-	void DFLightPatcher::RegisterVanillaPS(uint64_t hash, ID3D11PixelShader* vanillaPS)
+	void DFLightPatcher::RegisterVanillaPS(uint64_t hash, ID3D11PixelShader* vanillaPS) noexcept
 	{
-		if (!vanillaPS || g_creatingPatchedShader)
-			return;
-		ID3D11PixelShader* patched = GetOrCreatePatchedShader(hash);
-		if (!patched)
-			return;
-		static std::atomic<uint32_t> hitCount = 0;
-		uint32_t n = ++hitCount;
-		if (n == 1 || n == 10 || n == 50 || n == 100 || (n % 50) == 0) {
-			SPDLOG_INFO("[DFLightPatcher] Registered DFLight PS #{} hash=0x{:016x} ps={}",
-				n, hash, (void*)vanillaPS);
+		try {
+			if (!vanillaPS || g_creatingPatchedShader)
+				return;
+			ID3D11PixelShader* patched = GetOrCreatePatchedShader(hash);
+			if (!patched)
+				return;
+			static std::atomic<uint32_t> hitCount = 0;
+			uint32_t n = ++hitCount;
+			if (n == 1 || n == 10 || n == 50 || n == 100 || (n % 50) == 0) {
+				SPDLOG_INFO("[DFLightPatcher] Registered DFLight PS #{} hash=0x{:016x} ps={}",
+					n, hash, (void*)vanillaPS);
+			}
+		} catch (...) {
 		}
 	}
 
 	ID3D11PixelShader* DFLightPatcher::RegisterDescriptor(
 		uint32_t pixelDescriptor,
-		ID3D11PixelShader* vanillaPS)
+		ID3D11PixelShader* vanillaPS) noexcept
 	{
-		if (!vanillaPS || !IsDirectionalSunDescriptor(pixelDescriptor))
-			return nullptr;
-
-		const uint64_t hash = LookupPSHash(vanillaPS);
-		if (!hash)
-			return nullptr;
-
-		return AcquirePatchedShader(hash);
+		return AcquireDescriptor(pixelDescriptor, vanillaPS);
 	}
 
 	ID3D11PixelShader* DFLightPatcher::AcquirePatchedShader(uint64_t hash)
 	{
-		// GetOrCreatePatchedShader nests this lock. Keep it held through AddRef so
-		// ReleaseResources cannot erase/release the cache entry in between.
+		// Fast path: an existing replacement is AddRef'd under the shared map
+		// lock, which ReleaseResources() needs exclusively before it can free
+		// any entry. No lifecycle lock or bytecode lookup on the hot path.
+		{
+			std::shared_lock mapLock(patchedMapMutex);
+			if (auto existing = patchedByHash.find(hash); existing != patchedByHash.end()) {
+				existing->second->AddRef();
+				return existing->second;
+			}
+			if (unsupportedHashes.contains(hash))
+				return nullptr;
+		}
+		// GetOrCreatePatchedShader nests this lock. Keep it held through AddRef
+		// so ReleaseResources cannot erase/release the new entry in between.
 		std::lock_guard lifecycleLock(lifecycleMutex);
 		auto* shader = GetOrCreatePatchedShader(hash);
 		if (shader)
@@ -735,12 +746,16 @@ namespace SIE
 
 	ID3D11PixelShader* DFLightPatcher::AcquireDescriptor(
 		uint32_t pixelDescriptor,
-		ID3D11PixelShader* vanillaPS)
+		ID3D11PixelShader* vanillaPS) noexcept
 	{
-		if (!vanillaPS || !IsDirectionalSunDescriptor(pixelDescriptor))
+		try {
+			if (!vanillaPS || !IsDirectionalSunDescriptor(pixelDescriptor))
+				return nullptr;
+			const uint64_t hash = LookupPSHash(vanillaPS);
+			return hash ? AcquirePatchedShader(hash) : nullptr;
+		} catch (...) {
 			return nullptr;
-		const uint64_t hash = LookupPSHash(vanillaPS);
-		return hash ? AcquirePatchedShader(hash) : nullptr;
+		}
 	}
 
 	ID3D11PixelShader* DFLightPatcher::GetSwapForVanillaPS(ID3D11PixelShader* vanillaPS)
@@ -755,7 +770,7 @@ namespace SIE
 		return hash ? AcquirePatchedShader(hash) : nullptr;
 	}
 
-	void DFLightPatcher::RecordPSHash(ID3D11PixelShader* vanillaPS, uint64_t hash)
+	void DFLightPatcher::RecordPSHash(ID3D11PixelShader* vanillaPS, uint64_t hash) noexcept
 	{
 		if (!vanillaPS || g_creatingPatchedShader) return;
 		if (!RecordShaderHash(vanillaPS, hash)) {
@@ -812,9 +827,6 @@ namespace SIE
 
 	uint32_t DFLightPatcher::RematchRecordedShaders()
 	{
-		// Keep the before/after accounting and the complete rematch generation
-		// coherent with Release()/Initialize(). This nests during Initialize().
-		std::lock_guard lifecycleLock(lifecycleMutex);
 		std::vector<uint64_t> capturedHashes;
 		{
 			std::shared_lock readLock(bytecodeMutex);
@@ -836,39 +848,60 @@ namespace SIE
 			std::shared_lock mapLock(patchedMapMutex);
 			after = patchedByHash.size();
 		}
-		const uint32_t added = static_cast<uint32_t>(after - before);
+		const uint32_t added = after > before ? static_cast<uint32_t>(after - before) : 0u;
 		SPDLOG_INFO("[DFLightPatcher] Retroactive strict scan: classified {} captured hashes, created {} sunlight variants",
 			capturedHashes.size(), added);
 		return added;
 	}
 
-	void DFLightPatcher::StoreBytecode(uint64_t hash, const void* bytes, size_t size)
+	void DFLightPatcher::StoreBytecode(uint64_t hash, const void* bytes, size_t size) noexcept
 	{
-		if (!bytes || size == 0 || size > kMaxCapturedShaderBytes || g_creatingPatchedShader)
-			return;
-
-		// Keep the map lock through insertion so a concurrent unsupported
-		// classification cannot discard the entry immediately before we add it.
-		std::shared_lock mapLock(patchedMapMutex);
-		if (unsupportedHashes.contains(hash))
-			return;
-		std::unique_lock writeLock(bytecodeMutex);
-		if (bytecodeByHash.find(hash) != bytecodeByHash.end())
-			return;
-		if (capturedBytecodeBytes > kMaxCapturedBytecodeCache - size) {
-			static std::atomic<bool> logged{ false };
-			if (!logged.exchange(true)) {
-				SPDLOG_ERROR("[DFLightPatcher] Runtime bytecode cache reached {} MiB; rejecting additional shaders until classification",
-					kMaxCapturedBytecodeCache / (1024u * 1024u));
+		try {
+			if (!bytes || size == 0 || size > kMaxCapturedShaderBytes || g_creatingPatchedShader)
+				return;
+			{
+				std::shared_lock mapLock(patchedMapMutex);
+				if (unsupportedHashes.contains(hash))
+					return;
 			}
-			return;
-		}
-		auto [it, inserted] = bytecodeByHash.try_emplace(hash);
-		if (inserted) {
-			it->second.assign(
-				static_cast<const uint8_t*>(bytes),
-				static_cast<const uint8_t*>(bytes) + size);
-			capturedBytecodeBytes += size;
+			{
+				std::shared_lock readLock(bytecodeMutex);
+				if (bytecodeByHash.contains(hash))
+					return;
+			}
+			// Classify straight from the caller's buffer: the thousands of
+			// non-DFLight shaders are never copied, and their hashes are never
+			// examined again.
+			if (!DXBCPatcher::IsSunShadowCandidate(bytes, size)) {
+				std::unique_lock mapLock(patchedMapMutex);
+				unsupportedHashes.insert(hash);
+				return;
+			}
+
+			// Keep the map lock through insertion so a concurrent unsupported
+			// classification cannot discard the entry immediately before we add it.
+			std::shared_lock mapLock(patchedMapMutex);
+			if (unsupportedHashes.contains(hash))
+				return;
+			std::unique_lock writeLock(bytecodeMutex);
+			if (bytecodeByHash.find(hash) != bytecodeByHash.end())
+				return;
+			if (capturedBytecodeBytes > kMaxCapturedBytecodeCache - size) {
+				static std::atomic<bool> logged{ false };
+				if (!logged.exchange(true)) {
+					SPDLOG_ERROR("[DFLightPatcher] Sunlight bytecode cache reached {} MiB; rejecting additional candidates",
+						kMaxCapturedBytecodeCache / (1024u * 1024u));
+				}
+				return;
+			}
+			auto [it, inserted] = bytecodeByHash.try_emplace(hash);
+			if (inserted) {
+				it->second.assign(
+					static_cast<const uint8_t*>(bytes),
+					static_cast<const uint8_t*>(bytes) + size);
+				capturedBytecodeBytes += size;
+			}
+		} catch (...) {
 		}
 	}
 
@@ -883,6 +916,7 @@ namespace SIE
 					ps->Release();
 			}
 			patchedByHash.clear();
+			retryableFailures.clear();
 			if (clearCapturedBytecode)
 				unsupportedHashes.clear();
 		}
@@ -895,24 +929,25 @@ namespace SIE
 			patchDevice->Release();
 			patchDevice = nullptr;
 		}
-		cachedSunPatch = {};
-		cachedFactorTempRegister = 0xFFFFFFFF;
 	}
 
 	void DFLightPatcher::Release()
 	{
+		StopClassification();
 		std::lock_guard lifecycleLock(lifecycleMutex);
 		ReleaseResources(false);
 	}
 
 	void DFLightPatcher::Reset()
 	{
+		StopClassification();
 		std::lock_guard lifecycleLock(lifecycleMutex);
 		ReleaseResources(true);
 	}
 
 	DFLightPatcher::~DFLightPatcher()
 	{
+		StopClassification();
 		std::lock_guard lifecycleLock(lifecycleMutex);
 		ReleaseResources(true);
 	}

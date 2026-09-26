@@ -1,5 +1,4 @@
 // GPU contract tests use generated textures/constants, never game assets.
-#include "CloudMotionResolver.h"
 #include "CloudGeometryCapture.h"
 #include "CloudCubePreview.h"
 #include "GodrayCloudShader.h"
@@ -25,7 +24,7 @@
 #include <vector>
 
 using Microsoft::WRL::ComPtr;
-namespace Motion = FO4CS::CloudMotionResolver;
+namespace Motion = FO4CS::CloudGeometryCapture;
 using Float4 = std::array<float, 4>;
 
 namespace
@@ -128,24 +127,18 @@ namespace
             messages->ClearStoredMessages();
         }
 
-        template<class First, class Second>
-        void Compare(const std::string& name, First first, Second second, UINT repetitions)
+        template<class Work>
+        void Benchmark(const std::string& name, Work work, UINT repetitions)
         {
-            std::array<double,9> cube{}, sun{};
-            // Two warmup pairs, then nine measured pairs. Reverse submission
-            // order every round to expose order/clock effects in a short test.
+            // Two warmup rounds, then nine measured rounds.
+            std::array<double,9> values{};
             for (UINT round=0; round<11; ++round) {
-                double a{}, b{};
-                if (round%2) { b=Measure(second,repetitions); a=Measure(first,repetitions); }
-                else { a=Measure(first,repetitions); b=Measure(second,repetitions); }
-                if (round>=2) { cube[round-2]=a; sun[round-2]=b; }
+                const double value = Measure(work,repetitions);
+                if (round>=2) values[round-2]=value;
             }
-            const auto report = [&](const char* method, std::array<double,9> values) {
-                std::sort(values.begin(),values.end());
-                std::cout << name << " method=" << method << " GPU-span-ms median=" << values[4]
-                    << " min=" << values.front() << " max=" << values.back() << " batches=9\n";
-            };
-            report("Cubemap",cube); report("Sun2D",sun);
+            std::sort(values.begin(),values.end());
+            std::cout << name << " GPU-span-ms median=" << values[4]
+                << " min=" << values.front() << " max=" << values.back() << " batches=9\n";
         }
 
         ComPtr<ID3D11Buffer> Constants(const void* data, UINT size)
@@ -351,138 +344,7 @@ namespace
             gpu.context->PSSetConstantBuffers(2, 1, &rawPS);
         }
 
-        void Capture(uint64_t epoch, uint32_t layerCount = 2)
-        {
-            Require(Motion::BeginCaptureGeneration(gpu.device.Get(),
-                { epoch, 1, faceSize, layout }), "begin mapping generation");
-            for (uint32_t face = 0; face < 6; ++face) {
-                Require(Motion::BeginCaptureCubeFace(face), "begin mapping face");
-                for (uint32_t layer = 1; layer <= layerCount; ++layer) {
-                    Motion::CaptureLayerFace key{ layer, face, Motion::CloudTechnique::kClouds };
-                    Motion::CaptureFaceTarget target;
-                    Require(Motion::AcquireLayerMappingTarget(gpu.context.Get(), key, target),
-                        "acquire mapping target");
-                    const bool vr = layout == Motion::SkyConstantLayout::kVr;
-                    const Float4 mapping{ 0.125f + vertex[vr ? 14 : 10][0],
-                        0.125f, vertex[vr ? 11 : 7][3], 1.0f };
-                    gpu.context->ClearRenderTargetView(target.mappingRtv.Get(), mapping.data());
-                    Require(Motion::CompleteLayerMapping(key, true), "complete mapping layer");
-                }
-                Require(Motion::CompleteCaptureCubeFace(face, true), "complete mapping face");
-            }
-            Require(Motion::PublishCaptureGeneration(), "publish complete mapping");
-        }
-
-        void Begin(uint64_t epoch)
-        {
-            Require(Motion::BeginFrame(gpu.context.Get(), { epoch, 1, ++serial }),
-                "begin live frame");
-        }
-
-        void Accumulate(uint64_t id, Motion::CloudTechnique technique)
-        {
-            Require(Motion::AccumulateLiveLayer(gpu.context.Get(), { id, technique, true }),
-                "resolve live cloud layer");
-        }
-
-        Motion::ResolvedSnapshot Complete()
-        {
-            Require(Motion::CompleteFrame(gpu.context.Get(), true), "publish live frame");
-            Motion::ResolvedSnapshot result;
-            Require(Motion::AcquireResolvedSnapshot(result), "acquire resolved frame");
-            return result;
-        }
     };
-
-    void RunMotionTests(GPU& gpu, Motion::SkyConstantLayout layout)
-    {
-        MotionFixture fixture(gpu, layout);
-        fixture.Capture(1);
-        fixture.Begin(1);
-        fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-        auto first = fixture.Complete();
-        ExpectUniform(gpu, first.opacityCube.Get(), 0.125f);
-
-        fixture.SetLive(0.5f, 0.5f, 0.0f);
-        fixture.Begin(1);
-        fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-        // The old field remains immutable until publication.
-        ExpectUniform(gpu, first.opacityCube.Get(), 0.125f);
-        auto moved = fixture.Complete();
-        ExpectUniform(gpu, moved.opacityCube.Get(), 0.375f);
-
-        fixture.SetLive(0.5f, 0.25f, 0.7f);
-        fixture.Begin(1);
-        fixture.Accumulate(1, Motion::CloudTechnique::kCloudsFade);
-        auto faded = fixture.Complete();
-        ExpectUniform(gpu, faded.opacityCube.Get(), 0.09375f);
-
-        fixture.SetLive(0.0f, 0.5f, 0.25f);
-        fixture.Begin(1);
-        fixture.Accumulate(1, Motion::CloudTechnique::kCloudsLerp);
-        fixture.Accumulate(2, Motion::CloudTechnique::kClouds);
-        auto combined = fixture.Complete();
-        ExpectUniform(gpu, combined.opacityCube.Get(), 0.234375f);
-
-        fixture.Begin(1);
-        auto clear = fixture.Complete();
-        ExpectUniform(gpu, clear.opacityCube.Get(), 0.0f);
-        Require(clear.layerCount == 0, "empty sky reports no live layers");
-
-        fixture.Begin(1);
-        fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-        Require(!Motion::AccumulateLiveLayer(gpu.context.Get(),
-            { 1, Motion::CloudTechnique::kClouds, true }), "duplicate layer rejected");
-        Require(!Motion::CompleteFrame(gpu.context.Get(), true), "poisoned frame rejected");
-        Motion::ResolvedSnapshot invalid;
-        Require(!Motion::AcquireResolvedSnapshot(invalid), "failed frame withdraws field");
-        fixture.Begin(1);
-        fixture.Accumulate(2, Motion::CloudTechnique::kClouds);
-        auto recovered = fixture.Complete();
-        ExpectUniform(gpu, recovered.opacityCube.Get(), 0.125f);
-
-        fixture.Capture(2);
-        const auto warm = Motion::GetDiagnostics();
-        fixture.Capture(3);
-        const auto reused = Motion::GetDiagnostics();
-        Require(reused.mappingResourceCreates == warm.mappingResourceCreates &&
-            reused.mappingResourceReuses >= warm.mappingResourceReuses + 2,
-            "natural refresh reuses warmed mapping textures");
-        Require(reused.mappingBytes == 4u * 8u * 8u * 6u * 16u,
-            "mapping storage remains bounded to two sets");
-        fixture.Begin(3);
-        fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-        auto refreshed = fixture.Complete();
-        ExpectUniform(gpu, refreshed.opacityCube.Get(), 0.125f);
-
-        Require(Motion::BeginCaptureGeneration(gpu.device.Get(), { 4, 1, 8, layout }),
-            "begin rejected refresh");
-        Require(!Motion::PublishCaptureGeneration(), "incomplete cube rejected");
-        Motion::AbortCaptureGeneration();
-        Require(Motion::AcquireResolvedSnapshot(invalid), "bad refresh retains current field");
-        fixture.SetLive(4096.0f, 0.5f, 0.0f);
-        fixture.Capture(5);
-        fixture.SetLive(4096.5f, 0.5f, 0.0f);
-        // Verify D3D11.1 windows survive a resolver which temporarily binds
-        // this same buffer through a different range.
-        ComPtr<ID3D11DeviceContext1> context1;
-        Check(gpu.context.As(&context1), "D3D11.1 context available");
-        ID3D11Buffer* sentinel = fixture.vs.Get();
-        const UINT firstConstant = 16, constantCount = 16;
-        context1->CSSetConstantBuffers1(1, 1, &sentinel, &firstConstant, &constantCount);
-        fixture.Begin(5);
-        fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-        ComPtr<ID3D11Buffer> restored;
-        UINT restoredFirst{}, restoredCount{};
-        context1->CSGetConstantBuffers1(1, 1, &restored, &restoredFirst, &restoredCount);
-        Require(restored.Get() == sentinel && restoredFirst == firstConstant &&
-            restoredCount == constantCount, "compute constant-buffer window restored");
-        auto longRunning = fixture.Complete();
-        ExpectUniform(gpu, longRunning.opacityCube.Get(), 0.375f);
-        Motion::Invalidate();
-        Require(!Motion::AcquireResolvedSnapshot(invalid), "world reset invalidates field");
-        gpu.CheckMessages();
-    }
 
     void RunGeometryCaptureTests(GPU& gpu, Motion::SkyConstantLayout layout,
         float initialBlend = 0.5f, bool benchmark = false)
@@ -582,78 +444,9 @@ float4 PS(Output i) : SV_Target { return float4(i.uv,i.c.w,1); }
         gpu.context->OMSetRenderTargets(1,&rawTarget,nullptr);
         const D3D11_VIEWPORT viewport{0,0,4,4,0,1};
         gpu.context->RSSetViewports(1,&viewport);
-        Require(Motion::BeginCaptureGeneration(gpu.device.Get(), {1,1,8,layout}),
-            "bootstrap without any native reflection event");
-        for (UINT face = 0; face < 6; ++face)
-            Require(Motion::BeginCaptureCubeFace(face), "bootstrap face begin");
         struct Draw { ID3D11DeviceContext* context; UINT calls{}; bool vr; } draw{gpu.context.Get(),0,vr};
-        const auto submit = [](void* user) {
-            auto& request = *static_cast<Draw*>(user);
-            ++request.calls;
-            if (request.vr)
-                request.context->DrawInstanced(36,2,0,0);
-            else
-                request.context->Draw(36,0);
-        };
-        Require(Geometry::CaptureLayer(gpu.context.Get(), layout, 1,
-            Motion::CloudTechnique::kClouds, 8, submit, &draw), "capture native dome geometry");
-        Require(draw.calls == 6, "bootstrap is six bounded draws");
-        for (float value : gpu.Read(primary.Get()))
-            Require(value == 0.625f, "bootstrap leaves visible sky target untouched");
-        ComPtr<ID3D11VertexShader> restoredVS;
-        ComPtr<ID3D11PixelShader> restoredPS;
         ComPtr<ID3D11Buffer> restoredCB;
         UINT restoredFirst{}, restoredCount{};
-        gpu.context->VSGetShader(&restoredVS,nullptr,nullptr);
-        gpu.context->PSGetShader(&restoredPS,nullptr,nullptr);
-        context1->VSGetConstantBuffers1(0,1,&restoredCB,&restoredFirst,&restoredCount);
-        Require(restoredVS.Get() == vs.Get() && restoredPS.Get() == ps.Get() &&
-            restoredCB.Get() == sentinel && restoredFirst == first && restoredCount == count,
-            "bootstrap restores native shaders and constant-buffer window");
-        for (UINT face = 0; face < 6; ++face)
-            Require(Motion::CompleteCaptureCubeFace(face,true), "bootstrap face complete");
-        Require(Motion::PublishCaptureGeneration(), "bootstrap mapping publishes");
-        Require(Motion::HasCapturedLayer(1) && !Motion::HasCapturedLayer(2),
-            "new weather geometry requests a new mapping");
-        for (UINT frame = 0; frame < 2; ++frame) {
-            fixture.SetLive(frame ? 0.5f : 0, 0.5f, 0);
-            fixture.Begin(1);
-            fixture.Accumulate(1, Motion::CloudTechnique::kClouds);
-            auto resolved = fixture.Complete();
-            ComPtr<ID3D11Resource> cube;
-            resolved.opacityCube->GetResource(&cube);
-            const auto values = gpu.Read(cube.Get());
-            for (size_t i = 0; i < values.size(); ++i) {
-                const float u = (static_cast<float>(i % 8) + 0.5f) * 0.25f - 1;
-                const float v = (static_cast<float>((i / 8) % 8) + 0.5f) * 0.25f - 1;
-                // Independently ray-trace the translated unit box. The exit
-                // face determines its constant UV, without using capture VS
-                // matrices, rasterization, or an expected captured texture.
-                const std::array<std::array<float, 3>, 6> rays{{
-                    {1,-v,-u}, {-1,-v,u}, {u,1,v}, {u,-1,-v}, {u,-v,1}, {-u,-v,-1}
-                }};
-                const auto& ray = rays[i / 64];
-                const std::array<float, 3> localRay{ray[1], -ray[0], ray[2]};
-                const std::array<float, 3> localCamera{0.15f, 0.2f, -0.3f};
-                float firstExit = std::numeric_limits<float>::max();
-                bool high = false;
-                for (UINT axis = 0; axis < 3; ++axis) {
-                    if (std::abs(localRay[axis]) < 1.0e-6f)
-                        continue;
-                    const bool negative = localRay[axis] < 0;
-                    const float distance = ((negative ? -1.0f : 1.0f) -
-                        localCamera[axis]) / localRay[axis];
-                    if (distance < firstExit) {
-                        firstExit = distance;
-                        high = negative;
-                    }
-                }
-                const float expected = high != (frame != 0) ? 0.375f : 0.125f;
-                Require(std::abs(values[i] - expected) < 0.001f,
-                    "camera-relative dome translation, rotation and live cloud speed agree");
-            }
-        }
-        Require(draw.calls == 6, "animated frames do not replay geometry");
         // Real FO4 cloud meshes contain overlapping surfaces within a single
         // draw. Both .25-alpha surfaces must contribute (.25 + .25*.75),
         // including in VR where native geometry is submitted once per eye.
@@ -724,9 +517,20 @@ float4 PS(Output i) : SV_Target { return float4(i.uv,i.c.w,1); }
                 Motion::CloudTechnique::kClouds,opacityFaceSize,opacityTargets,submitOverlap,&draw),
                 "capture overlapping live opacity");
             const float expected = frame == 0 ? 0.0f : frame == 1 ? 0.4375f : 0.9375f;
-            for (float value : gpu.Read(opacity.Get()))
-                Require(std::abs(value-expected)<0.001f,
-                    "all overlapping surfaces contribute exactly once, including VR stereo");
+            const auto values = gpu.Read(opacity.Get());
+            const size_t faceTexels = static_cast<size_t>(opacityFaceSize) * opacityFaceSize;
+            for (size_t i = 0; i < values.size(); ++i) {
+                const bool belowHorizonFace = i / faceTexels == 5;
+                Require(std::abs(values[i] - (belowHorizonFace ? 0.0f : expected)) < 0.001f,
+                    "all overlapping surfaces contribute exactly once, including VR stereo; "
+                    "the never-sampled -Z face is not replayed");
+            }
+            const UINT callsBefore = draw.calls;
+            Require(Geometry::AccumulateOpacity(gpu.context.Get(),layout,
+                Motion::CloudTechnique::kClouds,opacityFaceSize,opacityTargets,submitOverlap,&draw),
+                "repeat capture for draw accounting");
+            Require(draw.calls - callsBefore == Geometry::kCapturedCubeFaceCount,
+                "one replay per captured face");
             for (float value : gpu.Read(primary.Get()))
                 Require(value == 0.625f,"opacity capture leaves the visible target untouched");
         }
@@ -745,118 +549,31 @@ float4 PS(Output i) : SV_Target { return float4(i.uv,i.c.w,1); }
             Require(Geometry::AccumulateOpacity(gpu.context.Get(),layout,
                 Motion::CloudTechnique::kClouds,opacityFaceSize,opacityTargets,submitOverlap,&draw),
                 "capture native front-facing overlapping cloud surfaces");
-            for (float value : gpu.Read(opacity.Get()))
-                Require(std::abs(value - (winding ? 0.9375f : 0.0f)) < 0.001f,
+            const auto values = gpu.Read(opacity.Get());
+            const size_t faceTexels = static_cast<size_t>(opacityFaceSize) * opacityFaceSize;
+            for (size_t i = 0; i < values.size(); ++i) {
+                const float expected = i / faceTexels == 5 ? 0.0f : (winding ? 0.9375f : 0.0f);
+                Require(std::abs(values[i] - expected) < 0.001f,
                     "native CCW cloud fronts survive cube projection; reversed fronts are culled");
+            }
             ComPtr<ID3D11RasterizerState> restoredRasterizer;
             gpu.context->RSGetState(&restoredRasterizer);
             Require(restoredRasterizer.Get() == nativeCullState.Get(),
                 "opacity capture restores the native rasterizer");
         }
         gpu.context->RSSetState(noCullState.Get());
-        // The alternate producer must rasterize directly into one 2D target,
-        // retain all overlapping surfaces, and never submit the second VR eye.
-        targetDesc.Width = targetDesc.Height = FO4CS::SunMaskProjection::kResolution;
-        targetDesc.ArraySize = 1;
-        targetDesc.MiscFlags = 0;
-        ComPtr<ID3D11Texture2D> sunOpacity;
-        ComPtr<ID3D11RenderTargetView> sunTarget;
-        Check(gpu.device->CreateTexture2D(&targetDesc, nullptr, &sunOpacity), "sun opacity target");
-        Check(gpu.device->CreateRenderTargetView(sunOpacity.Get(), nullptr, &sunTarget), "sun opacity RTV");
-        FO4CS::SunMaskProjection sunProjection;
-        for (const DirectX::XMFLOAT3 sun : { DirectX::XMFLOAT3{0,0,1}, DirectX::XMFLOAT3{0.6f,0,0.8f} }) {
-            Require(FO4CS::SunMaskProjection::Build(sun, {0,0,0}, 10000, sunProjection), "sun basis");
-            for (UINT frame = 0; frame < 3; ++frame) {
-                fixture.vertex[world] = {1,0,0,0};
-                fixture.SetLive(frame == 2 ? 0.5f : 0, frame ? 1.0f : 0, 0);
-                gpu.context->ClearRenderTargetView(sunTarget.Get(), zero);
-                const auto before = draw.calls;
-                Require(Geometry::AccumulateSunOpacity(gpu.context.Get(), layout,
-                    Motion::CloudTechnique::kClouds, sunTarget.Get(), sunProjection, submitOverlap, &draw),
-                    "direct sun capture");
-                Require(draw.calls == before + 1, "2D producer submits one draw, with no hidden cubemap");
-                const auto values = gpu.Read(sunOpacity.Get());
-                const float expected = frame == 0 ? 0.0f : frame == 1 ? 0.4375f : 0.9375f;
-                for (UINT y = 248; y < 264; ++y)
-                    for (UINT x = 248; x < 264; ++x)
-                        Require(std::abs(values[y * 512 + x] - expected) < 0.001f,
-                            "2D overlapping opacity, animated UV, fade and stereo multiplicity");
-                for (float value : gpu.Read(primary.Get()))
-                    Require(value == 0.625f, "2D capture leaves visible sky unchanged");
-            }
-        }
-        // A textured edge across the roof gives the direct rasterizer an
-        // independent spatial oracle. Check both a rotated native World and
-        // a recentered sun map; constant-alpha domes cannot catch these errors.
-        auto patterned = overlapping;
-        for (UINT i = 0; i < patterned.size(); ++i)
-            patterned[i].uv[0] = patterned[i].p[0] / (i < 36 ? 1.0f : 1.2f) * 0.5f + 0.5f;
-        initial.pSysMem = patterned.data();
-        ComPtr<ID3D11Buffer> patternedVB;
-        Check(gpu.device->CreateBuffer(&bufferDesc, &initial, &patternedVB), "spatial cloud edge");
-        rawVB = patternedVB.Get();
-        gpu.context->IASetVertexBuffers(0,1,&rawVB,&stride,&offset);
-        for (bool rotated : {false, true}) for (bool recentered : {false, true}) {
-            fixture.vertex[world] = rotated ? Float4{0,-1,0,0} : Float4{1,0,0,0};
-            fixture.vertex[world+1] = rotated ? Float4{1,0,0,0} : Float4{0,1,0,0};
-            fixture.SetLive(0,1,0);
-            Require(FO4CS::SunMaskProjection::Build({0,0,1},
-                {recentered ? 5000.0f : 0.0f,0,0},10000,sunProjection), "spatial edge projection");
-            gpu.context->ClearRenderTargetView(sunTarget.Get(),zero);
-            Require(Geometry::AccumulateSunOpacity(gpu.context.Get(),layout,
-                Motion::CloudTechnique::kClouds,sunTarget.Get(),sunProjection,submitOverlap,&draw),
-                "spatial cloud raster");
-            const auto values = gpu.Read(sunOpacity.Get());
-            for (UINT y=248; y<264; ++y) for (UINT x=248; x<264; ++x) {
-                // Sample the same world patch after shifting the map 32 texels.
-                const UINT sampleX = recentered ? x-32 : x;
-                const bool high = rotated ? y<256 : x>=256;
-                Require(std::abs(values[y*512+sampleX]-(high ? 0.9375f : 0.4375f))<0.001f,
-                    "native UV edge follows world rotation and stays fixed under map recentering");
-            }
-        }
-        rawVB=overlapVB.Get();
-        gpu.context->IASetVertexBuffers(0,1,&rawVB,&stride,&offset);
-        fixture.vertex[world]={1,0,0,0}; fixture.vertex[world+1]={0,1,0,0};
-        fixture.SetLive(0.5f,1,0);
-        Require(FO4CS::SunMaskProjection::Build({0.6f,0,0.8f},{},10000,sunProjection), "restore oblique sun");
-        for (UINT winding = 0; winding < 2; ++winding) {
-            D3D11_RASTERIZER_DESC nativeCull = noCull;
-            nativeCull.CullMode = D3D11_CULL_BACK;
-            nativeCull.FrontCounterClockwise = winding != 0;
-            ComPtr<ID3D11RasterizerState> state;
-            Check(gpu.device->CreateRasterizerState(&nativeCull, &state), "2D native winding");
-            gpu.context->RSSetState(state.Get());
-            gpu.context->ClearRenderTargetView(sunTarget.Get(), zero);
-            Require(Geometry::AccumulateSunOpacity(gpu.context.Get(), layout,
-                Motion::CloudTechnique::kClouds, sunTarget.Get(), sunProjection, submitOverlap, &draw),
-                "2D native culling");
-            const auto values = gpu.Read(sunOpacity.Get());
-            Require(std::abs(values[256 * 512 + 256] - (winding ? 0.9375f : 0.0f)) < 0.001f,
-                "2D preserves native CCW fronts and culls reversed faces");
-            ComPtr<ID3D11RasterizerState> restored;
-            gpu.context->RSGetState(&restored);
-            Require(restored == state, "2D restores rasterizer");
-        }
         restoredCB.Reset();
         context1->VSGetConstantBuffers1(0,1,&restoredCB,&restoredFirst,&restoredCount);
         Require(restoredCB.Get() == sentinel && restoredFirst == first && restoredCount == count,
-            "2D restores exact native constant buffer window");
-        gpu.context->RSSetState(noCullState.Get());
+            "opacity capture restores the exact native constant buffer window");
         if (benchmark) {
-            gpu.Compare("Capture layers=9 cube=256x256x6 sun=512x512 surfaces=2", [&] {
+            gpu.Benchmark("Capture layers=9 cube=256x256x5 surfaces=2", [&] {
                 for (auto* target : opacityTargets)
                     gpu.context->ClearRenderTargetView(target,zero);
                 for (UINT layer = 0; layer < 9; ++layer)
                     Require(Geometry::AccumulateOpacity(gpu.context.Get(),layout,
                         Motion::CloudTechnique::kClouds,opacityFaceSize,opacityTargets,
                         submitOverlap,&draw), "benchmark live opacity");
-            }, [&] {
-                gpu.context->ClearRenderTargetView(sunTarget.Get(), zero);
-                for (UINT layer = 0; layer < 9; ++layer)
-                    Require(Geometry::AccumulateSunOpacity(gpu.context.Get(), layout,
-                        Motion::CloudTechnique::kClouds, sunTarget.Get(), sunProjection,
-                        submitOverlap, &draw), "benchmark direct sun opacity");
             },30);
         }
         if (!benchmark) {
@@ -935,15 +652,11 @@ float4 PS(Output i) : SV_Target {
             for (UINT frame=0; frame<27; ++frame) {
                 gpu.context->ClearRenderTargetView(primaryView.Get(),clear);
                 const auto technique = static_cast<Motion::CloudTechnique>(5u+(frame/3u)%3u);
-                if (frame%3 == 1) {
+                if (frame%3 != 0) {
                     for (auto* target : opacityTargets)
                         gpu.context->ClearRenderTargetView(target,zero);
                     Require(Geometry::AccumulateOpacity(gpu.context.Get(),layout,technique,
                         opacityFaceSize,opacityTargets,submitOverlap,&draw), "roundtrip cube capture");
-                } else if (frame%3 == 2) {
-                    gpu.context->ClearRenderTargetView(sunTarget.Get(),zero);
-                    Require(Geometry::AccumulateSunOpacity(gpu.context.Get(),layout,technique,
-                        sunTarget.Get(),sunProjection,submitOverlap,&draw), "roundtrip sun capture");
                 }
                 // Deliberately do not rebind native state here: Fallout can
                 // elide those setters when its CPU-side cache has not changed.
@@ -957,17 +670,19 @@ float4 PS(Output i) : SV_Target {
                         "visible sky roundtrip baseline contains preserved background");
                 } else {
                     Require(pixels == reference,
-                        "visible sky is pixel-identical across OFF, cubemap and sun capture frames");
+                        "visible sky is pixel-identical across OFF and cubemap capture frames");
                 }
             }
-            std::cout << "Visible sky roundtrip passed: 27 alternating OFF/cube/sun frames, "
+            std::cout << "Visible sky roundtrip passed: 27 alternating OFF/cube frames, "
                 << (vr ? "VR" : "flat") << ", cloud techniques 5/6/7\n";
         }
         const UINT callsBeforeReject = draw.calls;
         gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_LINELIST);
-        Require(!Geometry::CaptureLayer(gpu.context.Get(), layout, 1,
-            Motion::CloudTechnique::kClouds, 8, submit, &draw),
-            "unsupported geometry remains fail neutral");
+        auto reason = Geometry::RejectReason::kNone;
+        Require(!Geometry::AccumulateOpacity(gpu.context.Get(), layout,
+            Motion::CloudTechnique::kClouds, opacityFaceSize, opacityTargets,
+            submitOverlap, &draw, &reason) && reason == Geometry::RejectReason::kTopology,
+            "unsupported geometry remains fail neutral and reports why");
         Require(draw.calls == callsBeforeReject, "rejected capture never submits geometry");
         Geometry::ReleaseDeviceResources();
         gpu.context->ClearState();
@@ -975,10 +690,9 @@ float4 PS(Output i) : SV_Target {
     }
 
     ComPtr<ID3DBlob> Compile(const std::filesystem::path& file,
-        const char* entry, const char* profile, bool vr, bool sunMask = false)
+        const char* entry, const char* profile, bool vr)
     {
-        const D3D_SHADER_MACRO macros[]{ { "FO4CS_SHADER_VR", vr ? "1" : "0" },
-            { "FO4CS_SUN_MASK", sunMask ? "1" : "0" }, {} };
+        const D3D_SHADER_MACRO macros[]{ { "FO4CS_SHADER_VR", vr ? "1" : "0" }, {} };
         ComPtr<ID3DBlob> blob, errors;
         const HRESULT result = D3DCompileFromFile(file.c_str(), macros, D3D_COMPILE_STANDARD_FILE_INCLUDE,
             entry, profile, D3DCOMPILE_ENABLE_STRICTNESS |
@@ -1068,23 +782,28 @@ float4 PS(Output i) : SV_Target {
         ComPtr<ID3D11ShaderResourceView> cubeView;
         Check(gpu.device->CreateShaderResourceView(cube.Get(), nullptr, &cubeView), "cube view");
 
-        std::array<Float4, 48> plugin{};
+        std::array<Float4, 44> plugin{};
         plugin[0][0] = plugin[1][1] = plugin[2][2] = plugin[3][3] = 1.0f;
         plugin[4] = { static_cast<float>(width), static_cast<float>(height),
             1.0f / width, 1.0f / height };
         plugin[8] = { 2.0f, 1.0f, 0, 0 };
         plugin[9] = { 1, -2, -2, 0 };
         plugin[10] = { benchmark ? 10000.0f : 35000.0f,
-            benchmark ? FO4CS::SunMaskProjection::kPlanetRadius : 6371000.0f / 0.01428f, 1, 0 };
+            benchmark ? 6371000.0f * 70.0f : 6371000.0f / 0.01428f, 1, 0 };
         plugin[26] = { 0, 0, 0, 1 };
         std::array<Float4, 64> frame{};
         for (UINT i = 0; i < 4; ++i)
             frame[12 + i][i] = 1.0f;
+        // VR: identity ViewProj for the second eye too (c16-c19), so both
+        // eyes' view rotations are identity with the identity projections.
+        if (vr)
+            for (UINT i = 0; i < 4; ++i)
+                frame[16 + i][i] = 1.0f;
         for (UINT base = vr ? 32u : 20u; base < (vr ? 48u : 28u); base += 4)
             for (UINT i = 0; i < 4; ++i)
                 frame[base + i][i] = 1.0f;
         std::array<Float4, 48> call{};
-        call[0] = { 1.0f / width, 1.0f / height, 0, 0 };
+        call[0] = { 1.0f / width, 1.0f / height, 1.0f / width, 1.0f / height };
         call[1] = { 0, 0, 1, 0 };
         call[2] = { 0, 0, 1, 0 };
         call[vr ? 45 : 27] = { 1, 1, 0, 0 };
@@ -1105,30 +824,9 @@ float4 PS(Output i) : SV_Target {
         if (benchmark) {
             gpu.context->CSSetShader(shaders[0].Get(), nullptr, 0);
             gpu.context->CSSetUnorderedAccessViews(0, 1, &target, nullptr);
-            // Same output, depth, optics and work submission; only the captured
-            // field's representation and corresponding lookup shader differ.
-            desc.ArraySize=1; desc.MiscFlags=0; desc.Width=desc.Height=512;
-            std::vector<float> sunTexels(512*512,0.25f);
-            initial.pSysMem=sunTexels.data(); initial.SysMemPitch=512*sizeof(float);
-            ComPtr<ID3D11Texture2D> sunTexture;
-            ComPtr<ID3D11ShaderResourceView> sunView;
-            Check(gpu.device->CreateTexture2D(&desc,&initial,&sunTexture), "benchmark sun map");
-            Check(gpu.device->CreateShaderResourceView(sunTexture.Get(),nullptr,&sunView), "benchmark sun SRV");
-            FO4CS::SunMaskProjection projection;
-            Require(FO4CS::SunMaskProjection::Build({0,0,1},{},plugin[10][0],projection), "benchmark sun basis");
-            std::memcpy(plugin.data()+44,&projection,sizeof(projection));
-            gpu.context->UpdateSubresource(b0.Get(),0,nullptr,plugin.data(),0,0);
-            auto sunCode=Compile(shaderDirectory / "FO4CloudShadowScreenCS.hlsl","mainProduction","cs_5_0",vr,true);
-            ComPtr<ID3D11ComputeShader> sunShader;
-            Check(gpu.device->CreateComputeShader(sunCode->GetBufferPointer(),sunCode->GetBufferSize(),nullptr,&sunShader),
-                "benchmark sun shader");
-            gpu.Compare("Screen " + std::to_string(width) + "x" + std::to_string(height), [&] {
+            gpu.Benchmark("Screen " + std::to_string(width) + "x" + std::to_string(height), [&] {
                 auto* source=cubeView.Get(); gpu.context->CSSetShaderResources(1,1,&source);
                 gpu.context->CSSetShader(shaders[0].Get(),nullptr,0);
-                gpu.context->Dispatch((width+7)/8,(height+7)/8,1);
-            }, [&] {
-                auto* source=sunView.Get(); gpu.context->CSSetShaderResources(1,1,&source);
-                gpu.context->CSSetShader(sunShader.Get(),nullptr,0);
                 gpu.context->Dispatch((width+7)/8,(height+7)/8,1);
             },60);
             gpu.context->ClearState();
@@ -1149,6 +847,25 @@ float4 PS(Output i) : SV_Target {
         for (size_t i = 0; i < production.size(); ++i)
             Require(production[i] == (i == 0 || i == 2 || i == 3 ? 1.0f : 0.5f),
                 "near/far and both stereo eyes preserve receiver/background contract");
+
+        if (!vr) {
+            // 1.11.240 DFLight binds 25 per-call registers, so b2 c27 holds
+            // another technique's leftovers there: the CPU layout flag, not
+            // the register contents, decides whether it scales the depth fetch.
+            call[27] = { 0.5f, 0.5f, 0, 0 };
+            gpu.context->UpdateSubresource(b2.Get(), 0, nullptr, call.data(), 0, 0);
+            Require(dispatch(shaders[0].Get()) == production &&
+                dispatch(shaders[1].Get()) == production,
+                "the 1.11.240 layout ignores leftover b2 c27 contents");
+            plugin[5][0] = 1;
+            gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+            Require(dispatch(shaders[0].Get()) != production,
+                "the OG layout applies the dynamic-resolution depth scale");
+            plugin[5][0] = 0;
+            call[27] = { 1, 1, 0, 0 };
+            gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+            gpu.context->UpdateSubresource(b2.Get(), 0, nullptr, call.data(), 0, 0);
+        }
 
         // Isolation belongs only to the right capture-analysis panel. A
         // remembered selector must never remove clouds from normal shadows.
@@ -1193,10 +910,10 @@ float4 PS(Output i) : SV_Target {
         plugin[43] = {};
         gpu.context->UpdateSubresource(b0.Get(),0,nullptr,plugin.data(),0,0);
 
-        // A finite cloud casts a fixed terrain pattern. Hold that cloud and
-        // sun still while moving the camera: fixed world probes cannot change,
-        // and a player who leaves the patch must become sunlit. A uniform cube
-        // would hide the original camera-following defect.
+        // A finite cloud casts a terrain pattern. Hold that cloud and sun
+        // still while moving the camera: fixed world probes cannot change
+        // and a player who leaves the patch becomes sunlit, on flat and VR.
+        // A uniform cube would hide camera-following projection regressions.
         std::fill(cloud.begin(),cloud.end(),0.0f);
         for (UINT face = 0; face < 6; ++face)
             gpu.context->UpdateSubresource(cube.Get(), face, nullptr, cloud.data(),
@@ -1220,6 +937,10 @@ float4 PS(Output i) : SV_Target {
             fixedTerrainBefore.begin(), fixedTerrainBefore.end());
         Require(*mostCoverage - *leastCoverage > 0.5f,
             "world-anchor fixture must contain both cloud and clear terrain");
+        const auto screenBefore = dispatch(shaders[0].Get());
+        Require(std::any_of(screenBefore.begin(), screenBefore.end(),
+                    [](float value) { return value < 1.0f; }),
+            "the player starts under the cloud patch");
         for (const Float4 camera : {Float4{120000,-80000,4000,0},
                 Float4{-95000,110000,-3000,0}}) {
             if (vr) {
@@ -1229,14 +950,46 @@ float4 PS(Output i) : SV_Target {
             } else
                 frame[35] = camera;
             gpu.context->UpdateSubresource(b1.Get(), 0, nullptr, frame.data(), 0, 0);
-            Require(dispatch(anchorProbe.Get()) == fixedTerrainBefore,
-                "fixed world terrain must keep identical cloud coverage when only the camera moves");
             const auto moved = dispatch(shaders[0].Get());
             Require(moved == dispatch(shaders[1].Get()),
-                "production and diagnostic use the same fixed cloud origin");
+                "production and diagnostic use the same cloud origin");
+            Require(dispatch(anchorProbe.Get()) == fixedTerrainBefore,
+                "fixed world terrain must keep identical cloud coverage when only the camera moves");
             for (size_t i = 0; i < moved.size(); ++i)
                 Require(moved[i] == 1.0f,
                     "a player travelling outside a stationary cloud patch becomes sunlit");
+        }
+        if (vr) {
+            // Travel re-anchoring blends two projections of the same live
+            // field. The current origin is far behind the player (clear sky
+            // above the player from there); the previous origin is the
+            // player's own position, directly under the stationary patch.
+            const Float4 camera{ 120000, -80000, 4000, 0 };
+            if (vr) {
+                frame[59] = frame[60] = camera;
+                frame[59][0] -= 2;
+                frame[60][0] += 2;
+            } else
+                frame[35] = camera;
+            gpu.context->UpdateSubresource(b1.Get(), 0, nullptr, frame.data(), 0, 0);
+            plugin[6] = { camera[0], camera[1], camera[2], 1 };
+            for (const float weight : { 0.0f, 0.5f, 1.0f }) {
+                plugin[5] = { 0, weight, 0, 0 };
+                gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+                const auto blended = dispatch(shaders[0].Get());
+                Require(blended == dispatch(shaders[1].Get()),
+                    "production and diagnostic blend a re-anchor identically");
+                // Coverage lerps 0 -> 0.75; opacity 2 doubles it before the clamp.
+                const float expected = (std::max)(0.0f, 1.0f - 0.75f * weight * 2.0f);
+                for (size_t i = 0; i < blended.size(); ++i) {
+                    const bool receiver = i != 0 && i != 2 && i != 3;
+                    Require(std::abs(blended[i] - (receiver ? expected : 1.0f)) < 1.0e-4f,
+                        "re-anchor crossfade weights the previous origin exactly");
+                }
+            }
+            plugin[5] = {};
+            plugin[6] = {};
+            gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
         }
         std::fill(cloud.begin(),cloud.end(),0.0f);
         gpu.context->UpdateSubresource(cube.Get(), 4, nullptr, cloud.data(),
@@ -1351,17 +1104,195 @@ float4 PS(Output i) : SV_Target {
                     Require(value == 0.5f,
                         "cloud covering sunlight shadows receivers despite a stale scene camera");
             }
+
+            // Keep a terrain point fixed, move/roll the camera, and forward
+            // project that point into a known depth texel. AE upscalers keep
+            // the depth allocation at output size while reducing the rendered
+            // viewport: b2 c0.xy addresses depth, c0.zw maps pixels to NDC.
+            // OG deliberately uses c0.xy for NDC even when c0.zw differs.
+            // Forward projection supplies the oracle, not our reconstruction.
+            for (const bool legacy : {true, false}) {
+                for (const UINT renderExtent : {8u, 6u, 4u}) {
+                    if (legacy && renderExtent != 8u) continue;
+                    plugin[5][0] = legacy ? 1.0f : 0.0f;
+                    call[0] = {1.0f / 8, 1.0f / 8,
+                        legacy ? 1.0f / 6 : 1.0f / renderExtent,
+                        legacy ? 1.0f / 6 : 1.0f / renderExtent};
+                    call[27] = legacy ? Float4{1,1,0,0} : Float4{0.25f,0.25f,0,0};
+                    plugin[43] = {0,0,1,1}; // Fixed world sun, independent of the view.
+                    gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+                    for (const bool nearReceiver : {false, true}) {
+                        const XMVECTOR terrain = XMVectorAdd(origin, nearReceiver ?
+                            XMVectorSet(0.5f, -0.25f, 16, 0) :
+                            XMVectorSet(128, -64, 2048, 0));
+                        XMFLOAT3 expectedTerrain;
+                        XMStoreFloat3(&expectedTerrain, terrain);
+                        UINT pose = 0;
+                        for (const Float4 angles : {Float4{0,0,0,0},
+                                Float4{0.12f,0.25f,-0.18f,1},
+                                Float4{-0.08f,-0.2f,0.15f,-1}, Float4{0,0,0,0}}) {
+                            const float motion = nearReceiver ? 0.5f : 32.0f;
+                            const XMVECTOR camera = XMVectorAdd(origin,
+                                XMVectorSet(angles[3] * motion, -angles[3] * motion * 0.5f,
+                                    angles[3] * motion * 0.25f, 0));
+                            XMFLOAT4 cameraPosition;
+                            XMStoreFloat4(&cameraPosition, camera);
+                            std::memcpy(frame[35].data(), &cameraPosition, sizeof(cameraPosition));
+                            const XMMATRIX inverseView = XMMatrixRotationRollPitchYaw(
+                                angles[0], angles[1], angles[2]);
+                            writeMatrix(12, inverseView);
+                            const XMVECTOR viewPoint = XMVector4Transform(
+                                XMVectorSetW(XMVectorSubtract(terrain, camera), 1),
+                                XMMatrixInverse(nullptr, inverseView));
+                            XMMATRIX projection = nearReceiver ? nearProjection : farProjection;
+                            const UINT x = 1 + (pose++ % 2), y = 1;
+                            const XMVECTOR ndc = XMVectorSet(
+                                (x + 0.5f) * 2 / renderExtent - 1,
+                                1 - (y + 0.5f) * 2 / renderExtent, 0, 0);
+                            // Off-centre projection puts this same world point
+                            // on an exact pixel centre, avoiding sample rounding.
+                            const XMVECTOR firstClip = XMVector4Transform(viewPoint, projection);
+                            projection.r[2] = XMVectorAdd(projection.r[2], XMVectorSelect(
+                                XMVectorZero(), XMVectorSubtract(ndc,
+                                    XMVectorDivide(firstClip, XMVectorSplatW(firstClip))),
+                                XMVectorSelectControl(1,1,0,0)));
+                            const XMVECTOR clip = XMVector4Transform(viewPoint, projection);
+                            const float nativeDepth = XMVectorGetZ(clip) / XMVectorGetW(clip);
+                            writeMatrix(nearReceiver ? 24 : 20, XMMatrixInverse(nullptr, projection));
+                            std::fill(depths.begin(), depths.end(), 1.0f);
+                            depths[y * 8 + x] = nearReceiver ? nativeDepth * 0.01f :
+                                (nativeDepth + 0.01f) / 1.01f;
+                            gpu.context->UpdateSubresource(depth.Get(), 0, nullptr, depths.data(),
+                                8 * sizeof(float), 0);
+                            gpu.context->UpdateSubresource(b1.Get(), 0, nullptr, frame.data(), 0, 0);
+                            gpu.context->UpdateSubresource(b2.Get(), 0, nullptr, call.data(), 0, 0);
+                            gpu.context->CSSetShader(probe.Get(), nullptr, 0);
+                            ID3D11UnorderedAccessView* probeUav = probeTarget.Get();
+                            gpu.context->CSSetUnorderedAccessViews(3, 1, &probeUav, nullptr);
+                            gpu.context->Dispatch(1, 1, 1);
+                            probeUav = nullptr;
+                            gpu.context->CSSetUnorderedAccessViews(3, 1, &probeUav, nullptr);
+                            const auto observed = gpu.Read(probeTexture.Get());
+                            const UINT index = (y * 8 + x) * 4;
+                            Require(std::abs(observed[index] - expectedTerrain.x) < 0.2f &&
+                                std::abs(observed[index + 1] - expectedTerrain.y) < 0.2f &&
+                                std::abs(observed[index + 2] - expectedTerrain.z) < 0.2f &&
+                                std::abs(observed[index + 3] - depths[y * 8 + x]) < 1.0e-6f,
+                                "fixed terrain stays fixed during camera translation/roll at native and reduced AE resolution");
+                        }
+                    }
+                }
+            }
+        }
+        if (vr) {
+            using namespace DirectX;
+            // VR DFLight lights in view space: c12+4e is each eye's ViewProj
+            // (eye-relative world -> clip) and c32+4e its inverse projection
+            // (layout confirmed by a headset readback, 24 Sep 2026). Receivers
+            // and the engine sun must come back in world space for any head
+            // rotation; view-space receivers made shadows turn with the head.
+            auto code = Compile(shaderDirectory.parent_path().parent_path() /
+                "tests/CloudProjectionProbeCS.hlsl", "probe", "cs_5_0", true);
+            ComPtr<ID3D11ComputeShader> probe;
+            Check(gpu.device->CreateComputeShader(code->GetBufferPointer(),
+                code->GetBufferSize(), nullptr, &probe), "VR projection observer");
+            D3D11_TEXTURE2D_DESC probeDesc{};
+            probeDesc.Width = 32;
+            probeDesc.Height = 9;
+            probeDesc.ArraySize = probeDesc.MipLevels = probeDesc.SampleDesc.Count = 1;
+            probeDesc.Format = DXGI_FORMAT_R32_FLOAT;
+            probeDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+            ComPtr<ID3D11Texture2D> probeTexture;
+            ComPtr<ID3D11UnorderedAccessView> probeTarget;
+            Check(gpu.device->CreateTexture2D(&probeDesc, nullptr, &probeTexture),
+                "VR projection observer texture");
+            Check(gpu.device->CreateUnorderedAccessView(probeTexture.Get(), nullptr,
+                &probeTarget), "VR projection observer target");
+            const auto writeMatrix = [&](UINT base, FXMMATRIX matrix) {
+                XMFLOAT4X4 packed;
+                XMStoreFloat4x4(&packed, XMMatrixTranspose(matrix));
+                std::memcpy(frame.data() + base, &packed, sizeof(packed));
+            };
+            const std::array<XMVECTOR, 2> eyes{
+                XMVectorSet(-24048, -29155, 16340, 0), XMVectorSet(-24042, -29155, 16340, 0) };
+            const std::array<XMMATRIX, 2> projections{
+                XMMatrixPerspectiveOffCenterLH(-7, 5, -7, 9, 5, 100000),
+                XMMatrixPerspectiveOffCenterLH(-5, 7, -7, 9, 5, 100000) };
+            const XMVECTOR sunWorld = XMVector3Normalize(XMVectorSet(0.8f, 0.15f, 0.5f, 0));
+            plugin[43] = {}; // Use the engine's per-eye (view-space) sun.
+            gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+            for (const Float4 angles : { Float4{0,0,0,0}, Float4{0.4f,1.2f,0.3f,0},
+                    Float4{-0.7f,-1.8f,0.2f,0}, Float4{1.0f,2.6f,-0.4f,0} }) {
+                const XMMATRIX inverseView = XMMatrixRotationRollPitchYaw(
+                    angles[0], angles[1], angles[2]);
+                const XMMATRIX view = XMMatrixInverse(nullptr, inverseView);
+                for (UINT eye = 0; eye < 2; ++eye) {
+                    writeMatrix(12 + 4 * eye, view * projections[eye]);
+                    writeMatrix(32 + 4 * eye, XMMatrixInverse(nullptr, projections[eye]));
+                    writeMatrix(40 + 4 * eye, XMMatrixInverse(nullptr, projections[eye]));
+                    XMFLOAT4 eyePosition;
+                    XMStoreFloat4(&eyePosition, eyes[eye]);
+                    frame[59 + eye] = { eyePosition.x, eyePosition.y, eyePosition.z, 0 };
+                    XMFLOAT4 sunView;
+                    XMStoreFloat4(&sunView, XMVector3TransformNormal(sunWorld, view));
+                    call[1 + eye] = { sunView.x, sunView.y, sunView.z, 0 };
+                }
+                std::array<XMFLOAT3, 64> expected{};
+                for (UINT y = 0; y < 8; ++y) {
+                    for (UINT x = 0; x < 8; ++x) {
+                        const UINT eye = x >= 4 ? 1u : 0u;
+                        const XMMATRIX& projection = projections[eye];
+                        const XMVECTOR clip = XMVector4Transform(
+                            XMVectorSet(0, 0, 2048.0f + 64.0f * x, 1), projection);
+                        const float nativeDepth = XMVectorGetZ(clip) / XMVectorGetW(clip);
+                        depths[y * 8 + x] = (nativeDepth + 0.01f) / 1.01f;
+                        float ndcX = (x + 0.5f) * 0.25f - 1;
+                        ndcX = (ndcX + (eye ? -0.5f : 0.5f)) * 2.0f;
+                        const XMVECTOR ndc = XMVectorSet(ndcX, 1 - (y + 0.5f) * 0.25f, nativeDepth, 1);
+                        XMVECTOR reconstructed = XMVector4Transform(ndc,
+                            XMMatrixInverse(nullptr, projection));
+                        reconstructed = XMVectorDivide(reconstructed, XMVectorSplatW(reconstructed));
+                        XMStoreFloat3(&expected[y * 8 + x], XMVectorAdd(eyes[eye],
+                            XMVector3TransformNormal(reconstructed, inverseView)));
+                    }
+                }
+                gpu.context->UpdateSubresource(depth.Get(), 0, nullptr, depths.data(),
+                    8 * sizeof(float), 0);
+                gpu.context->UpdateSubresource(b1.Get(), 0, nullptr, frame.data(), 0, 0);
+                gpu.context->UpdateSubresource(b2.Get(), 0, nullptr, call.data(), 0, 0);
+                gpu.context->CSSetShader(probe.Get(), nullptr, 0);
+                ID3D11UnorderedAccessView* probeUav = probeTarget.Get();
+                gpu.context->CSSetUnorderedAccessViews(3, 1, &probeUav, nullptr);
+                gpu.context->Dispatch(1, 1, 1);
+                probeUav = nullptr;
+                gpu.context->CSSetUnorderedAccessViews(3, 1, &probeUav, nullptr);
+                const auto observed = gpu.Read(probeTexture.Get());
+                for (UINT pixel = 0; pixel < 64; ++pixel) {
+                    const auto& receiver = expected[pixel];
+                    const size_t index = static_cast<size_t>(pixel / 8) * 32 + (pixel % 8) * 4;
+                    Require(std::abs(observed[index] - receiver.x) < 0.5f &&
+                        std::abs(observed[index + 1] - receiver.y) < 0.5f &&
+                        std::abs(observed[index + 2] - receiver.z) < 0.5f,
+                        "VR receivers are world positions for every head rotation, in both eyes");
+                }
+                XMFLOAT3 expectedSun;
+                XMStoreFloat3(&expectedSun, sunWorld);
+                Require(std::abs(observed[256] - expectedSun.x) < 1.0e-4f &&
+                    std::abs(observed[257] - expectedSun.y) < 1.0e-4f &&
+                    std::abs(observed[258] - expectedSun.z) < 1.0e-4f && observed[259] == 1,
+                    "the VR engine sun is rotated from view space to world space");
+            }
         }
         gpu.context->ClearState();
         gpu.CheckMessages();
     }
 
-    void RunGodrayCloudTests(GPU& gpu, bool sunMask = false)
+    void RunGodrayCloudTests(GPU& gpu)
     {
         namespace Godray = FO4CS::GodrayCloudShader;
         gpu.context->ClearState();
         for (bool screen : { false, true }) {
-            const auto source = Godray::PayloadSource(screen, sunMask);
+            const auto source = Godray::PayloadSource(screen);
             ComPtr<ID3DBlob> code, errors;
             const auto result = D3DCompile(source.data(), source.size(), nullptr,
                 nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS |
@@ -1372,7 +1303,7 @@ float4 PS(Output i) : SV_Target {
             Check(gpu.device->CreatePixelShader(code->GetBufferPointer(),
                 code->GetBufferSize(), nullptr, &shader), "create production godray payload");
         }
-        const auto source = std::string(sunMask ? "#define FO4CS_SUN_MASK 1\n" : "") + Godray::CommonSource() + R"hlsl(
+        const auto source = std::string(Godray::CommonSource()) + R"hlsl(
 RWTexture2D<float> Result : register(u0);
 [numthreads(1,1,1)] void main(uint3 id : SV_DispatchThreadID)
 {
@@ -1391,10 +1322,10 @@ RWTexture2D<float> Result : register(u0);
         D3D11_TEXTURE2D_DESC description{};
         description.Width = description.Height = 8;
         description.MipLevels = description.SampleDesc.Count = 1;
-        description.ArraySize = sunMask ? 1 : 6;
+        description.ArraySize = 6;
         description.Format = DXGI_FORMAT_R32_FLOAT;
         description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        description.MiscFlags = sunMask ? 0 : D3D11_RESOURCE_MISC_TEXTURECUBE;
+        description.MiscFlags = D3D11_RESOURCE_MISC_TEXTURECUBE;
         ComPtr<ID3D11Texture2D> cube;
         Check(gpu.device->CreateTexture2D(&description, nullptr, &cube), "create godray fixture cube");
         ComPtr<ID3D11ShaderResourceView> view;
@@ -1413,8 +1344,6 @@ RWTexture2D<float> Result : register(u0);
         auto passBuffer = gpu.Constants(pass.data(), sizeof(pass));
         auto nativeBuffer = gpu.Constants(nativeVolume.data(), sizeof(nativeVolume));
         Godray::Constants cloud{};
-        if (sunMask)
-            Require(FO4CS::SunMaskProjection::Build({0,0,1}, {}, 10000, cloud.sunProjection), "godray sun projection");
         cloud.geometryAndStrength = { 10000, 6371000.0f * 70.0f, 1, 1 };
         cloud.captureOriginAndBlend = { 0, 0, 0, 1 };
         cloud.expectedEyeAndTolerance = { 0, 0, 0, 16 };
@@ -1422,11 +1351,11 @@ RWTexture2D<float> Result : register(u0);
         auto cloudBuffer = gpu.Constants(&cloud, sizeof(cloud));
         auto sampler = gpu.Sampler();
         const auto fill = [&](float opacity, bool edge = false) {
-            for (UINT face = 0; face < (sunMask ? 1u : 6u); ++face) {
+            for (UINT face = 0; face < 6u; ++face) {
                 std::array<float, 64> texels{};
                 for (UINT y = 0; y < 8; ++y)
                     for (UINT x = 0; x < 8; ++x)
-                        texels[y * 8 + x] = edge ? ((sunMask || face == 4) && x < 4 ? 1.0f : 0.0f) : opacity;
+                        texels[y * 8 + x] = edge ? (face == 4 && x < 4 ? 1.0f : 0.0f) : opacity;
                 gpu.context->UpdateSubresource(cube.Get(), face, nullptr,
                     texels.data(), 8 * sizeof(float), 0);
             }
@@ -1486,19 +1415,6 @@ RWTexture2D<float> Result : register(u0);
         GPU gpu(true);
         std::cout << "Synthetic warm-cache timings; excludes native capture and game lighting.\n";
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kFlat,0.5f,true);
-        for (uint32_t layers : { 1u, 4u, 8u, 16u }) {
-            MotionFixture fixture(gpu, Motion::SkyConstantLayout::kFlat);
-            fixture.faceSize = 256;
-            fixture.Capture(1, layers);
-            const double milliseconds = gpu.Measure([&] {
-                fixture.Begin(1);
-                for (uint32_t id = 1; id <= layers; ++id)
-                    fixture.Accumulate(id, Motion::CloudTechnique::kClouds);
-                (void)fixture.Complete();
-            }, 30);
-            std::cout << "Motion 256x256x6 layers=" << layers << " GPU span ms="
-                << milliseconds << '\n';
-        }
         for (auto extent : { std::array<UINT, 2>{ 1920, 1080 },
                  std::array<UINT, 2>{ 2560, 1440 }, std::array<UINT, 2>{ 3840, 2160 } })
             RunScreenTests(gpu, directory, false, extent[0], extent[1], true);
@@ -1513,8 +1429,6 @@ int main(int argc, char** argv)
             "usage: CloudRendererTests <shader directory> [--benchmark|--hardware]");
         GPU gpu(hardware);
         RunMainViewCameraReadbackTests(gpu);
-        RunMotionTests(gpu, Motion::SkyConstantLayout::kFlat);
-        RunMotionTests(gpu, Motion::SkyConstantLayout::kVr);
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kFlat);
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kVr);
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kFlat, 0.0f);
@@ -1525,7 +1439,6 @@ int main(int argc, char** argv)
         RunComparisonScreenTests(gpu, argv[1], true);
         RunCubemapPreviewTests(gpu);
         RunGodrayCloudTests(gpu);
-        RunGodrayCloudTests(gpu, true);
         if (argc == 3 && !hardware)
             RunBenchmarks(argv[1]);
         std::cout << "Cloud renderer GPU contracts passed (flat/VR motion and masks)\n";

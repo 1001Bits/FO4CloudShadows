@@ -3,25 +3,23 @@
 void RunComparisonScreenTests(GPU& gpu, const std::filesystem::path& directory, bool vr)
 {
     gpu.context->ClearState();
-    constexpr UINT width = 16, height = 8, cubeSize = 64, mapSize = 512;
-    const auto compile = [&](const char* entry, bool sun) {
-        auto code = Compile(directory / "FO4CloudShadowScreenCS.hlsl", entry, "cs_5_0", vr, sun);
+    constexpr UINT width = 16, height = 8, cubeSize = 64;
+    const auto compile = [&](const char* entry) {
+        auto code = Compile(directory / "FO4CloudShadowScreenCS.hlsl", entry, "cs_5_0", vr);
         ComPtr<ID3D11ComputeShader> shader;
         Check(gpu.device->CreateComputeShader(code->GetBufferPointer(), code->GetBufferSize(),
             nullptr, &shader), "comparison shader");
         return shader;
     };
-    auto preview = compile("mainSkyPreview", false);
-    auto production = compile("mainProduction", true);
-    auto diagnostic = compile("main", true);
-    std::array<Float4,48> plugin{};
+    auto preview = compile("mainSkyPreview");
+    std::array<Float4,44> plugin{};
     plugin[4] = {width, height, 1.0f/width, 1.0f/height};
     plugin[8] = {1,1,0,0}; plugin[9] = {1,-2,-2,2};
-    plugin[10] = {10000, FO4CS::SunMaskProjection::kPlanetRadius, 1, 0};
+    plugin[10] = {10000, 6371000.0f * 70.0f, 1, 0};
     plugin[26] = {0,0,0,1}; plugin[43] = {0,0,1,1};
     std::array<Float4,64> frame{};
     std::array<Float4,48> call{};
-    call[0] = {1.0f/width, 1.0f/height,0,0};
+    call[0] = {1.0f/width, 1.0f/height,1.0f/width,1.0f/height};
     call[vr ? 45 : 27] = {1,1,0,0};
     const Float4 stereo{1,0,0,0};
     auto b0 = gpu.Constants(plugin.data(), sizeof(plugin));
@@ -39,14 +37,12 @@ void RunComparisonScreenTests(GPU& gpu, const std::filesystem::path& directory, 
     desc.ArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
     desc.Format = DXGI_FORMAT_R32G32B32A32_FLOAT;
     desc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
-    ComPtr<ID3D11Texture2D> previewOutput, maskOutput, depth, cube, map;
-    ComPtr<ID3D11UnorderedAccessView> previewUav, maskUav;
-    ComPtr<ID3D11ShaderResourceView> depthSrv, cubeSrv, mapSrv;
+    ComPtr<ID3D11Texture2D> previewOutput, depth, cube;
+    ComPtr<ID3D11UnorderedAccessView> previewUav;
+    ComPtr<ID3D11ShaderResourceView> depthSrv, cubeSrv;
     Check(gpu.device->CreateTexture2D(&desc,nullptr,&previewOutput), "preview output");
     Check(gpu.device->CreateUnorderedAccessView(previewOutput.Get(),nullptr,&previewUav), "preview UAV");
     desc.Format = DXGI_FORMAT_R32_FLOAT;
-    Check(gpu.device->CreateTexture2D(&desc,nullptr,&maskOutput), "sun mask output");
-    Check(gpu.device->CreateUnorderedAccessView(maskOutput.Get(),nullptr,&maskUav), "sun mask UAV");
     desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
     Check(gpu.device->CreateTexture2D(&desc,nullptr,&depth), "comparison depth");
     Check(gpu.device->CreateShaderResourceView(depth.Get(),nullptr,&depthSrv), "comparison depth SRV");
@@ -71,18 +67,18 @@ void RunComparisonScreenTests(GPU& gpu, const std::filesystem::path& directory, 
         }
         gpu.context->UpdateSubresource(cube.Get(),face,nullptr,texels.data(),cubeSize*sizeof(float),0);
     }
-    const auto dispatch = [&](ID3D11ComputeShader* shader, bool sky) {
+    const auto dispatch = [&](ID3D11ComputeShader* shader) {
         gpu.context->UpdateSubresource(b0.Get(),0,nullptr,plugin.data(),0,0);
         gpu.context->UpdateSubresource(b1.Get(),0,nullptr,frame.data(),0,0);
-        ID3D11ShaderResourceView* inputs[]{depthSrv.Get(), sky ? cubeSrv.Get() : mapSrv.Get()};
-        auto* output = sky ? previewUav.Get() : maskUav.Get();
+        ID3D11ShaderResourceView* inputs[]{depthSrv.Get(), cubeSrv.Get()};
+        auto* output = previewUav.Get();
         gpu.context->CSSetShaderResources(0,2,inputs);
         gpu.context->CSSetShader(shader,nullptr,0);
         gpu.context->CSSetUnorderedAccessViews(0,1,&output,nullptr);
         gpu.context->Dispatch(width/8,height/8,1);
         output = nullptr;
         gpu.context->CSSetUnorderedAccessViews(0,1,&output,nullptr);
-        return gpu.Read(sky ? previewOutput.Get() : maskOutput.Get());
+        return gpu.Read(previewOutput.Get());
     };
     const std::array<std::array<float,3>,6> forwards{{{0,0,1},{1,0,0},{0,1,0},{0,0,-1},{-1,0,0},{0,-1,0}}};
     const std::array<std::array<float,3>,6> rights{{{1,0,0},{0,0,-1},{1,0,0},{-1,0,0},{0,0,1},{1,0,0}}};
@@ -98,10 +94,22 @@ void RunComparisonScreenTests(GPU& gpu, const std::filesystem::path& directory, 
             frame[base]={1.1f,0,0,shift};
             frame[base+1]={0,0.8f,0,-0.03f};
             frame[base+2]={0,0,0,1}; frame[base+3]={0,0,-0.99f,1};
-            if (vr) for (UINT axis=0; axis<3; ++axis)
-                frame[base+axis]={r[axis]*1.1f,u[axis]*0.8f,0,r[axis]*shift-u[axis]*0.03f+f[axis]};
+            if (vr) {
+                // VR: c32+4e is the eye's inverse projection (above) and
+                // c12+4e its ViewProj, chosen so their product is the
+                // world->view rotation with rows r/u/f.
+                const UINT m=12+4*eye;
+                for (UINT axis=0; axis<3; ++axis) {
+                    frame[m][axis]=(r[axis]-shift*f[axis])/1.1f;
+                    frame[m+1][axis]=(u[axis]+0.03f*f[axis])/0.8f;
+                    frame[m+2][axis]=f[axis]/0.99f;
+                    frame[m+3][axis]=f[axis];
+                }
+                frame[m][3]=frame[m+1][3]=frame[m+3][3]=0;
+                frame[m+2][3]=-1.0f/0.99f;
+            }
         }
-        const auto raw=dispatch(preview.Get(),true);
+        const auto raw=dispatch(preview.Get());
         for (UINT y=0; y<height; ++y) for (UINT x=0; x<width; ++x) {
             const UINT eye=vr && x>=width/2 ? 1u : 0u;
             const float nx=vr ? ((x%(width/2)+0.5f)*4/width-1) : (x+0.5f)*2/width-1;
@@ -119,62 +127,16 @@ void RunComparisonScreenTests(GPU& gpu, const std::filesystem::path& directory, 
             frame[35]={0,0,-0.99f,1}; frame[59]=frame[60]={123456,654321,321,0};
         }
         plugin[26]={99999,-7777,4321,1}; plugin[43]={1,0,0,1}; plugin[10][0]=90000;
-        Require(dispatch(preview.Get(),true)==raw,
+        Require(dispatch(preview.Get())==raw,
             "raw sky preview is independent of player translation, field anchor, height and sun");
         plugin[9][3]=1;
-        const auto overlay=dispatch(preview.Get(),true);
+        const auto overlay=dispatch(preview.Get());
         for (UINT i=0; i<width*height; ++i)
             Require(std::abs(overlay[i*4+3]-(i==1 ? 0 : raw[i*4]*0.65f))<0.0001f,
                 "overlay tints sky only and leaves foreground geometry visible");
         plugin[9][3]=2;
     }
 
-    // A world-fixed edge at x=0 is encoded directly in the sun-plane map.
-    desc.Width=desc.Height=mapSize; desc.ArraySize=1; desc.MiscFlags=0;
-    Check(gpu.device->CreateTexture2D(&desc,nullptr,&map), "2D source");
-    Check(gpu.device->CreateShaderResourceView(map.Get(),nullptr,&mapSrv), "2D source SRV");
-    const auto fillMap = [&](float center) {
-        std::vector<float> texels(mapSize*mapSize);
-        for (UINT y=0; y<mapSize; ++y) for (UINT x=0; x<mapSize; ++x)
-            texels[y*mapSize+x]=((x+0.5f)*80000/mapSize-40000+center)<0 ? 0.2f : 0.7f;
-        gpu.context->UpdateSubresource(map.Get(),0,nullptr,texels.data(),mapSize*sizeof(float),0);
-    };
-    FO4CS::SunMaskProjection projection{};
-    Require(!FO4CS::SunMaskProjection::Build({0,0,-1},{},10000,projection), "sun below horizon rejected");
-    Require(!FO4CS::SunMaskProjection::Build({1.0e38f,0,1},{},10000,projection), "overflowing sun normalization rejected");
-    Require(!FO4CS::SunMaskProjection::Build({0,0,1},{},1.0e38f,projection), "overflowing shell rejected");
-    Require(FO4CS::SunMaskProjection::Build({0,0,1},{},10000,projection), "overhead sun map basis");
-    std::memcpy(plugin.data()+44,&projection,sizeof(projection));
-    plugin[9]={1,-2,-2,0}; plugin[10]={10000,FO4CS::SunMaskProjection::kPlanetRadius,1,0};
-    plugin[26]={0,0,0,1}; plugin[43]={0,0,1,1};
-    depths.fill(0.5f); depths[0]=1; depths[1]=0.005f;
-    gpu.context->UpdateSubresource(depth.Get(),0,nullptr,depths.data(),width*sizeof(float),0);
-    frame={};
-    for (UINT i=0; i<4; ++i) frame[12+i][i]=1;
-    for (UINT base=vr?32u:20u; base<(vr?48u:28u); base+=4) {
-        frame[base]={20000,0,0,0}; frame[base+1]={0,20000,0,0};
-        frame[base+2]={0,0,0,0}; frame[base+3]={0,0,0,1};
-    }
-    fillMap(0);
-    const auto first=dispatch(production.Get(),false);
-    Require(dispatch(diagnostic.Get(),false)==first, "2D diagnostic and production agree");
-    for (UINT y=0; y<height; ++y) for (UINT x=0; x<width; ++x) {
-        const UINT i=y*width+x, localX=vr ? x%(width/2) : x;
-        const float expected=i==0 ? 1.0f : localX<(vr ? width/4 : width/2) ? 0.8f : 0.3f;
-        Require(std::abs(first[i]-expected)<0.001f, "2D receiver samples the expected world cloud patch in both eyes");
-    }
-    // Keep terrain fixed while moving the camera by compensating its native
-    // inverse projection translation, then recenter the finite capture window.
-    if (vr) frame[59]=frame[60]={5000,0,0,0}; else frame[35]={5000,0,0,0};
-    for (UINT base=vr?32u:20u; base<(vr?48u:28u); base+=4) frame[base][3]=-5000;
-    Require(dispatch(production.Get(),false)==first, "camera movement does not drag the 2D shadow");
-    Require(FO4CS::SunMaskProjection::Build({0,0,1},{5000,0,0},10000,projection), "recenter map");
-    std::memcpy(plugin.data()+44,&projection,sizeof(projection)); fillMap(projection.centerAndValid.x);
-    Require(dispatch(production.Get(),false)==first, "finite map recentering preserves world cloud positions");
-    plugin[47][0]=100000;
-    for (float value:dispatch(production.Get(),false)) Require(value==1, "outside finite map is neutral, never tiled");
-    plugin[47][0]=0; plugin[47][3]=0;
-    for (float value:dispatch(production.Get(),false)) Require(value==1, "invalid sun transform is neutral");
     gpu.context->ClearState(); gpu.CheckMessages();
-    std::cout << (vr ? "VR" : "Flat") << " sky alignment and sun 2D projection contracts passed\n";
+    std::cout << (vr ? "VR" : "Flat") << " sky alignment contracts passed\n";
 }

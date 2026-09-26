@@ -9,6 +9,7 @@
 #include "ResidentPageValidation.h"
 #include <bcrypt.h>
 #include <fstream>
+#include <thread>
 #include <filesystem>
 #include <nlohmann/json.hpp>
 
@@ -78,9 +79,15 @@ namespace FO4CS::PrivateProfile
             SPDLOG_INFO("FO4CloudShadows private profile v1 PID={}", GetCurrentProcessId());
             SPDLOG_INFO("[CloudShadows][PrivateProfile] Armed PID={} on private desktop; file control only, application cadence (not display FPS)", GetCurrentProcessId());
         }
-        void PollScreenshot(IDXGISwapChain* chain) {
+        void PollScreenshot(IDXGISwapChain* chain, double now) {
             // Explicit test-harness trigger only. Captures happen before any
             // measurement window. One asynchronous readback, no pipeline changes.
+            // The trigger file is checked four times a second, not per Present.
+            static double nextTriggerPoll = 0.0;
+            if (!screenshot) {
+                if (now < nextTriggerPoll) return;
+                nextTriggerPoll = now + 0.25;
+            }
             using Microsoft::WRL::ComPtr;
             ComPtr<ID3D11Device> device;
             if (FAILED(chain->GetDevice(IID_PPV_ARGS(&device)))) return;
@@ -130,7 +137,12 @@ namespace FO4CS::PrivateProfile
             const auto gpuTimings = CloudComparison::GetTimings();
             CloudComparison::SetProfilingMeasurements(false);
             const auto base = requestPath.parent_path() / lastTag;
-            std::ofstream output(base.string() + ".frames.csv", std::ios::binary);
+            // The CSV holds up to 20,000 rows: write it off the render thread.
+            std::thread([rows = std::move(rows), base, gpuTimings, tag = lastTag, mode = mode,
+                    cpu = cpu, cycles = cycles, gpu = gpu, settle = settle, duration = duration,
+                    frequency = frequency, start = start, exterior = IsExterior()]() mutable {
+            try {
+            std::ofstream output(base.wstring() + L".frames.csv", std::ios::binary);
             output << "seconds,frame_ms,present_result,mask,lighting,enabled,present_count,present_count_valid";
             for (const auto* name : CpuProfile::names)
                 output << ',' << name << "_calls," << name << "_inclusive_ms," << name << "_exclusive_ms," << name << "_max_call_ms," << name << "_cycles," << name << "_exclusive_cycles";
@@ -143,20 +155,25 @@ namespace FO4CS::PrivateProfile
             }
             output.close();
             Json result{
-                {"tag", lastTag}, {"mode", mode}, {"cpu_instrumented",cpu}, {"thread_cycles",cycles}, {"gpu_instrumented",gpu},
+                {"tag", tag}, {"mode", mode}, {"cpu_instrumented",cpu}, {"thread_cycles",cycles}, {"gpu_instrumented",gpu},
                 {"pid",GetCurrentProcessId()}, {"build",FO4CS_BUILD_ID}, {"rows",rows.size()}, {"settle_seconds",settle},
                 {"requested_seconds",duration}, {"clock_frequency",frequency},
                 {"resident_page_checks",ResidentPages::enabled.load()},
-                {"start_qpc_seconds",start}, {"exterior_at_finish",IsExterior()},
+                {"start_qpc_seconds",start}, {"exterior_at_finish",exterior},
                 {"metric","private desktop application Present intervals, not display FPS"},
                 {"gpu_frames",gpuTimings.frames}, {"gpu_dropped",gpuTimings.dropped},
                 {"gpu_capture_ms",gpuTimings.captureMs}, {"gpu_projection_ms",gpuTimings.projectionMs},
                 {"gpu_scope_wall_ms",gpuTimings.cpuMs}, {"gpu_draws",gpuTimings.draws},
                 {"file_ok",static_cast<bool>(output)}
             };
-            std::ofstream summary(base.string() + ".json",std::ios::binary);
+            std::ofstream summary(base.wstring() + L".json",std::ios::binary);
             summary << result.dump(2);
-            SPDLOG_INFO("[CloudShadows][PrivateProfile] Complete tag={} mode={} frames={} CPU={} GPU={}", lastTag,mode,rows.size(),cpu,gpu);
+            SPDLOG_INFO("[CloudShadows][PrivateProfile] Complete tag={} mode={} frames={} CPU={} GPU={}", tag,mode,rows.size(),cpu,gpu);
+            } catch (...) {
+                SPDLOG_ERROR("[CloudShadows][PrivateProfile] Could not write the profile for tag={}", tag);
+            }
+            }).detach();
+            rows = {};
         }
         void Poll(double now) {
             if (now < nextPoll || sampling) return;
@@ -173,7 +190,7 @@ namespace FO4CS::PrivateProfile
             if (tag.empty() || tag == lastTag || tag.size() > 100 ||
                 tag.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-") != std::string::npos) return;
             const auto requestedMode = request.value("mode",std::string{"off"});
-            if (requestedMode != "off" && requestedMode != "cube" && requestedMode != "sun") return;
+            if (requestedMode != "off" && requestedMode != "cube") return;
             const double requestedDuration = request.value("seconds",20.0);
             const double requestedSettle = request.value("settle",10.0);
             if (!std::isfinite(requestedDuration) || requestedDuration < 5 || requestedDuration > 120 ||
@@ -181,7 +198,6 @@ namespace FO4CS::PrivateProfile
             lastTag=tag; mode=requestedMode; duration=requestedDuration; settle=requestedSettle;
             cpu=request.value("cpu",true); gpu=request.value("gpu",false); cycles=request.value("cycles",false);
             ResidentPages::enabled.store(request.value("resident_pages",false),std::memory_order_relaxed);
-            CloudComparison::SetMethod(mode == "sun" ? CloudComparison::Method::SunMask : CloudComparison::Method::Cubemap);
             CloudShadows::g_shadowsEnabled.store(mode != "off",std::memory_order_release);
             CloudShadows::InvalidateWorldCloudCaptureForToggle();
             CloudComparison::SetProfilingMeasurements(gpu);
@@ -269,7 +285,7 @@ namespace FO4CS::PrivateProfile
                 if (now-start >= settle+duration || rows.size() >= 20000) Finish();
             }
             Poll(now);
-            if (!sampling || now-start < settle-2.0) PollScreenshot(chain);
+            if (!sampling || now-start < settle-2.0) PollScreenshot(chain, now);
             CpuProfile::counters={};
             previous=now;
         } catch (const std::exception& error) {
@@ -277,6 +293,10 @@ namespace FO4CS::PrivateProfile
             active.store(false,std::memory_order_release);
             CloudComparison::SetProfilingMeasurements(false);
             SPDLOG_ERROR("[CloudShadows][PrivateProfile] Disabled after error: {}",error.what());
+        } catch (...) {
+            CpuProfile::enabled.store(false,std::memory_order_relaxed);
+            active.store(false,std::memory_order_release);
+            CloudComparison::SetProfilingMeasurements(false);
         }
     }
 #else

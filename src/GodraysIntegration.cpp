@@ -71,10 +71,6 @@ namespace FO4CS::GodraysIntegration
             0x7a55a33e, 0xcb80, 0x4eca,
             { 0x98, 0xf8, 0xd8, 0x3e, 0x25, 0x39, 0x41, 0xbc }
         };
-        constexpr GUID kPatchedSunMaskGodrayShaderMarker{
-            0x7a55a33f, 0xcb80, 0x4eca,
-            { 0x98, 0xf8, 0xd8, 0x3e, 0x25, 0x39, 0x41, 0xbc }
-        };
 
         constexpr float kPlanetRadiusWorld = 6371000.0f * 70.0f;
         // CameraPosAdjust and GameWorks' g_vEyePosition are sampled in the same
@@ -105,7 +101,6 @@ namespace FO4CS::GodraysIntegration
         std::atomic<bool> s_vrUnsupportedLogged{ false };
         std::atomic<std::uint32_t> s_authenticatedShaderObjects{ 0 };
         std::atomic<std::uint32_t> s_authenticatedDirectionalVariants{ 0 };
-        std::atomic<std::uint32_t> s_authenticatedSunMaskVariants{ 0 };
         std::atomic<std::uint32_t> s_patchFailures{ 0 };
         std::atomic<std::uint64_t> s_renderVolumeCalls{ 0 };
         std::atomic<std::uint64_t> s_submittedDraws{ 0 };
@@ -546,10 +541,10 @@ namespace FO4CS::GodraysIntegration
 
         [[nodiscard]] ID3DBlob* BuildPatchedShader(
             const void* bytecode, std::size_t bytecodeSize,
-            DirectionalShader variant, bool sunMask = false) noexcept try
+            DirectionalShader variant) noexcept try
         {
             const auto source = FO4CS::GodrayCloudShader::PayloadSource(
-                variant == DirectionalShader::kScreenIntegral, sunMask);
+                variant == DirectionalShader::kScreenIntegral);
             if (source.empty())
                 return nullptr;
 
@@ -753,8 +748,11 @@ namespace FO4CS::GodraysIntegration
                 CloudShadows::g_settings.Opacity,
                 1.0f
             };
+            // Godrays run on flat only, where the cloud shell is centred on
+            // the camera exactly as for the ground shadows.
+            (void)origin;
             constants.captureOriginAndBlend = {
-                origin.x, origin.y, origin.z,
+                expectedEye.x, expectedEye.y, expectedEye.z,
                 std::clamp(layers[0].ActiveBlend, 0.0f, 1.0f)
             };
             constants.expectedEyeAndTolerance = {
@@ -767,10 +765,6 @@ namespace FO4CS::GodraysIntegration
             constants.visibleSunDirectionAndValidity = {
                 visibleSun.x, visibleSun.y, visibleSun.z, sunValid ? 1.0f : -1.0f
             };
-            if (FO4CS::CloudComparison::GetMethod() == FO4CS::CloudComparison::Method::SunMask) {
-                if (!CloudShadows::GetCommittedSunMaskProjection(constants.sunProjection)) return false;
-                constants.geometryAndStrength.x = constants.sunProjection.upAndHeight.w;
-            }
 
             ComPtr<ID3D11Buffer> buffer;
             {
@@ -1029,18 +1023,6 @@ namespace FO4CS::GodraysIntegration
                     static_cast<std::uint32_t>(attachResult));
                 return;
             }
-            ComPtr<ID3DBlob> sunBlob;
-            sunBlob.Attach(BuildPatchedShader(stockBytecode, stockBytecodeLength, variant, true));
-            ComPtr<ID3D11PixelShader> sunShader;
-            if (!sunBlob || FAILED(createPixelShader(device, sunBlob->GetBufferPointer(),
-                    sunBlob->GetBufferSize(), nullptr, &sunShader)) ||
-                FAILED(stockShader->SetPrivateDataInterface(kPatchedSunMaskGodrayShaderMarker, sunShader.Get()))) {
-                s_patchFailures.fetch_add(1, std::memory_order_relaxed);
-                SPDLOG_ERROR("[CloudShadows][Godrays] Sun-mask variant unavailable; its draws retain vanilla rays");
-            } else {
-                s_authenticatedSunMaskVariants.fetch_or(
-                    variant == DirectionalShader::kVolumeGeometry ? 1u : 2u, std::memory_order_release);
-            }
             const std::uint32_t count =
                 s_authenticatedShaderObjects.fetch_add(
                     1, std::memory_order_release) + 1;
@@ -1092,9 +1074,7 @@ namespace FO4CS::GodraysIntegration
         UINT replacementSize = sizeof(ID3D11PixelShader*);
         ID3D11PixelShader* rawReplacement = nullptr;
         const HRESULT replacementResult = state.vanillaPS->GetPrivateData(
-            FO4CS::CloudComparison::GetMethod() == FO4CS::CloudComparison::Method::SunMask
-                ? kPatchedSunMaskGodrayShaderMarker : kPatchedGodrayShaderMarker,
-            &replacementSize, &rawReplacement);
+            kPatchedGodrayShaderMarker, &replacementSize, &rawReplacement);
         if (FAILED(replacementResult) ||
             replacementSize != sizeof(ID3D11PixelShader*) ||
             !rawReplacement) {
@@ -1209,7 +1189,6 @@ namespace FO4CS::GodraysIntegration
         // own exact GameWorks objects have been observed and used.
         s_authenticatedShaderObjects.store(0, std::memory_order_release);
         s_authenticatedDirectionalVariants.store(0, std::memory_order_release);
-        s_authenticatedSunMaskVariants.store(0, std::memory_order_release);
         s_patchFailures.store(0, std::memory_order_release);
         s_submittedDraws.store(0, std::memory_order_release);
         s_enableDrawBaseline.store(0, std::memory_order_release);
@@ -1238,7 +1217,6 @@ namespace FO4CS::GodraysIntegration
             .authenticatedDirectionalVariants =
                 s_authenticatedDirectionalVariants.load(
                     std::memory_order_acquire),
-            .authenticatedSunMaskVariants = s_authenticatedSunMaskVariants.load(std::memory_order_acquire),
             .patchFailures = s_patchFailures.load(std::memory_order_acquire),
             .renderVolumeCalls = s_renderVolumeCalls.load(
                 std::memory_order_acquire),

@@ -1,11 +1,15 @@
 #include "CpuStageProfiler.h"
 #include "CloudShadows.h"
-#include "CloudMotionResolver.h"
 #include "CloudGeometryCapture.h"
 #include "CloudFramePublication.h"
 #include "WorldCloudAnchor.h"
 #include "MainViewCameraReadback.h"
+#include "MainViewViewport.h"
 #include "CloudComparison.h"
+#include "AcceptanceRunner.h"
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+#include "ConstantBufferProbe.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -35,22 +39,6 @@ namespace CloudShadows
                 kWorldCloudCubeFaceCount> faceRTVs;
         };
 
-        struct CaptureBlendVariant
-        {
-            ComPtr<ID3D11BlendState> stock;
-            ComPtr<ID3D11BlendState> capture;
-        };
-
-        constexpr uint32_t kCaptureBlendVariantCapacity = 16;
-
-        struct SunMaskSet
-        {
-            ComPtr<ID3D11Texture2D> texture;
-            ComPtr<ID3D11ShaderResourceView> srv;
-            ComPtr<ID3D11RenderTargetView> rtv;
-            FO4CS::SunMaskProjection projection{};
-        };
-
         struct WorldCloudResources
         {
             ComPtr<ID3D11Device> device;
@@ -60,11 +48,7 @@ namespace CloudShadows
             ComPtr<ID3D11ShaderResourceView> resolvedSrv;
             ComPtr<ID3D11Texture2D> resolvedTexture;
             CloudCubeSet cubeSets[2];
-            SunMaskSet sunSets[2];
             ComPtr<ID3D11SamplerState> sampler;
-            std::array<CaptureBlendVariant,
-                kCaptureBlendVariantCapacity> blendVariants;
-            uint32_t blendVariantCount{ 0 };
             uint32_t faceWidth{ 0 };
             uint32_t faceHeight{ 0 };
             uint32_t mipLevels{ 0 };
@@ -89,7 +73,6 @@ namespace CloudShadows
             XMFLOAT3 captureOrigin{};
             bool captureOriginValid{ false };
             bool active{ false };
-            FO4CS::SunMaskProjection sunProjection{};
 
             void Clear() noexcept
             {
@@ -98,7 +81,6 @@ namespace CloudShadows
                 captureOrigin = {};
                 captureOriginValid = false;
                 active = false;
-                sunProjection = {};
             }
         };
 
@@ -127,18 +109,12 @@ namespace CloudShadows
         };
 
         std::mutex s_resourceMutex;
-        std::unique_ptr<WorldCloudResources> s_resources;
+        // Device-owned state is never destroyed by a DLL static destructor:
+        // at process exit that would release D3D objects under the loader lock.
+        std::unique_ptr<WorldCloudResources>& s_resources =
+            *new std::unique_ptr<WorldCloudResources>();
         CloudSnapshot s_snapshots[2];
         FO4CS::CloudFramePublication s_mainSkyFrame;
-
-        uint32_t s_preparedFaceMask = 0;
-        uint32_t s_completedFaceMask = 0;
-        std::atomic<uint32_t> s_completedFaceMaskDiagnostic{ 0 };
-        uint64_t s_captureEpoch = 0;
-        uint64_t s_internalEpochSerial = 0;
-        uint64_t s_lastAbortedEpoch =
-            (std::numeric_limits<uint64_t>::max)();
-        uint64_t s_uniqueAbortCount = 0;
 
         std::atomic<bool> s_resetRequested{ false };
         std::uintptr_t s_worldIdentity = 0;
@@ -147,71 +123,113 @@ namespace CloudShadows
         XMFLOAT3 s_projectionOrigin{};
         bool s_projectionOriginValid = false;
         FO4CS::WorldCloudAnchor s_confirmedProjectionOrigin;
-        FO4CS::MainViewCameraReadback s_mainViewCameraReadback;
-        XMFLOAT3 s_stagingCaptureOrigin{};
-        bool s_stagingCaptureOriginValid = false;
-        uint64_t s_publishedMappingEpoch = 0;
-        uint64_t s_publishedMappingWorldGeneration = 0;
+        FO4CS::MainViewCameraReadback& s_mainViewCameraReadback =
+            *new FO4CS::MainViewCameraReadback();
         XMFLOAT3 s_publishedMappingOrigin{};
         bool s_publishedMappingOriginValid = false;
-        bool s_mappingPublicationQueued = false;
-        bool s_geometryCaptureActive = false;
-        bool s_geometryCaptureFailed = false;
-        bool s_geometryCaptureWanted = true;
-        std::chrono::steady_clock::time_point s_geometryRetryAfter{};
         constexpr uint32_t kGeometryMappingFaceSize = 256;
 
-        enum class NativePrepareRejectReason : std::uint32_t
+        // Re-anchor crossfade (see WorldCloudAnchor.h). While active, the
+        // projection also samples the field from the previous origin and
+        // blends toward the new one so the ground pattern never jumps.
+        XMFLOAT3 s_previousProjectionOrigin{};
+        ULONGLONG s_crossfadeStartTick = 0;
+        bool s_crossfadeActive = false;
+        ULONGLONG s_nextAnchorReadbackTick = 0;
+
+        // Any main-view render (main Sky draw or main DFLight prepass) since
+        // the previous Present. A Present without one shows no new scene and
+        // keeps the published field on every runtime.
+        bool s_mainViewRenderedSincePresent = false;
+
+        // Per-frame capture gate: evaluated at the first main Sky draw of a
+        // frame and reused by its remaining cloud layers.
+        enum class CaptureGate : uint8_t { kUnknown, kCapture, kSkip };
+        CaptureGate s_captureGate = CaptureGate::kUnknown;
+
+        // Deterministic resource failures are retried with backoff and
+        // logged once per failure streak instead of on every Sky draw.
+        struct FailureLatch
         {
-            kInvalidRequest,
-            kResourceCreation,
-            kFaceContract,
-            kCameraUnlatched,
-            kPublicationQueued,
-            kCount
-        };
+            ULONGLONG retryAfter{ 0 };
+            uint32_t failures{ 0 };
 
-        std::array<std::atomic<std::uint64_t>,
-            static_cast<std::size_t>(NativePrepareRejectReason::kCount)>
-            s_nativePrepareRejectCounts{};
-
-        void LogNativePrepareReject(
-            NativePrepareRejectReason reason,
-            std::uint32_t faceMask,
-            std::uint64_t sourceEpoch) noexcept
-        {
-            const auto index = static_cast<std::size_t>(reason);
-            const auto count = s_nativePrepareRejectCounts[index].fetch_add(
-                1, std::memory_order_relaxed) + 1u;
-            if (count > 4u && (count & (count - 1u)) != 0u)
-                return;
-
-            const char* name = "unknown";
-            switch (reason) {
-            case NativePrepareRejectReason::kInvalidRequest:
-                name = "invalid-request";
-                break;
-            case NativePrepareRejectReason::kResourceCreation:
-                name = "resource-creation";
-                break;
-            case NativePrepareRejectReason::kFaceContract:
-                name = "face-contract";
-                break;
-            case NativePrepareRejectReason::kCameraUnlatched:
-                name = "camera-unlatched";
-                break;
-            case NativePrepareRejectReason::kPublicationQueued:
-                name = "publication-queued";
-                break;
-            default:
-                break;
+            [[nodiscard]] bool Blocked() const noexcept
+            {
+                return failures != 0 && GetTickCount64() < retryAfter;
             }
-            SPDLOG_WARN(
-                "[CloudShadows] Native face prepare rejected reason={} "
-                "count={} faceMask=0x{:02X} epoch={} world={} cameraValid={}",
-                name, count, faceMask, sourceEpoch,
-                reinterpret_cast<void*>(s_worldIdentity),
-                s_lastCameraPositionValid);
+
+            // Returns true when this failure should be logged.
+            bool Fail() noexcept
+            {
+                ++failures;
+                const ULONGLONG backoff = (std::min)(
+                    300000ull, 1000ull << (std::min)(failures, 8u));
+                retryAfter = GetTickCount64() + backoff;
+                return failures == 1 || (failures & (failures - 1)) == 0;
+            }
+
+            void Succeed() noexcept { *this = {}; }
+        };
+        FailureLatch s_cubeCreation;
+
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+        // The capture takes dome direction from Sky VS b2 World rows
+        // (c4-c6 on flat, c8-c10 on VR). Compare these with view motion.
+        void LogSkyDiagnostics(ID3D11DeviceContext* context,
+            uint32_t technique) noexcept
+        {
+            try {
+                static auto& probe = *new FO4CS::ConstantBufferProbe();
+                ComPtr<ID3D11Buffer> buffer;
+                UINT first = 0;
+                UINT count = 0;
+                ComPtr<ID3D11DeviceContext1> context1;
+                if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context1))) && context1)
+                    context1->VSGetConstantBuffers1(2, 1, buffer.GetAddressOf(), &first, &count);
+                else
+                    context->VSGetConstantBuffers(2, 1, buffer.GetAddressOf());
+                FO4CS::ConstantBufferProbe::Sample sample;
+                if (probe.Poll(context, buffer.Get(), first,
+                        { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }, sample)) {
+                    SPDLOG_INFO("[CloudShadows][ViewDiag] Sky VS b2 technique={}{}",
+                        technique, FO4CS::ConstantBufferProbe::Describe(sample));
+                }
+            } catch (...) {
+            }
+        }
+#endif
+
+        const char* CaptureRejectName(
+            FO4CS::CloudGeometryCapture::RejectReason reason) noexcept
+        {
+            using Reason = FO4CS::CloudGeometryCapture::RejectReason;
+            switch (reason) {
+            case Reason::kInvalidRequest: return "invalid-request";
+            case Reason::kTopology: return "topology";
+            case Reason::kExtraShaderStage: return "geometry/hull/domain shader bound";
+            case Reason::kClassLinkage: return "class-linked or missing VS/PS";
+            case Reason::kStreamOutput: return "stream-output bound";
+            case Reason::kPixelUav: return "pixel UAV bound";
+            case Reason::kResources: return "capture shaders/resources unavailable";
+            case Reason::kRasterizer: return "unsupported rasterizer state";
+            case Reason::kDeviceRemoved: return "device removed";
+            case Reason::kException: return "exception";
+            default: return "none";
+            }
+        }
+
+        void LogCaptureReject(FO4CS::CloudGeometryCapture::RejectReason reason,
+            uint32_t technique) noexcept
+        {
+            static std::atomic<uint32_t> rejections{ 0 };
+            const uint32_t count = rejections.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count <= 4 || (count & (count - 1)) == 0) {
+                SPDLOG_WARN(
+                    "[CloudShadows] Cloud opacity capture rejected (#{}, technique={}): {}; "
+                    "this frame stays neutral",
+                    count, technique, CaptureRejectName(reason));
+            }
         }
 
         struct CaptureEvidenceStats
@@ -544,11 +562,10 @@ namespace CloudShadows
                 D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE>
                 viewports{};
             context->RSGetViewports(&viewportCount, viewports.data());
-            return viewportCount == 1 &&
-                viewports[0].TopLeftX == 0.0f &&
-                viewports[0].TopLeftY == 0.0f &&
-                viewports[0].Width == static_cast<float>(primaryWidth) &&
-                viewports[0].Height == static_cast<float>(primaryHeight);
+            return FO4CS::IsMainSkyViewport(viewports[0], viewportCount,
+                primaryWidth, primaryHeight,
+                FO4CS::RuntimeAPI::GetSingleton().Target() ==
+                    FO4CS::F4SECompat::RuntimeTarget::kVR);
         }
 
         void ClearCubeSet(
@@ -565,51 +582,22 @@ namespace CloudShadows
             }
         }
 
-        bool EnsureSunMasks() noexcept
-        {
-            if (s_resources->sunSets[0].srv && s_resources->sunSets[1].srv)
-                return true;
-            SunMaskSet candidates[2];
-            D3D11_TEXTURE2D_DESC desc{};
-            desc.Width = desc.Height = FO4CS::SunMaskProjection::kResolution;
-            desc.ArraySize = desc.MipLevels = desc.SampleDesc.Count = 1;
-            desc.Format = DXGI_FORMAT_R16_FLOAT;
-            desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
-            for (auto& set : candidates) {
-                auto* device = s_resources->device.Get();
-                if (FAILED(device->CreateTexture2D(&desc, nullptr, &set.texture)) ||
-                    FAILED(device->CreateRenderTargetView(set.texture.Get(), nullptr, &set.rtv)) ||
-                    FAILED(device->CreateShaderResourceView(set.texture.Get(), nullptr, &set.srv)))
-                    return false;
-            }
-            s_resources->sunSets[0] = std::move(candidates[0]);
-            s_resources->sunSets[1] = std::move(candidates[1]);
-            // Sun 2D may be selected in the main menu, before a cube has ever
-            // existed, or survive a device reset. It owns its own readiness.
-            g_worldCloudReady.store(true, std::memory_order_release);
-            SPDLOG_INFO("[CloudShadows] Sun opacity field ready: 512x512 R16_FLOAT, double buffered");
-            return true;
-        }
-
         void ResetCaptureProgress() noexcept
         {
-            s_geometryCaptureActive = false;
-            s_geometryCaptureFailed = false;
-            s_preparedFaceMask = 0;
-            s_completedFaceMask = 0;
-            s_completedFaceMaskDiagnostic.store(0, std::memory_order_release);
-            s_captureEpoch = 0;
-            s_stagingCaptureOrigin = {};
-            s_stagingCaptureOriginValid = false;
-            s_mappingPublicationQueued = false;
+            s_captureGate = CaptureGate::kUnknown;
             g_worldCloudPendingEpoch.store(0, std::memory_order_release);
+        }
+
+        void CancelCrossfade() noexcept
+        {
+            s_crossfadeActive = false;
+            s_previousProjectionOrigin = {};
+            s_crossfadeStartTick = 0;
         }
 
         void InvalidateCommittedField() noexcept
         {
             FO4CS::CloudComparison::RetirePreview();
-            s_geometryCaptureWanted = true;
-            s_geometryRetryAfter = {};
             s_snapshots[0].Clear();
             s_snapshots[1].Clear();
             if (s_resources) {
@@ -618,13 +606,10 @@ namespace CloudShadows
                 s_resources->evidencePending = false;
                 s_resources->evidenceMapRetryCount = 0;
             }
-            s_publishedMappingEpoch = 0;
-            s_publishedMappingWorldGeneration = 0;
             s_publishedMappingOrigin = {};
             s_publishedMappingOriginValid = false;
             s_mainSkyFrame.Withdraw();
             g_worldCloudPendingEpoch.store(0, std::memory_order_release);
-            FO4CS::CloudMotionResolver::Invalidate();
             g_worldCloudPreviewSRV = nullptr;
             g_worldCloudActiveLayers.store(0, std::memory_order_release);
             g_worldCloudCommittedEpoch.store(0, std::memory_order_release);
@@ -633,7 +618,8 @@ namespace CloudShadows
         }
 
         void WithdrawResolvedFieldForRetry(
-            bool preserveInFlightFrame = false) noexcept
+            bool preserveInFlightFrame = false,
+            bool preserveFrameStamp = false) noexcept
         {
             FO4CS::CloudComparison::RetirePreview();
             // A malformed live Sky frame invalidates only the resolved opacity
@@ -656,7 +642,13 @@ namespace CloudShadows
             g_worldCloudActiveLayers.store(0, std::memory_order_release);
             g_worldCloudCommittedEpoch.store(0, std::memory_order_release);
             InvalidatePublishedWorldCloudCubeEvidence();
-            InvalidateShadowMaskState();
+            if (preserveFrameStamp) {
+                // The frame's own dispatch already consumed the old field;
+                // FinalizeFrameAtPresent must still report that dispatch.
+                g_shadowMaskValid.store(false, std::memory_order_release);
+            } else {
+                InvalidateShadowMaskState();
+            }
         }
 
         void ResetWorldFieldForTransition(
@@ -673,6 +665,8 @@ namespace CloudShadows
             s_projectionOriginValid = worldIdentity != 0;
             s_confirmedProjectionOrigin.Reset();
             s_mainViewCameraReadback.Reset();
+            CancelCrossfade();
+            s_nextAnchorReadbackTick = 0;
             if (s_resources) {
                 ClearCubeSet(context, s_resources->cubeSets[0]);
                 ClearCubeSet(context, s_resources->cubeSets[1]);
@@ -712,17 +706,23 @@ namespace CloudShadows
             // Present may follow a temporary reflection/UI camera. It can
             // observe load/world changes, but cannot replace the origin that
             // an authenticated main-Sky/main-light draw already established.
-            if (!observeCamera && (explicitReset || s_worldIdentity != worldIdentity)) {
-                // The next authenticated main draw must initialize the new
-                // world's origin; neither the old nor the Present camera can.
-                ResetWorldFieldForTransition(context, 0, {});
-                fieldReset = true;
-                return false;
-            }
-            if (!observeCamera && !s_lastCameraPositionValid)
-                return false;
-            if (!observeCamera)
+            if (!observeCamera) {
+                const auto action = FO4CS::ClassifyPresentWorld(
+                    explicitReset, s_worldIdentity, worldIdentity);
+                if (action == FO4CS::PresentWorldAction::kReset) {
+                    // The next authenticated main draw must initialize the new
+                    // world's origin; neither the old nor the Present camera can.
+                    ResetWorldFieldForTransition(context, 0, {});
+                    fieldReset = true;
+                    return false;
+                }
+                // No established world yet: the field is already empty, so
+                // wait for the main draw instead of resetting every Present.
+                if (action == FO4CS::PresentWorldAction::kWait ||
+                    !s_lastCameraPositionValid)
+                    return false;
                 cameraPosition = s_lastCameraPosition;
+            }
             if (currentCameraPosition)
                 *currentCameraPosition = cameraPosition;
 
@@ -753,49 +753,6 @@ namespace CloudShadows
             s_lastCameraPosition = cameraPosition;
             s_lastCameraPositionValid = true;
             return true;
-        }
-
-        bool GetReferenceFaceContract(
-            ID3D11RenderTargetView* reference,
-            uint32_t& width,
-            uint32_t& height,
-            uint32_t& faceIndex) noexcept
-        {
-            width = 0;
-            height = 0;
-            faceIndex = kWorldCloudCubeFaceCount;
-            if (!reference)
-                return false;
-            ComPtr<ID3D11Resource> resource;
-            ComPtr<ID3D11Texture2D> texture;
-            reference->GetResource(resource.GetAddressOf());
-            if (!resource || FAILED(resource.As(&texture)) || !texture)
-                return false;
-
-            D3D11_TEXTURE2D_DESC textureDescription{};
-            D3D11_RENDER_TARGET_VIEW_DESC viewDescription{};
-            texture->GetDesc(&textureDescription);
-            reference->GetDesc(&viewDescription);
-            if (textureDescription.SampleDesc.Count != 1 ||
-                textureDescription.ArraySize < kWorldCloudCubeFaceCount ||
-                (textureDescription.MiscFlags &
-                    D3D11_RESOURCE_MISC_TEXTURECUBE) == 0 ||
-                viewDescription.ViewDimension !=
-                    D3D11_RTV_DIMENSION_TEXTURE2DARRAY ||
-                viewDescription.Texture2DArray.ArraySize != 1 ||
-                viewDescription.Texture2DArray.FirstArraySlice >=
-                    kWorldCloudCubeFaceCount)
-                return false;
-
-            const UINT mip = viewDescription.Texture2DArray.MipSlice;
-            if (mip >= textureDescription.MipLevels)
-                return false;
-
-            width = (std::max)(1u, textureDescription.Width >> mip);
-            height = (std::max)(1u, textureDescription.Height >> mip);
-            faceIndex =
-                viewDescription.Texture2DArray.FirstArraySlice;
-            return width == height;
         }
 
         bool CreateCubeSet(
@@ -900,6 +857,8 @@ namespace CloudShadows
                 s_resources->cubeSets[0].texture &&
                 s_resources->cubeSets[1].texture)
                 return true;
+            if (s_cubeCreation.Blocked())
+                return false;
 
             CloudCubeSet replacement[2];
             uint32_t mipLevels0 = 0;
@@ -911,19 +870,21 @@ namespace CloudShadows
                     s_resources->device.Get(), width, replacement[1],
                     mipLevels1) ||
                 mipLevels0 == 0 || mipLevels0 != mipLevels1) {
-                SPDLOG_ERROR(
-                    "[CloudShadows] Failed creating {}x{} double-buffered "
-                    "R16 native cloud-opacity cube", width, height);
+                if (s_cubeCreation.Fail()) {
+                    SPDLOG_ERROR(
+                        "[CloudShadows] Failed creating {}x{} double-buffered "
+                        "R16 cloud-opacity cube (failure #{}); retrying with backoff",
+                        width, height, s_cubeCreation.failures);
+                }
                 return false;
             }
+            s_cubeCreation.Succeed();
 
             s_resources->cubeSets[0] = std::move(replacement[0]);
             s_resources->cubeSets[1] = std::move(replacement[1]);
             s_resources->faceWidth = width;
             s_resources->faceHeight = height;
             s_resources->mipLevels = mipLevels0;
-            s_resources->blendVariants = {};
-            s_resources->blendVariantCount = 0;
             s_resources->evidenceStaging.Reset();
             s_resources->evidenceQuery.Reset();
             s_resources->evidencePending = false;
@@ -944,18 +905,6 @@ namespace CloudShadows
                 "{}x{} R16_FLOAT TextureCube, {} mips, double buffered",
                 width, height, mipLevels0);
             return true;
-        }
-
-        bool EnsureCaptureResources(
-            ID3D11DeviceContext* context,
-            ID3D11RenderTargetView* referenceFaceRTV,
-            uint32_t expectedFaceMask) noexcept
-        {
-            uint32_t width = 0, height = 0;
-            uint32_t faceIndex = kWorldCloudCubeFaceCount;
-            return GetReferenceFaceContract(referenceFaceRTV, width, height, faceIndex) &&
-                expectedFaceMask == (1u << faceIndex) &&
-                EnsureCaptureDimensions(context, width, height);
         }
 
         bool EvidenceCaptureNeeded(
@@ -1196,133 +1145,6 @@ namespace CloudShadows
             }
         }
 
-        bool PublishCompleteCube(
-            ID3D11DeviceContext* context,
-            uint64_t epoch) noexcept
-        {
-            if (!s_resources || !s_stagingCaptureOriginValid ||
-                !s_projectionOriginValid)
-                return false;
-            (void)context;
-            if (!FO4CS::CloudMotionResolver::PublishCaptureGeneration())
-                return false;
-
-            // This runs only at the authoritative Present boundary, after an
-            // in-flight main-Sky frame has completed against the preceding
-            // mapping. The next authenticated main Sky advances every layer
-            // in this new generation to its live TexCoordOff.
-            s_publishedMappingEpoch = epoch;
-            s_publishedMappingWorldGeneration =
-                g_worldCloudResetGeneration.load(std::memory_order_acquire);
-            // The reflection camera is recentered on the player for every
-            // natural cubemap generation, but the cloud dome is directional:
-            // translating that camera does not move the cloud UV field.  Keep
-            // the shell projection anchored in world space until an explicit
-            // world/load/camera-discontinuity reset.  Replacing this with the
-            // latest capture camera made every otherwise identical mapping
-            // refresh translate all ground shadows in one visible step.
-            s_publishedMappingOrigin = s_projectionOrigin;
-            s_publishedMappingOriginValid = true;
-            // WorldCloudResources retains the preceding resolved cube while
-            // the resolver activates this mapping. It remains immutable until
-            // the next player Sky publishes an atomic replacement.
-            s_mainSkyFrame.CancelCapture();
-            SPDLOG_DEBUG(
-                "[CloudShadows] Published authenticated per-layer cloud "
-                "mapping epoch={} faces=0x3F; awaiting live Sky resolve",
-                epoch);
-            return true;
-        }
-
-        [[maybe_unused]] bool BeginGeometryMapping(ID3D11DeviceContext* context) noexcept
-        {
-            if (std::chrono::steady_clock::now() < s_geometryRetryAfter ||
-                !EnsureCaptureDimensions(context,
-                    kGeometryMappingFaceSize, kGeometryMappingFaceSize))
-                return false;
-            bool reset = false;
-            if (!SynchronizeWorldField(context, reset) || !s_projectionOriginValid)
-                return false;
-
-            FO4CS::CloudMotionResolver::AbortCaptureGeneration();
-            ResetCaptureProgress();
-            if (++s_internalEpochSerial == 0)
-                ++s_internalEpochSerial;
-            s_captureEpoch = s_internalEpochSerial;
-            s_stagingCaptureOrigin = s_projectionOrigin;
-            s_stagingCaptureOriginValid = true;
-            const auto layout = FO4CS::RuntimeAPI::GetSingleton().Target() ==
-                    FO4CS::F4SECompat::RuntimeTarget::kVR
-                ? FO4CS::CloudMotionResolver::SkyConstantLayout::kVr
-                : FO4CS::CloudMotionResolver::SkyConstantLayout::kFlat;
-            g_geometryCaptureAttempts.fetch_add(1, std::memory_order_relaxed);
-            s_geometryCaptureActive = true;
-            s_geometryCaptureFailed =
-                !FO4CS::CloudMotionResolver::BeginCaptureGeneration(
-                    s_resources->device.Get(), {
-                        s_captureEpoch,
-                        g_worldCloudResetGeneration.load(std::memory_order_acquire),
-                        kGeometryMappingFaceSize, layout });
-            for (uint32_t face = 0; face < 6 && !s_geometryCaptureFailed; ++face)
-                s_geometryCaptureFailed =
-                    !FO4CS::CloudMotionResolver::BeginCaptureCubeFace(face);
-            g_worldCloudPendingEpoch.store(s_captureEpoch, std::memory_order_release);
-            return true;
-        }
-
-        [[maybe_unused]] void FinishGeometryMapping(ID3D11DeviceContext* context) noexcept
-        {
-            bool accepted = !s_geometryCaptureFailed;
-            for (uint32_t face = 0; face < 6 && accepted; ++face)
-                accepted = FO4CS::CloudMotionResolver::CompleteCaptureCubeFace(face, true);
-            accepted = accepted && PublishCompleteCube(context, s_captureEpoch);
-            if (accepted) {
-                g_geometryCapturePublished.fetch_add(1, std::memory_order_relaxed);
-                s_geometryCaptureWanted = false;
-                s_geometryRetryAfter = {};
-                SPDLOG_INFO(
-                    "[CloudShadows] Main-Sky geometry mapping published: epoch={} faces=0x3F",
-                    s_captureEpoch);
-            } else {
-                FO4CS::CloudMotionResolver::AbortCaptureGeneration();
-                s_geometryCaptureWanted = true;
-                s_geometryRetryAfter =
-                    std::chrono::steady_clock::now() + std::chrono::seconds(2);
-                const auto count = g_geometryCaptureRejected.fetch_add(
-                    1, std::memory_order_relaxed) + 1;
-                if (count <= 4 || (count & (count - 1)) == 0)
-                    SPDLOG_WARN(
-                        "[CloudShadows] Main-Sky geometry mapping rejected "
-                        "(attempt={}); retry limited to once per 2 seconds", count);
-            }
-            ResetCaptureProgress();
-        }
-
-        void AbortCaptureUnlocked(
-            uint64_t sourceEpoch, bool abortQueued = false) noexcept
-        {
-            // Once all six faces are coherent, Present owns the publication
-            // transaction. A later natural-capture rejection must not discard
-            // that queued generation before the boundary can publish it.
-            if (s_mappingPublicationQueued && !abortQueued)
-                return;
-            FO4CS::CloudMotionResolver::AbortCaptureGeneration();
-            ResetCaptureProgress();
-            // An incomplete natural cube is only a rejected refresh. Keep the
-            // last authenticated mapping and resolved field advancing; full
-            // world/load/device/toggle paths invalidate it explicitly.
-            if (sourceEpoch == s_lastAbortedEpoch)
-                return;
-            s_lastAbortedEpoch = sourceEpoch;
-            const uint64_t abortCount = ++s_uniqueAbortCount;
-            if (abortCount <= 4 ||
-                (abortCount & (abortCount - 1u)) == 0u) {
-                SPDLOG_WARN(
-                    "[CloudShadows] Native cloud-opacity capture epoch={} "
-                    "aborted fail-neutral (uniqueAbort={})",
-                    sourceEpoch, abortCount);
-            }
-        }
     }
 
     bool GetWorldCloudCubeEvidenceSnapshot(
@@ -1417,8 +1239,6 @@ namespace CloudShadows
         if (s_resources && s_resources->device.Get() == device)
             return true;
 
-        FO4CS::CloudMotionResolver::ReleaseDeviceResources();
-
         g_worldCloudReady.store(false, std::memory_order_release);
         g_worldCloudPreviewSRV = nullptr;
         InvalidatePublishedWorldCloudCubeEvidence();
@@ -1444,8 +1264,6 @@ namespace CloudShadows
         s_snapshots[1].Clear();
         s_mainSkyFrame.Reset();
         ResetCaptureProgress();
-        s_lastAbortedEpoch = (std::numeric_limits<uint64_t>::max)();
-        s_uniqueAbortCount = 0;
         s_worldIdentity = 0;
         s_lastCameraPosition = {};
         s_lastCameraPositionValid = false;
@@ -1453,14 +1271,14 @@ namespace CloudShadows
         s_projectionOriginValid = false;
         s_confirmedProjectionOrigin.Reset();
         s_mainViewCameraReadback.Reset();
-        s_publishedMappingEpoch = 0;
-        s_publishedMappingWorldGeneration = 0;
+        CancelCrossfade();
+        s_nextAnchorReadbackTick = 0;
+        s_mainViewRenderedSincePresent = false;
+        s_cubeCreation.Succeed();
         s_publishedMappingOrigin = {};
         s_publishedMappingOriginValid = false;
         s_mainSkyFrame.Reset(true);
         s_mainSkyFrame.CancelCapture();
-        s_geometryCaptureWanted = true;
-        s_geometryRetryAfter = {};
         s_resetRequested.store(false, std::memory_order_release);
         SPDLOG_INFO(
             "[CloudShadows] Native cloud-opacity manager ready; awaiting "
@@ -1473,15 +1291,16 @@ namespace CloudShadows
         std::lock_guard lock(s_resourceMutex);
         g_worldCloudReady.store(false, std::memory_order_release);
         g_worldCloudPreviewSRV = nullptr;
-        FO4CS::CloudMotionResolver::ReleaseDeviceResources();
         FO4CS::CloudGeometryCapture::ReleaseDeviceResources();
         s_resources.reset();
         s_snapshots[0].Clear();
         s_snapshots[1].Clear();
         s_mainSkyFrame.Reset();
         ResetCaptureProgress();
-        s_lastAbortedEpoch = (std::numeric_limits<uint64_t>::max)();
-        s_uniqueAbortCount = 0;
+        CancelCrossfade();
+        s_nextAnchorReadbackTick = 0;
+        s_mainViewRenderedSincePresent = false;
+        s_cubeCreation.Succeed();
         s_worldIdentity = 0;
         s_lastCameraPosition = {};
         s_lastCameraPositionValid = false;
@@ -1489,8 +1308,6 @@ namespace CloudShadows
         s_projectionOriginValid = false;
         s_confirmedProjectionOrigin.Reset();
         s_mainViewCameraReadback.Reset();
-        s_publishedMappingEpoch = 0;
-        s_publishedMappingWorldGeneration = 0;
         s_publishedMappingOrigin = {};
         s_publishedMappingOriginValid = false;
         s_mainSkyFrame.Reset(true);
@@ -1502,317 +1319,40 @@ namespace CloudShadows
         InvalidateShadowMaskState();
     }
 
-    bool PrepareNativeWorldCloudCaptureFaces(
-        ID3D11DeviceContext* context,
-        ID3D11RenderTargetView* referenceFaceRTV,
-        uint32_t faceMask,
-        uint64_t sourceEpoch) noexcept
+    namespace
     {
-        try {
-            faceMask &= kCompleteWorldCloudCubeFaceMask;
-            if (!context || context != GetD3DContext() ||
-                faceMask == 0) {
-                LogNativePrepareReject(
-                    NativePrepareRejectReason::kInvalidRequest,
-                    faceMask, sourceEpoch);
-                return false;
-            }
-            if (!CreateWorldCloudResources()) {
-                LogNativePrepareReject(
-                    NativePrepareRejectReason::kResourceCreation,
-                    faceMask, sourceEpoch);
-                return false;
-            }
-
-            std::lock_guard lock(s_resourceMutex);
-            if (s_mappingPublicationQueued) {
-                // The resolver still owns a complete immutable staging set.
-                // Reject a later natural update until Present atomically
-                // publishes it; never turn the new event into an abort of the
-                // already completed generation.
-                LogNativePrepareReject(
-                    NativePrepareRejectReason::kPublicationQueued,
-                    faceMask, sourceEpoch);
-                return false;
-            }
-            if (referenceFaceRTV) {
-                if (!EnsureCaptureResources(
-                        context, referenceFaceRTV, faceMask)) {
-                    LogNativePrepareReject(
-                        NativePrepareRejectReason::kFaceContract,
-                        faceMask, sourceEpoch);
-                    return false;
-                }
-            } else if (!s_resources ||
-                !g_worldCloudReady.load(std::memory_order_acquire) ||
-                !s_resources->cubeSets[0].texture ||
-                !s_resources->cubeSets[1].texture) {
-                // The first native face teaches us its runtime-specific size
-                // from bound RT0. Later cloudless faces can be cleared here at
-                // lifecycle begin without waiting for a cloud draw.
-                LogNativePrepareReject(
-                    NativePrepareRejectReason::kFaceContract,
-                    faceMask, sourceEpoch);
-                return false;
-            }
-            PollCaptureEvidence(context, *s_resources);
-
-            XMFLOAT3 currentCameraPosition{};
-            if (s_lastCameraPositionValid && s_worldIdentity != 0) {
-                // Fallout temporarily zeros CameraPosAdjust while its native
-                // cubemap camera renders. An exact main DFLight pass sampled
-                // the authoritative origin immediately beforehand; retain it
-                // for every face in this capture generation.
-                currentCameraPosition = s_lastCameraPosition;
-            } else {
-                // Never bootstrap from the reflection camera. Its temporary
-                // zero CameraPosAdjust was the source of a 0 <-> player-origin
-                // reset loop that invalidated every completed cube. Reject
-                // this first attempt; the next exact main DFLight pass latches
-                // a stable origin and the following cube can publish.
-                LogNativePrepareReject(
-                    NativePrepareRejectReason::kCameraUnlatched,
-                    faceMask, sourceEpoch);
-                return false;
-            }
-
-            // A face repeated before a complete 0x3F generation identifies a
-            // new native cubemap cycle. Discard the incomplete staging set so
-            // faces from different captures can never be mixed.
-            const bool cycleChanged = s_captureEpoch != 0 &&
-                sourceEpoch != 0 && sourceEpoch != s_captureEpoch;
-            if (cycleChanged ||
-                ((s_preparedFaceMask | s_completedFaceMask) & faceMask) != 0) {
-                FO4CS::CloudMotionResolver::AbortCaptureGeneration();
-                ClearCubeSet(context, s_resources->cubeSets[s_mainSkyFrame.WriteIndex()]);
-                ResetCaptureProgress();
-            }
-            if (s_captureEpoch == 0) {
-                s_captureEpoch = sourceEpoch != 0
-                    ? sourceEpoch
-                    : ++s_internalEpochSerial;
-                // Fallout recentres BSCubeMapCamera for every generation.
-                // Record that exact origin once and retain it across all six
-                // staged faces so cube directions and shell lookup agree.
-                s_stagingCaptureOrigin = currentCameraPosition;
-                s_stagingCaptureOriginValid = true;
-                const auto target =
-                    FO4CS::RuntimeAPI::GetSingleton().Target();
-                const auto layout = target ==
-                        FO4CS::F4SECompat::RuntimeTarget::kVR
-                    ? FO4CS::CloudMotionResolver::SkyConstantLayout::kVr
-                    : FO4CS::CloudMotionResolver::SkyConstantLayout::kFlat;
-                const uint64_t worldGeneration =
-                    g_worldCloudResetGeneration.load(
-                        std::memory_order_acquire);
-                if (!FO4CS::CloudMotionResolver::BeginCaptureGeneration(
-                        s_resources->device.Get(), {
-                            .captureEpoch = s_captureEpoch,
-                            .worldGeneration = worldGeneration,
-                            .faceSize = s_resources->faceWidth,
-                            .constantLayout = layout })) {
-                    AbortCaptureUnlocked(sourceEpoch);
-                    return false;
-                }
-            } else if (sourceEpoch != 0) {
-                s_captureEpoch = (std::max)(s_captureEpoch, sourceEpoch);
-            }
-
-            for (uint32_t face = 0;
-                 face < kWorldCloudCubeFaceCount; ++face) {
-                const uint32_t bit = 1u << face;
-                if ((faceMask & bit) != 0 &&
-                    (s_preparedFaceMask & bit) == 0 &&
-                    !FO4CS::CloudMotionResolver::BeginCaptureCubeFace(face)) {
-                    AbortCaptureUnlocked(sourceEpoch);
-                    return false;
-                }
-            }
-
-            const float clear[4]{};
-            ScopedUnpredicated unpredicated(context);
-            for (uint32_t face = 0;
-                 face < kWorldCloudCubeFaceCount; ++face) {
-                const uint32_t bit = 1u << face;
-                if ((faceMask & bit) != 0) {
-                    context->ClearRenderTargetView(
-                        s_resources->cubeSets[s_mainSkyFrame.WriteIndex()].faceRTVs[face].Get(),
-                        clear);
-                }
-            }
-            s_preparedFaceMask |= faceMask;
-            g_worldCloudPendingEpoch.store(
-                s_captureEpoch, std::memory_order_release);
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    ID3D11RenderTargetView* GetNativeWorldCloudCaptureFaceRTV(
-        uint32_t faceIndex) noexcept
-    {
-        std::lock_guard lock(s_resourceMutex);
-        if (faceIndex >= kWorldCloudCubeFaceCount || !s_resources ||
-            !g_worldCloudReady.load(std::memory_order_acquire) ||
-            (s_preparedFaceMask & (1u << faceIndex)) == 0)
-            return nullptr;
-        return s_resources->cubeSets[s_mainSkyFrame.WriteIndex()].faceRTVs[faceIndex].Get();
-    }
-
-    ID3D11BlendState* GetNativeWorldCloudCaptureBlendState(
-        ID3D11BlendState* stockBlendState) noexcept
-    {
-        std::lock_guard lock(s_resourceMutex);
-        if (!s_resources ||
-            s_resources->device.Get() != GetD3DDevice() ||
-            !g_worldCloudReady.load(std::memory_order_acquire))
-            return nullptr;
-
-        for (uint32_t index = 0;
-             index < s_resources->blendVariantCount; ++index) {
-            auto& variant = s_resources->blendVariants[index];
-            if (variant.stock.Get() == stockBlendState)
-                return variant.capture.Get();
-        }
-        if (s_resources->blendVariantCount >=
-            kCaptureBlendVariantCapacity) {
-            SPDLOG_ERROR(
-                "[CloudShadows] Native cloud MRT blend-state cache exhausted");
-            return nullptr;
+        // Nothing the capture could produce is visible: the ground mask and
+        // the lighting patch are both exactly neutral in these states, so the
+        // cube clear, the per-layer replays and the full-screen dispatch are
+        // skipped. Explicit diagnostics (sky preview, acceptance evidence,
+        // debug views) keep the pipeline running.
+        [[nodiscard]] bool DiagnosticConsumerActive() noexcept
+        {
+            return FO4CS::CloudComparison::GetPreview() !=
+                    FO4CS::CloudComparison::Preview::Off ||
+                AcceptanceRunner::IsRunning() || g_settings.DebugMode != 0.0f;
         }
 
-        D3D11_BLEND_DESC description{};
-        if (stockBlendState) {
-            stockBlendState->GetDesc(&description);
-        } else {
-            description.RenderTarget[0].RenderTargetWriteMask =
-                D3D11_COLOR_WRITE_ENABLE_ALL;
-        }
-        if (!description.IndependentBlendEnable) {
-            for (uint32_t target = 1;
-                 target < D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT; ++target)
-                description.RenderTarget[target] =
-                    description.RenderTarget[0];
-            description.IndependentBlendEnable = TRUE;
-        }
-
-        auto& mapping = description.RenderTarget[
-            kNativeWorldCloudOpacityTargetSlot];
-        // Each stable cloud layer owns a separate RGBA32F mapping face. The
-        // authenticated draw writes (animatedUV.xy, vertexAlpha, validity)
-        // exactly once, so blending would corrupt UVs and alpha.
-        mapping.BlendEnable = FALSE;
-        mapping.SrcBlend = D3D11_BLEND_ONE;
-        mapping.DestBlend = D3D11_BLEND_ZERO;
-        mapping.BlendOp = D3D11_BLEND_OP_ADD;
-        mapping.SrcBlendAlpha = D3D11_BLEND_ONE;
-        mapping.DestBlendAlpha = D3D11_BLEND_ZERO;
-        mapping.BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        mapping.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-
-        auto& variant = s_resources->blendVariants[
-            s_resources->blendVariantCount];
-        variant.stock = stockBlendState;
-        if (FAILED(s_resources->device->CreateBlendState(
-                &description, variant.capture.GetAddressOf()))) {
-            variant.stock.Reset();
-            return nullptr;
-        }
-        ++s_resources->blendVariantCount;
-        return variant.capture.Get();
-    }
-
-    bool CompleteNativeWorldCloudCaptureFaces(
-        ID3D11DeviceContext* context,
-        uint32_t faceMask,
-        uint64_t sourceEpoch,
-        bool capturePathAuthenticated) noexcept
-    {
-        try {
-            std::lock_guard lock(s_resourceMutex);
-            faceMask &= kCompleteWorldCloudCubeFaceMask;
-            if (!context || context != GetD3DContext() || !s_resources ||
-                faceMask == 0)
-                return false;
-            // Completion callbacks from a later rejected native update must
-            // not abort the coherent 0x3F staging generation which is waiting
-            // for the authoritative Present boundary.
-            if (s_mappingPublicationQueued)
-                return false;
-            PollCaptureEvidence(context, *s_resources);
-
-            if (!capturePathAuthenticated ||
-                (sourceEpoch != 0 && s_captureEpoch != 0 &&
-                    sourceEpoch != s_captureEpoch) ||
-                (faceMask & ~s_preparedFaceMask) != 0) {
-                AbortCaptureUnlocked(sourceEpoch);
-                return false;
-            }
-            if (sourceEpoch != 0)
-                s_captureEpoch = sourceEpoch;
-            for (uint32_t face = 0;
-                 face < kWorldCloudCubeFaceCount; ++face) {
-                const uint32_t bit = 1u << face;
-                if ((faceMask & bit) != 0 &&
-                    !FO4CS::CloudMotionResolver::CompleteCaptureCubeFace(
-                        face, true)) {
-                    AbortCaptureUnlocked(sourceEpoch);
-                    return false;
-                }
-            }
-            s_preparedFaceMask &= ~faceMask;
-            s_completedFaceMask |= faceMask;
-            s_completedFaceMaskDiagnostic.store(
-                s_completedFaceMask, std::memory_order_release);
-            if (s_completedFaceMask != kCompleteWorldCloudCubeFaceMask)
+        [[nodiscard]] bool CaptureCanBeVisible() noexcept
+        {
+            if (DiagnosticConsumerActive())
                 return true;
-
-            if (!s_stagingCaptureOriginValid) {
-                AbortCaptureUnlocked(sourceEpoch);
+            if (!(g_settings.Opacity > 0.0f) || !g_dfLightPatcher.IsReady())
                 return false;
-            }
-
-            const uint64_t publishEpoch = s_captureEpoch != 0
-                ? s_captureEpoch
-                : ++s_internalEpochSerial;
-            s_captureEpoch = publishEpoch;
-            s_mappingPublicationQueued = true;
-            g_worldCloudPendingEpoch.store(
-                publishEpoch, std::memory_order_release);
-            SPDLOG_DEBUG(
-                "[CloudShadows] Queued coherent per-layer cloud mapping "
-                "epoch={} faces=0x3F for Present publication",
-                publishEpoch);
-            return true;
-        } catch (...) {
-            std::lock_guard lock(s_resourceMutex);
-            AbortCaptureUnlocked(sourceEpoch);
-            return false;
+            XMFLOAT3 sun{};
+            return FO4CS::EngineAPI::ReadVisibleSunDirection(
+                       FO4CS::EngineAPI::GetSky(), sun) &&
+                sun.z > 0.0f;
         }
     }
 
-    void AbortNativeWorldCloudCapture(
-        ID3D11DeviceContext* context,
-        uint64_t sourceEpoch) noexcept
+    bool CloudShadowsCanBeVisible() noexcept
     {
-        std::lock_guard lock(s_resourceMutex);
-        if (!context || context != GetD3DContext())
-            return;
-        AbortCaptureUnlocked(sourceEpoch);
-    }
-
-    uint32_t GetNativeWorldCloudStagingFaceMask() noexcept
-    {
-        return s_completedFaceMaskDiagnostic.load(std::memory_order_acquire);
-    }
-
-    bool HandleUncapturedWorldCloudDraw(
-        ID3D11DeviceContext*, uint64_t) noexcept
-    {
-        // The main Sky path handles bounded geometry bootstrap internally.
-        // A rejected draw must still reach Fallout's downstream draw once.
-        return false;
+        try {
+            return CaptureCanBeVisible();
+        } catch (...) {
+            return false;
+        }
     }
 
     bool ProcessWorldCloudDraw(
@@ -1824,105 +1364,101 @@ namespace CloudShadows
         bool drawInvoked = false;
         try {
             FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CloudDrawValidation);
-            if (!context || context != GetD3DContext() || !reissue ||
-                !IsMainSkyPlayerView(context)) {
+            // The caller has already proven the exact main-Sky view once for
+            // this draw; repeating it here doubled the per-draw D3D queries.
+            if (!context || context != GetD3DContext() || !reissue)
                 return false;
-            }
 
             cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureSetup);
+            bool captureThisDraw = false;
             {
                 std::lock_guard lock(s_resourceMutex);
                 if (!s_resources)
                     return false;
-                if (!s_mainSkyFrame.Active()) {
-                    const bool sunMask = FO4CS::CloudComparison::EffectiveMethod() ==
-                        FO4CS::CloudComparison::Method::SunMask;
-                    if (sunMask ? !EnsureSunMasks() : !EnsureCaptureDimensions(context,
-                            kGeometryMappingFaceSize, kGeometryMappingFaceSize)) return false;
-                    bool reset = false;
-                    XMFLOAT3 camera{};
-                    if (!SynchronizeWorldField(context, reset, &camera) || !s_projectionOriginValid)
-                        return false;
-                    FO4CS::CloudComparison::GpuScope captureTiming(context,
-                        FO4CS::CloudComparison::Work::Capture);
-                    if (sunMask) {
-                        XMFLOAT3 sun{};
-                        auto& set = s_resources->sunSets[s_mainSkyFrame.WriteIndex()];
-                        const XMFLOAT3 relative{ camera.x - s_projectionOrigin.x,
-                            camera.y - s_projectionOrigin.y, camera.z - s_projectionOrigin.z };
-                        if (!FO4CS::EngineAPI::ReadVisibleSunDirection(FO4CS::EngineAPI::GetSky(), sun) ||
-                            !FO4CS::SunMaskProjection::Build(sun, relative, g_settings.CloudHeight, set.projection)) {
-                            WithdrawResolvedFieldForRetry();
-                            return false;
-                        }
-                        const float clear[4]{};
-                        ScopedUnpredicated unpredicated(context);
-                        context->ClearRenderTargetView(set.rtv.Get(), clear);
-                    } else {
-                        ClearCubeSet(context, s_resources->cubeSets[s_mainSkyFrame.WriteIndex()]);
-                    }
-                    s_mainSkyFrame.Begin();
-                    s_publishedMappingOrigin = s_projectionOrigin;
-                    s_publishedMappingOriginValid = true;
-                    g_worldCloudPendingEpoch.store(s_mainSkyFrame.Serial(),
-                        std::memory_order_release);
-                    g_geometryCaptureAttempts.fetch_add(1, std::memory_order_relaxed);
+                s_mainViewRenderedSincePresent = true;
+                if (s_captureGate == CaptureGate::kUnknown) {
+                    s_captureGate = CaptureCanBeVisible()
+                        ? CaptureGate::kCapture : CaptureGate::kSkip;
                 }
+                if (s_captureGate == CaptureGate::kCapture && !s_mainSkyFrame.Active()) {
+                    bool reset = false;
+                    if (EnsureCaptureDimensions(context,
+                            kGeometryMappingFaceSize, kGeometryMappingFaceSize) &&
+                        SynchronizeWorldField(context, reset) &&
+                        s_projectionOriginValid) {
+                        FO4CS::CloudComparison::GpuScope captureTiming(context,
+                            FO4CS::CloudComparison::Work::Capture);
+                        ClearCubeSet(context, s_resources->cubeSets[s_mainSkyFrame.WriteIndex()]);
+                        s_mainSkyFrame.Begin();
+                        s_publishedMappingOrigin = s_projectionOrigin;
+                        s_publishedMappingOriginValid = true;
+                        g_worldCloudPendingEpoch.store(s_mainSkyFrame.Serial(),
+                            std::memory_order_release);
+                        g_geometryCaptureAttempts.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+                // A rejected frame is already withdrawn; replaying its remaining
+                // layers would only spend GPU time on a field nobody reads.
+                captureThisDraw = s_mainSkyFrame.Active() &&
+                    s_mainSkyFrame.Authenticated() && IsCloudTechnique(command.skyTechnique);
             }
 
             // Submit the visible draw once, then blend every cloud primitive
-            // into private cube faces. Overlapping surfaces cannot be encoded
-            // in a single UV per texel; replaying alpha preserves all of them.
+            // into private targets. Overlapping surfaces cannot be encoded in a
+            // single UV per texel; replaying alpha preserves all of them.
             cpuTiming.Set(FO4CS::CpuProfile::Stage::VisibleDraw);
             reissue(context, command);
             cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureSetup);
             drawInvoked = true;
+            if (!captureThisDraw)
+                return true;
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+            LogSkyDiagnostics(context, command.skyTechnique);
+#endif
 
-            if (IsCloudTechnique(command.skyTechnique)) {
-                const bool authenticated =
-                    command.authentication ==
-                        CloudDrawAuthentication::kStockVisibleCloudShaders &&
-                    command.stableLayerId != 0;
-                std::array<ID3D11RenderTargetView*, 6> targets{};
-                for (uint32_t face = 0; face < 6; ++face)
-                    targets[face] = s_resources->cubeSets[s_mainSkyFrame.WriteIndex()].faceRTVs[face].Get();
-                struct Submission { ID3D11DeviceContext* context;
-                    const CloudDrawCommand* command; CloudDrawReissue reissue;
-                } submission{context, &command, reissue};
-                const auto layout = FO4CS::RuntimeAPI::GetSingleton().Target() ==
-                        FO4CS::F4SECompat::RuntimeTarget::kVR
-                    ? FO4CS::CloudMotionResolver::SkyConstantLayout::kVr
-                    : FO4CS::CloudMotionResolver::SkyConstantLayout::kFlat;
-                const bool sunMask = FO4CS::CloudComparison::EffectiveMethod() ==
-                    FO4CS::CloudComparison::Method::SunMask;
-                const auto submit = [](void* user) {
-                    const auto& draw = *static_cast<Submission*>(user);
-                    draw.reissue(draw.context, *draw.command);
-                };
-                const auto technique = static_cast<FO4CS::CloudMotionResolver::CloudTechnique>(command.skyTechnique);
-                const auto& sunSet = s_resources->sunSets[s_mainSkyFrame.WriteIndex()];
-                bool accumulated;
-                {
-                    FO4CS::CloudComparison::GpuScope captureTiming(context,
-                        FO4CS::CloudComparison::Work::Capture, sunMask ? 1u : 6u);
-                    accumulated = authenticated && (sunMask
-                        ? FO4CS::CloudGeometryCapture::AccumulateSunOpacity(context, layout,
-                            technique, sunSet.rtv.Get(), sunSet.projection, submit, &submission)
-                        : FO4CS::CloudGeometryCapture::AccumulateOpacity(context, layout,
-                            technique, kGeometryMappingFaceSize, targets, submit, &submission));
-                }
-                if (accumulated) {
-                    g_cloudDrawCount.fetch_add(1, std::memory_order_relaxed);
-                    g_geometryCaptureDraws.fetch_add(sunMask ? 1u : 6u, std::memory_order_relaxed);
-                }
-                if (!accumulated) {
-                    std::lock_guard lock(s_resourceMutex);
-                    s_mainSkyFrame.Reject();
-                    // A known-invalid current Sky must not leave the previous
-                    // frame's cloud field visible to a later GameWorks volume
-                    // or DFLight draw in this same frame.
-                    WithdrawResolvedFieldForRetry(true);
-                }
+            const bool authenticated =
+                command.authentication ==
+                    CloudDrawAuthentication::kStockVisibleCloudShaders;
+            std::array<ID3D11RenderTargetView*, 6> targets{};
+            for (uint32_t face = 0; face < 6; ++face)
+                targets[face] = s_resources->cubeSets[s_mainSkyFrame.WriteIndex()].faceRTVs[face].Get();
+            struct Submission { ID3D11DeviceContext* context;
+                const CloudDrawCommand* command; CloudDrawReissue reissue;
+            } submission{context, &command, reissue};
+            const auto layout = FO4CS::RuntimeAPI::GetSingleton().Target() ==
+                    FO4CS::F4SECompat::RuntimeTarget::kVR
+                ? FO4CS::CloudGeometryCapture::SkyConstantLayout::kVr
+                : FO4CS::CloudGeometryCapture::SkyConstantLayout::kFlat;
+            const auto submit = [](void* user) {
+                const auto& draw = *static_cast<Submission*>(user);
+                draw.reissue(draw.context, *draw.command);
+            };
+            const auto technique = static_cast<FO4CS::CloudGeometryCapture::CloudTechnique>(command.skyTechnique);
+            auto reason = FO4CS::CloudGeometryCapture::RejectReason::kNone;
+            bool accumulated = false;
+            if (!authenticated) {
+                reason = FO4CS::CloudGeometryCapture::RejectReason::kInvalidRequest;
+            } else {
+                FO4CS::CloudComparison::GpuScope captureTiming(context,
+                    FO4CS::CloudComparison::Work::Capture,
+                    FO4CS::CloudGeometryCapture::kCapturedCubeFaceCount);
+                accumulated = FO4CS::CloudGeometryCapture::AccumulateOpacity(context, layout,
+                    technique, kGeometryMappingFaceSize, targets, submit, &submission, &reason);
+            }
+            if (accumulated) {
+                g_cloudDrawCount.fetch_add(1, std::memory_order_relaxed);
+                g_geometryCaptureDraws.fetch_add(
+                    FO4CS::CloudGeometryCapture::kCapturedCubeFaceCount,
+                    std::memory_order_relaxed);
+            } else {
+                if (authenticated)
+                    LogCaptureReject(reason, command.skyTechnique);
+                std::lock_guard lock(s_resourceMutex);
+                s_mainSkyFrame.Reject();
+                // A known-invalid current Sky must not leave the previous
+                // frame's cloud field visible to a later GameWorks volume
+                // or DFLight draw in this same frame.
+                WithdrawResolvedFieldForRetry(true);
             }
             return true;
         } catch (...) {
@@ -1939,6 +1475,7 @@ namespace CloudShadows
         std::lock_guard lock(s_resourceMutex);
         if (!context || context != GetD3DContext() || !s_resources)
             return;
+        s_mainViewRenderedSincePresent = true;
         PollCaptureEvidence(context, *s_resources);
         bool fieldReset = false;
         SynchronizeWorldField(context, fieldReset);
@@ -1958,29 +1495,33 @@ namespace CloudShadows
         std::lock_guard lock(s_resourceMutex);
         if (!context || context != GetD3DContext() || !s_resources)
             return;
+        const bool mainViewRendered = std::exchange(s_mainViewRenderedSincePresent, false);
+        s_captureGate = CaptureGate::kUnknown;
+        // Loading screens and companion windows present thousands of times
+        // per second with nothing rendered, captured or published: skip the
+        // world synchronization unless a reset or a real frame needs it.
+        if (!mainViewRendered && !s_mainSkyFrame.Active() &&
+            s_mainSkyFrame.PublishedEpoch() == 0 && !s_resources->evidencePending &&
+            !s_resetRequested.load(std::memory_order_acquire))
+            return;
         PollCaptureEvidence(context, *s_resources);
         bool reset = false;
         const bool worldReady = SynchronizeWorldField(context, reset, nullptr, false);
         const bool rejected = s_mainSkyFrame.Active() && !s_mainSkyFrame.Authenticated();
         const auto completedIndex = s_mainSkyFrame.WriteIndex();
-        const bool companionWindow = FO4CS::RuntimeAPI::GetSingleton().Target() ==
-            FO4CS::F4SECompat::RuntimeTarget::kVR;
-        const auto publication = s_mainSkyFrame.CompletePresent(worldReady, companionWindow);
+        const auto publication = s_mainSkyFrame.CompletePresent(worldReady, mainViewRendered);
         if (publication == FO4CS::CloudFramePublication::PresentResult::Retained)
             return;
         if (publication == FO4CS::CloudFramePublication::PresentResult::Withdrawn) {
             if (rejected)
                 g_geometryCaptureRejected.fetch_add(1, std::memory_order_relaxed);
             if (s_snapshots[s_mainSkyFrame.ReadIndex()].active)
-                WithdrawResolvedFieldForRetry();
+                WithdrawResolvedFieldForRetry(false, true);
             g_worldCloudPendingEpoch.store(0, std::memory_order_release);
             return;
         }
         auto& completed = s_resources->cubeSets[completedIndex];
-        const bool sunMask = FO4CS::CloudComparison::EffectiveMethod() ==
-            FO4CS::CloudComparison::Method::SunMask;
-        auto& sunCompleted = s_resources->sunSets[completedIndex];
-        if (!sunMask && g_settings.DebugMode > 3.5f && g_settings.DebugMode < 4.5f)
+        if (g_settings.DebugMode > 3.5f && g_settings.DebugMode < 4.5f)
             context->GenerateMips(completed.srv.Get());
 
         CloudSnapshot snapshot{};
@@ -1988,7 +1529,6 @@ namespace CloudShadows
         snapshot.captureOrigin = s_publishedMappingOrigin;
         snapshot.captureOriginValid = true;
         snapshot.active = true;
-        if (sunMask) snapshot.sunProjection = sunCompleted.projection;
         snapshot.layer.stableLayerId = kCompositeCloudFieldId;
         snapshot.layer.PlaneZ = s_publishedMappingOrigin.z +
             g_settings.CloudHeight;
@@ -1999,8 +1539,8 @@ namespace CloudShadows
         snapshot.layer.MipBias = 0.0f;
         snapshot.layer.SliceIndex = 0;
         s_snapshots[s_mainSkyFrame.ReadIndex()] = snapshot;
-        s_resources->resolvedSrv = sunMask ? sunCompleted.srv : completed.srv;
-        s_resources->resolvedTexture = sunMask ? sunCompleted.texture : completed.texture;
+        s_resources->resolvedSrv = completed.srv;
+        s_resources->resolvedTexture = completed.texture;
         g_worldCloudPreviewSRV = s_resources->resolvedSrv.Get();
         g_worldCloudActiveLayers.store(1, std::memory_order_release);
         g_worldCloudCommittedEpoch.store(
@@ -2012,9 +1552,7 @@ namespace CloudShadows
         // to report the completed frame.  The next Prepass always rebuilds the
         // mask from this newly published live cloud field.
 
-        if (!sunMask) {
-            ArmCaptureEvidence(context, *s_resources, s_resources->resolvedTexture.Get(), snapshot.epoch);
-        }
+        ArmCaptureEvidence(context, *s_resources, s_resources->resolvedTexture.Get(), snapshot.epoch);
         g_geometryCapturePublished.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -2030,7 +1568,6 @@ namespace CloudShadows
         // F10 discards the incomplete capture and published field. The next
         // authenticated player Sky recreates opacity immediately.
         auto* context = GetD3DContext();
-        FO4CS::CloudMotionResolver::AbortCaptureGeneration();
         ResetCaptureProgress();
         WithdrawResolvedFieldForRetry();
         if (s_resources && context) {
@@ -2074,14 +1611,6 @@ namespace CloudShadows
             : nullptr;
     }
 
-    bool GetCommittedSunMaskProjection(FO4CS::SunMaskProjection& destination) noexcept
-    {
-        std::lock_guard lock(s_resourceMutex);
-        destination = s_snapshots[s_mainSkyFrame.ReadIndex()].sunProjection;
-        return s_resources && s_snapshots[s_mainSkyFrame.ReadIndex()].active &&
-            destination.centerAndValid.w == 1.0f;
-    }
-
     bool ConfirmWorldCloudOrigin(ID3D11DeviceContext* context,
         ID3D11Buffer* enginePerFrame, UINT firstConstant, bool vr) noexcept
     {
@@ -2089,28 +1618,39 @@ namespace CloudShadows
         if (!s_resources || s_resources->device.Get() != GetD3DDevice() ||
             s_worldIdentity == 0)
             return false;
-        if (s_confirmedProjectionOrigin.IsConfirmed())
+        const bool confirmed = s_confirmedProjectionOrigin.IsConfirmed();
+        const ULONGLONG now = GetTickCount64();
+        if (s_crossfadeActive &&
+            FO4CS::CrossfadeWeight(now - s_crossfadeStartTick,
+                FO4CS::ReanchorPolicy::kCrossfadeMilliseconds) <= 0.0f)
+            CancelCrossfade();
+        // Once confirmed, VR samples the same exact b12 camera about twice a
+        // second so its world-fixed anchor can follow the player across long
+        // distances. Flat retains its confirmed world origin until a reset,
+        // so normal camera movement cannot shift terrain shadows.
+        if (confirmed && (!vr || (!s_mainViewCameraReadback.Pending() &&
+                now < s_nextAnchorReadbackTick)))
             return true;
         FO4CS::MainViewCameraReadback::Point observed{};
         if (!s_mainViewCameraReadback.TryRead(context, enginePerFrame,
                 firstConstant, vr,
                 g_worldCloudResetGeneration.load(std::memory_order_acquire), observed))
-            return false;
+            return confirmed;
+        s_nextAnchorReadbackTick = now + FO4CS::ReanchorPolicy::kReadbackIntervalMilliseconds;
         const XMFLOAT3 gameplayCamera{observed[0], observed[1], observed[2]};
-        const auto confirmation = s_confirmedProjectionOrigin.ConfirmMainView(
-            { gameplayCamera.x, gameplayCamera.y, gameplayCamera.z });
-        if (confirmation == FO4CS::WorldCloudAnchor::Confirmation::kRejected)
-            return false;
-        if (confirmation == FO4CS::WorldCloudAnchor::Confirmation::kEstablished) {
+        const auto moveOrigin = [&](bool crossfade) {
             const bool moved = gameplayCamera.x != s_projectionOrigin.x ||
-                gameplayCamera.y != s_projectionOrigin.y || gameplayCamera.z != s_projectionOrigin.z;
+                gameplayCamera.y != s_projectionOrigin.y ||
+                gameplayCamera.z != s_projectionOrigin.z;
+            if (crossfade && s_projectionOriginValid && moved) {
+                s_previousProjectionOrigin = s_projectionOrigin;
+                s_crossfadeStartTick = now;
+                s_crossfadeActive = true;
+            } else {
+                CancelCrossfade();
+            }
             s_projectionOrigin = gameplayCamera;
             s_projectionOriginValid = true;
-            // Unlike the directional cube, the 2D capture embeds the origin
-            // in its window transform. Never relabel that texture with a new
-            // origin; rebuild it on the next authenticated Sky frame.
-            if (moved && FO4CS::CloudComparison::EffectiveMethod() == FO4CS::CloudComparison::Method::SunMask)
-                WithdrawResolvedFieldForRetry();
             if (s_publishedMappingOriginValid)
                 s_publishedMappingOrigin = gameplayCamera;
             for (auto& snapshot : s_snapshots) {
@@ -2119,11 +1659,49 @@ namespace CloudShadows
                 snapshot.captureOriginValid = true;
                 snapshot.layer.PlaneZ = gameplayCamera.z + g_settings.CloudHeight;
             }
-            s_mainViewCameraReadback.Reset();
+        };
+        if (!confirmed) {
+            const auto confirmation = s_confirmedProjectionOrigin.ConfirmMainView(
+                { gameplayCamera.x, gameplayCamera.y, gameplayCamera.z });
+            if (confirmation != FO4CS::WorldCloudAnchor::Confirmation::kEstablished)
+                return false;
+            moveOrigin(false);
             SPDLOG_INFO("[CloudShadows] World-fixed cloud origin confirmed by main lighting GPU camera: "
                         "{:.2f},{:.2f},{:.2f}",
                 gameplayCamera.x, gameplayCamera.y, gameplayCamera.z);
+            return true;
         }
+        if (vr && FO4CS::NeedsReanchor(
+                { s_projectionOrigin.x, s_projectionOrigin.y, s_projectionOrigin.z },
+                observed, g_settings.CloudHeight) &&
+            s_confirmedProjectionOrigin.Reanchor(observed)) {
+            const XMFLOAT3 previous = s_projectionOrigin;
+            moveOrigin(true);
+            SPDLOG_INFO("[CloudShadows] World-fixed cloud origin re-anchored after travel: "
+                        "{:.0f},{:.0f},{:.0f} -> {:.0f},{:.0f},{:.0f} ({})",
+                previous.x, previous.y, previous.z,
+                gameplayCamera.x, gameplayCamera.y, gameplayCamera.z,
+                s_crossfadeActive ? "crossfading" : "immediate");
+        }
+        return true;
+    }
+
+    bool GetWorldCloudCrossfade(XMFLOAT3& previousOrigin, float& previousWeight) noexcept
+    {
+        std::lock_guard lock(s_resourceMutex);
+        previousOrigin = {};
+        previousWeight = 0.0f;
+        if (!s_crossfadeActive)
+            return false;
+        previousWeight = FO4CS::CrossfadeWeight(
+            GetTickCount64() - s_crossfadeStartTick,
+            FO4CS::ReanchorPolicy::kCrossfadeMilliseconds);
+        if (previousWeight <= 0.0f) {
+            CancelCrossfade();
+            previousWeight = 0.0f;
+            return false;
+        }
+        previousOrigin = s_previousProjectionOrigin;
         return true;
     }
 

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "PCH.h"
 #include "CloudComparison.h"
-#include "CloudGeometryCapture.h"
 #include "CloudShadows.h"
 #include "ManualFpsLog.h"
 #include "Overlay.h"
@@ -14,7 +13,6 @@ namespace FO4CS::CloudComparison
 {
     namespace
     {
-        std::atomic<Method> method{ Method::Cubemap };
         std::atomic<Preview> preview{ Preview::Off };
         std::atomic<bool> hud{}, measuring{};
         std::atomic<double> hudDeadline{ 0.0 };
@@ -27,13 +25,48 @@ namespace FO4CS::CloudComparison
         std::string status = BuildFeatures::kDeveloperTools
             ? "F10: shadows on/off | F7: stop measurement"
             : "F10: shadows on/off | F8: sky preview | F7: hide";
-        ComPtr<ID3D11ComputeShader> sunProduction, sunDiagnostic, previewShader;
-        ComPtr<ID3D11Texture2D> previewTexture;
-        ComPtr<ID3D11ShaderResourceView> previewSrv;
-        ComPtr<ID3D11UnorderedAccessView> previewUav;
-        ComPtr<ID3D11Buffer> previewCB;
+        // Device objects are never destroyed by a DLL static destructor: at
+        // process exit that would run under the loader lock.
+        struct DeviceObjects
+        {
+            ComPtr<ID3D11ComputeShader> previewShader;
+            ComPtr<ID3D11Texture2D> previewTexture;
+            ComPtr<ID3D11ShaderResourceView> previewSrv;
+            ComPtr<ID3D11UnorderedAccessView> previewUav;
+            ComPtr<ID3D11Buffer> previewCB;
+            // Recorded screen-shader source for the lazily compiled variants.
+            ComPtr<ID3D11Device> shaderDevice;
+            std::string shaderSource;
+            std::string shaderName;
+            bool shaderVr{};
+            bool previewAttempted{};
+        };
+        DeviceObjects& objects = *new DeviceObjects();
+        auto& previewShader = objects.previewShader;
+        auto& previewTexture = objects.previewTexture;
+        auto& previewSrv = objects.previewSrv;
+        auto& previewUav = objects.previewUav;
+        auto& previewCB = objects.previewCB;
         UINT previewWidth{}, previewHeight{};
         bool previewReady{};
+
+        bool CompileScreenEntry(const char* entry,
+            ComPtr<ID3D11ComputeShader>& shader)
+        {
+            const D3D_SHADER_MACRO macros[]{ {"FO4CS_SHADER_VR", objects.shaderVr ? "1" : "0"}, {} };
+            ComPtr<ID3DBlob> code, errors;
+            if (FAILED(D3DCompile(objects.shaderSource.data(), objects.shaderSource.size(),
+                    objects.shaderName.c_str(), macros, nullptr,
+                    entry, "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS |
+                    D3DCOMPILE_WARNINGS_ARE_ERRORS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
+                    0, &code, &errors))) {
+                SPDLOG_ERROR("[CloudShadows][Compare] {} compile: {}", entry,
+                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "failed");
+                return false;
+            }
+            return SUCCEEDED(objects.shaderDevice->CreateComputeShader(code->GetBufferPointer(),
+                code->GetBufferSize(), nullptr, &shader));
+        }
 
         // Bounded, asynchronous timestamps. Never Flush, wait, or map a
         // staging resource on the render thread. A full ring drops samples.
@@ -50,8 +83,8 @@ namespace FO4CS::CloudComparison
             std::uint64_t generation{};
             bool pending{}, eligible{}, overflow{};
         };
-        std::array<Frame, kFrames> frames;
-        ComPtr<ID3D11Device> timingDevice;
+        std::array<Frame, kFrames>& frames = *new std::array<Frame, kFrames>();
+        ComPtr<ID3D11Device>& timingDevice = *new ComPtr<ID3D11Device>();
         unsigned current = kFrames, next{};
         bool droppedCurrent{};
         std::uint64_t generation = 1;
@@ -91,14 +124,7 @@ namespace FO4CS::CloudComparison
         }
     }
 
-    Method GetMethod() noexcept { return method.load(std::memory_order_acquire); }
-    Method EffectiveMethod() noexcept
-    {
-        return GetMethod() == Method::SunMask && SunMethodAvailable() &&
-            CloudGeometryCapture::SunCaptureAvailable() ? Method::SunMask : Method::Cubemap;
-    }
     Preview GetPreview() noexcept { return preview.load(std::memory_order_acquire); }
-    const char* MethodName() noexcept { return GetMethod() == Method::SunMask ? "Sun 2D" : "Cubemap"; }
     bool HudVisible() noexcept
     {
         if (!hud.load(std::memory_order_acquire)) return false;
@@ -122,7 +148,6 @@ namespace FO4CS::CloudComparison
         hudDeadline.store(Now() + seconds, std::memory_order_release);
         hud.store(true, std::memory_order_release);
     }
-    bool SunMethodAvailable() noexcept { return sunProduction != nullptr; }
     void SetStatus(std::string text) { std::lock_guard lock(statusMutex); status = std::move(text); }
     std::string Status() { std::lock_guard lock(statusMutex); return status; }
     void ResetTimings() noexcept { ++generation; totals = {}; }
@@ -150,41 +175,12 @@ namespace FO4CS::CloudComparison
         preview.store(Preview::Off, std::memory_order_release);
         RetirePreview();
         ResetTimings();
-        SPDLOG_INFO("[CloudShadows][Compare] Measurement and preview stopped; F6/F10 starts a new comparison");
-    }
-
-    void SetMethod(Method value) noexcept
-    {
-        if (value != Method::Cubemap && value != Method::SunMask) return;
-        // Saved preferences are applied before the compute shaders compile, so
-        // the selection must never be refused here: the prepass already fails
-        // neutral (kResources) while the Sun 2D shaders are absent, and the
-        // menu greys the option out. Refusing silently dropped the preference.
-        if (value == Method::SunMask && !SunMethodAvailable())
-            SPDLOG_INFO("[CloudShadows][Compare] Sun 2D method selected before its shaders compiled; it activates once they are ready");
-        if (method.exchange(value, std::memory_order_acq_rel) == value) return;
-        preview.store(Preview::Off, std::memory_order_release);
-        previewReady = false;
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-        hud.store(true, std::memory_order_release);
-        SetStatus("Method selected. F8 checks cubemap alignment; application FPS comparison is flat-only.");
-#endif
-        CloudShadows::InvalidateWorldCloudCaptureForToggle();
-        SPDLOG_INFO("[CloudShadows][Compare] Capture method={} (effective {}); other producer disabled",
-            MethodName(), EffectiveMethod() == Method::SunMask ? "Sun 2D" : "Cubemap");
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-        ManualFpsLog::OnToggle(CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire));
-#endif
+        SPDLOG_INFO("[CloudShadows][Compare] Measurement and preview stopped; F10 starts a new comparison");
     }
 
     void SetPreview(Preview value) noexcept
     {
         if (value != Preview::Off && value != Preview::SkyOverlay && value != Preview::RawMask) return;
-        if (value != Preview::Off && EffectiveMethod() != Method::Cubemap) {
-            // Never silently change the player's saved method for a preview.
-            FlashStatus("Sky preview is only available with the Cubemap method (F11 > Cloud shadow method).", 4.0);
-            return;
-        }
         preview.store(value, std::memory_order_release);
         previewReady = false;
         // Release: leaving the preview shows the status briefly instead of a
@@ -206,73 +202,54 @@ namespace FO4CS::CloudComparison
         }
         const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
         const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-        static bool previous6{};
-        const bool f6 = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-#endif
         if (!Overlay::IsExternalHostActive() && IsForeground()) {
             if (f7 && !previous7) StopMeasurements();
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-            if (f6 && !previous6)
-                SetMethod(GetMethod() == Method::Cubemap ? Method::SunMask : Method::Cubemap);
-#endif
             if (f8 && !previous8)
                 SetPreview(static_cast<Preview>((static_cast<unsigned>(GetPreview()) + 1) % 3));
         }
         previous7 = f7; previous8 = f8;
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-        previous6 = f6;
-#endif
     }
 
     bool CompileShaders(ID3D11Device* device, const std::string& source,
         const std::string& name, bool vr)
     {
-        const auto compile = [&](const char* entry, bool sun, ComPtr<ID3D11ComputeShader>& shader) {
-            const D3D_SHADER_MACRO macros[]{ {"FO4CS_SHADER_VR", vr ? "1" : "0"},
-                {"FO4CS_SUN_MASK", sun ? "1" : "0"}, {} };
-            ComPtr<ID3DBlob> code, errors;
-            if (FAILED(D3DCompile(source.data(), source.size(), name.c_str(), macros, nullptr,
-                    entry, "cs_5_0", D3DCOMPILE_ENABLE_STRICTNESS |
-                    D3DCOMPILE_WARNINGS_ARE_ERRORS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
-                    0, &code, &errors))) {
-                SPDLOG_ERROR("[CloudShadows][Compare] {} compile: {}", entry,
-                    errors ? static_cast<const char*>(errors->GetBufferPointer()) : "failed");
-                return false;
-            }
-            return SUCCEEDED(device->CreateComputeShader(code->GetBufferPointer(),
-                code->GetBufferSize(), nullptr, &shader));
-        };
-        ComPtr<ID3D11ComputeShader> production, diagnostic, sky;
-        // The sun-oriented 2D method is a user-selectable alternative. Its
-        // shaders failing must never disable the cubemap ground shadows.
-        if (!compile("mainProduction", true, production) || !compile("main", true, diagnostic)) {
-            if constexpr (BuildFeatures::kExperimental) return false;
-            SPDLOG_WARN("[CloudShadows][Compare] Sun 2D method unavailable; cubemap shadows remain enabled");
-            production.Reset(); diagnostic.Reset();
-        }
-        // A failed optional preview must never disable the ground shadows.
-        if (!compile("mainSkyPreview", false, sky))
-            SPDLOG_WARN("[CloudShadows][Compare] Sky preview unavailable; ground shadows remain enabled");
-        sunProduction = std::move(production); sunDiagnostic = std::move(diagnostic);
-        previewShader = std::move(sky);
-        // The effective method may have just switched from the cubemap fallback
-        // to Sun 2D; discard the in-flight cubemap capture so the producers
-        // restart on the next authenticated Sky frame.
-        if (GetMethod() == Method::SunMask && sunProduction)
-            CloudShadows::InvalidateWorldCloudCaptureForToggle();
+        if (!device)
+            return false;
+        objects.shaderDevice = device;
+        objects.shaderSource = source;
+        objects.shaderName = name;
+        objects.shaderVr = vr;
+        objects.previewAttempted = false;
+        previewShader.Reset();
+        previewReady = false;
         return true;
     }
 
-    ID3D11ComputeShader* SunShader(bool diagnostic) noexcept
-    { return diagnostic ? sunDiagnostic.Get() : sunProduction.Get(); }
+    void MaintainShaders(ID3D11Device* device) noexcept
+    {
+        try {
+            if (!device || device != objects.shaderDevice.Get() || objects.shaderSource.empty())
+                return;
+            if (GetPreview() != Preview::Off && !objects.previewAttempted) {
+                objects.previewAttempted = true;
+                ComPtr<ID3D11ComputeShader> sky;
+                // A failed optional preview must never disable the ground shadows.
+                if (CompileScreenEntry("mainSkyPreview", sky))
+                    previewShader = std::move(sky);
+                else
+                    SPDLOG_WARN("[CloudShadows][Compare] Sky preview unavailable; ground shadows remain enabled");
+            }
+        } catch (...) {
+            SPDLOG_ERROR("[CloudShadows][Compare] Optional shader preparation failed");
+        }
+    }
 
     bool RenderPreview(ID3D11DeviceContext* context,
         const CloudShadows::CloudShadowScreenCBData& constants,
         ID3D11ShaderResourceView* cube) noexcept
     {
         previewReady = false;
-        if (GetPreview() == Preview::Off || EffectiveMethod() != Method::Cubemap || !cube || !previewShader)
+        if (GetPreview() == Preview::Off || !cube || !previewShader)
             return false;
         ComPtr<ID3D11Device> device;
         context->GetDevice(&device);
@@ -400,7 +377,11 @@ namespace FO4CS::CloudComparison
 
     void ReleaseDeviceResources() noexcept
     {
-        sunProduction.Reset(); sunDiagnostic.Reset(); previewShader.Reset();
+        objects.shaderDevice.Reset();
+        objects.shaderSource.clear();
+        objects.shaderName.clear();
+        objects.previewAttempted = false;
+        previewShader.Reset();
         previewTexture.Reset(); previewSrv.Reset(); previewUav.Reset(); previewCB.Reset();
         previewReady = false; previewWidth = previewHeight = 0;
         frames = {}; timingDevice.Reset(); current = kFrames; next = 0;

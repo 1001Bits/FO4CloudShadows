@@ -5,7 +5,10 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
+#include <unordered_map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -163,5 +166,142 @@ V main(uint id : SV_VertexID) {
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return false;
+    }
+}
+
+// The live path authenticates stock Sky cloud shaders by exact FNV-1a hash,
+// including three FO4VR Deferred replacements that differ from stock only in
+// equivalent CB12 motion-vector indexing. With an extracted DXBC corpus (file
+// or directory arguments) this proves those replacements render identically.
+// Without one it proves the comparator itself on WARP.
+namespace
+{
+    std::vector<uint8_t> ReadBytes(const std::filesystem::path& path)
+    {
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        if (!input)
+            return {};
+        const std::streamoff length = input.tellg();
+        if (length <= 0 || length > (1 << 24))
+            return {};
+        std::vector<uint8_t> bytes(static_cast<size_t>(length));
+        input.seekg(0, std::ios::beg);
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(length));
+        return input ? bytes : std::vector<uint8_t>{};
+    }
+
+    uint64_t HashDXBC(const std::vector<uint8_t>& bytes)
+    {
+        uint64_t hash = 0xCBF29CE484222325ULL;
+        for (const uint8_t byte : bytes) {
+            hash ^= byte;
+            hash *= 0x100000001B3ULL;
+        }
+        return hash;
+    }
+
+    void AddCorpusPath(const std::filesystem::path& path,
+        std::vector<std::filesystem::path>& files)
+    {
+        std::error_code error;
+        if (std::filesystem::is_regular_file(path, error) && !error) {
+            files.push_back(path);
+            return;
+        }
+        if (!std::filesystem::is_directory(path, error) || error)
+            return;
+        for (std::filesystem::recursive_directory_iterator iterator(path, error), end;
+             iterator != end && !error; iterator.increment(error)) {
+            if (iterator->is_regular_file(error) && !error &&
+                iterator->path().extension() == ".dxbc")
+                files.push_back(iterator->path());
+        }
+    }
+
+    std::vector<uint8_t> CompileSyntheticCloudShader(bool altered)
+    {
+        const char* source = R"hlsl(
+struct V {
+    float4 pos : SV_Position;
+    float2 uv : TEXCOORD0;
+    float2 uv1 : TEXCOORD1;
+    float4 color : COLOR0;
+    float4 current : POSITION0;
+    float4 previous : POSITION1;
+    nointerpolation uint eye : POSITION2;
+    float cull : SV_CullDistance0;
+    float clip : SV_ClipDistance0;
+};
+cbuffer Material : register(b2) { float4 M; };
+Texture2D<float4> Cloud0 : register(t0);
+SamplerState Sampler0 : register(s0);
+struct O { float4 color : SV_Target0; float4 motion : SV_Target1; };
+O main(V i) {
+    O o;
+    o.color = float4(i.color.rgb * M.y, i.color.a * Cloud0.Sample(Sampler0, i.uv).a);
+#if ALTERED
+    o.color.r += 0.25;
+#endif
+    o.motion = float4(i.current.xy - i.previous.xy, 0, 1);
+    return o;
+}
+)hlsl";
+        const D3D_SHADER_MACRO macros[]{ { "ALTERED", altered ? "1" : "0" }, {} };
+        ComPtr<ID3DBlob> code, errors;
+        if (FAILED(D3DCompile(source, std::char_traits<char>::length(source), nullptr,
+                macros, nullptr, "main", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS, 0,
+                &code, &errors)))
+            throw std::runtime_error("synthetic cloud shader failed to compile");
+        const auto* bytes = static_cast<const uint8_t*>(code->GetBufferPointer());
+        return { bytes, bytes + code->GetBufferSize() };
+    }
+}
+
+int main(int argc, char** argv)
+{
+    try {
+        ComPtr<ID3D11Device> device;
+        constexpr D3D_FEATURE_LEVEL level = D3D_FEATURE_LEVEL_11_0;
+        if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                &level, 1, D3D11_SDK_VERSION, &device, nullptr, nullptr)))
+            throw std::runtime_error("WARP D3D11 device is unavailable");
+
+        const auto stock = CompileSyntheticCloudShader(false);
+        const auto altered = CompileSyntheticCloudShader(true);
+        if (!VerifySkyOutputEquivalence(device.Get(), stock, stock))
+            throw std::runtime_error("comparator rejects identical cloud shaders");
+        if (VerifySkyOutputEquivalence(device.Get(), stock, altered))
+            throw std::runtime_error("comparator accepts a shader with different colour output");
+
+        std::vector<std::filesystem::path> corpus;
+        for (int index = 1; index < argc; ++index)
+            AddCorpusPath(argv[index], corpus);
+        std::unordered_map<uint64_t, std::vector<uint8_t>> shaders;
+        for (const auto& path : corpus) {
+            auto bytes = ReadBytes(path);
+            if (!bytes.empty())
+                shaders.emplace(HashDXBC(bytes), std::move(bytes));
+        }
+        // {stock VR cloud PS, accepted FO4VR Deferred replacement}.
+        const std::array<std::array<uint64_t, 2>, 3> compatibilityPairs{{
+            { 0x0219856733164CB0ULL, 0x6D2B9D973AF2EC0DULL },
+            { 0x7C98FE0C571E1916ULL, 0x9D6DBBA74E764A0CULL },
+            { 0x9672C2620203FD20ULL, 0x585F89F70474752CULL }
+        }};
+        unsigned verified = 0;
+        for (const auto& pair : compatibilityPairs) {
+            if (!shaders.contains(pair[1]))
+                continue;
+            if (!shaders.contains(pair[0]) ||
+                !VerifySkyOutputEquivalence(device.Get(), shaders.at(pair[0]), shaders.at(pair[1])))
+                throw std::runtime_error("VR replacement changes stock colour, alpha or motion output");
+            ++verified;
+        }
+        std::cout << "Sky cloud compatibility tests passed (comparator self-test; "
+            << verified << " corpus replacement pair(s) verified)\n";
+        return 0;
+    } catch (const std::exception& error) {
+        std::cerr << error.what() << '\n';
+        return 1;
     }
 }

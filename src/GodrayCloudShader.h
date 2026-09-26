@@ -2,7 +2,6 @@
 #pragma once
 #include <DirectXMath.h>
 #include <string>
-#include "SunMaskProjection.h"
 
 namespace FO4CS::GodrayCloudShader
 {
@@ -16,11 +15,10 @@ namespace FO4CS::GodrayCloudShader
         DirectX::XMFLOAT4 expectedEyeAndTolerance{};
         // Same visible-sun direction / validity as the ground shader.
         DirectX::XMFLOAT4 visibleSunDirectionAndValidity{};
-        SunMaskProjection sunProjection{};
     };
-    static_assert(sizeof(Constants) == 128);
+    static_assert(sizeof(Constants) == 64);
 
     // Shared by both native payloads and numerical GPU fixtures.
     [[nodiscard]] const char* CommonSource() noexcept;
-    [[nodiscard]] std::string PayloadSource(bool screenIntegral, bool sunMask = false);
+    [[nodiscard]] std::string PayloadSource(bool screenIntegral);
 }

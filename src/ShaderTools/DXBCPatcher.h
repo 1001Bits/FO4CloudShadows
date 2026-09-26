@@ -38,7 +38,10 @@ namespace SIE
 		constexpr uint32_t DCL_OUTPUT = 0x65;
 		constexpr uint32_t DCL_TEMPS = 0x68;
 		constexpr uint32_t DCL_GLOBAL_FLAGS = 0x6A;
-		constexpr uint32_t INTERFACE_CALL = 0x77;
+		// SM5 fcall (D3D11_SB_OPCODE_INTERFACE_CALL = 120). 0x77 is
+		// emit_then_cut_stream, which is not dynamic linkage.
+		constexpr uint32_t INTERFACE_CALL = 0x78;
+		constexpr uint32_t RETC = 0x3F;
 		constexpr uint32_t DCL_STREAM = 0x8F;
 		constexpr uint32_t DCL_FUNCTION_BODY = 0x90;
 		constexpr uint32_t DCL_FUNCTION_TABLE = 0x91;
@@ -89,6 +92,11 @@ namespace SIE
 			uint32_t factorTempRegister,
 			SunShadowPatchInfo* outInfo = nullptr);
 
+		/// True when `data` has one of the audited terminal sunlight layouts
+		/// PatchSunShadowShader accepts. Parses only; no blob or copy is made,
+		/// so every shader the game creates can be classified cheaply.
+		static bool IsSunShadowCandidate(const void* data, size_t size) noexcept;
+
 		/// Compile a minimal HLSL snippet and extract its SHEX instruction bytes
 		/// (excluding declarations and ret). Useful for generating injection payloads.
 		/// Returns the raw DWORD sequences of the body instructions.
@@ -118,8 +126,11 @@ namespace SIE
 			uint32_t tempsDeclOffset = 0xFFFFFFFF;        // dcl_temps instruction position
 			uint32_t tempCount = 0;                        // Current dcl_temps value
 			uint32_t svPositionRegister = 0xFFFFFFFF;     // Input register index for SV_Position
+			uint32_t svPositionMask = 0;                  // Declared components of that register
 			uint32_t maxInputRegister = 0xFFFFFFFF;       // Highest input register index used
 			std::unordered_set<uint32_t> declaredInputRegisters;  // All registers with dcl_input_ps or dcl_input_ps_siv
+			std::unordered_map<uint32_t, uint32_t> inputRegisterMasks;  // regIdx -> declared component mask
+			bool hasConditionalReturn = false;            // retc present (legacy pre-ret insertion unsafe)
 			std::unordered_set<uint32_t> declaredResourceRegisters;
 			std::unordered_map<uint32_t, uint32_t> outputRegisterMasks;  // regIdx → component mask (x=1,y=2,z=4,w=8)
 			bool usesDynamicLinkage = false;

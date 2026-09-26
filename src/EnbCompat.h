@@ -60,23 +60,35 @@ namespace FO4CS::EnbCompat
         return Setting::kMissing;
     }
 
-    // True when ENB renders its cloud shadows at startup: [GLOBAL] UseEffect and
-    // [EFFECT] EnableCloudShadows are not "false". Missing values follow ENB's
-    // stock preset, which enables both, so ENB keeps ownership of the effect.
+    // True when the preset explicitly enables ENB's cloud shadows at startup:
+    // [EFFECT] EnableCloudShadows is true and [GLOBAL] UseEffect is not false.
+    // A preset without the key (or without an enbseries.ini) is not treated
+    // as ENB-owned: staying inert there left players with no cloud shadows at
+    // all. The caller logs how to resolve doubled shadows in that case.
     [[nodiscard]] inline bool CloudShadowsActiveAtStartup(
         const std::filesystem::path& enbseriesIni) noexcept
     {
         std::error_code error;
         if (!std::filesystem::exists(enbseriesIni, error) || error)
-            return true;
+            return false;
         return ReadBool(enbseriesIni, L"GLOBAL", L"UseEffect") != Setting::kFalse &&
-            ReadBool(enbseriesIni, L"EFFECT", L"EnableCloudShadows") != Setting::kFalse;
+            ReadBool(enbseriesIni, L"EFFECT", L"EnableCloudShadows") == Setting::kTrue;
+    }
+
+    // True when the preset states EnableCloudShadows explicitly (either way).
+    [[nodiscard]] inline bool CloudShadowsSettingPresent(
+        const std::filesystem::path& enbseriesIni) noexcept
+    {
+        std::error_code error;
+        return std::filesystem::exists(enbseriesIni, error) && !error &&
+            ReadBool(enbseriesIni, L"EFFECT", L"EnableCloudShadows") != Setting::kMissing;
     }
 
     struct Detection
     {
         bool present{};
         bool cloudShadowsActive{};
+        bool cloudShadowsSettingPresent{};
         long version{};
         std::filesystem::path configPath;
     };
@@ -105,12 +117,14 @@ namespace FO4CS::EnbCompat
                     result.configPath =
                         std::filesystem::path(path).parent_path() / L"enbseries.ini";
                 }
-                result.cloudShadowsActive = result.configPath.empty() ||
+                result.cloudShadowsActive = !result.configPath.empty() &&
                     CloudShadowsActiveAtStartup(result.configPath);
+                result.cloudShadowsSettingPresent = !result.configPath.empty() &&
+                    CloudShadowsSettingPresent(result.configPath);
                 return result;
             }
         } catch (...) {
-            result.cloudShadowsActive = result.present;
+            result.cloudShadowsActive = false;
         }
         return result;
     }

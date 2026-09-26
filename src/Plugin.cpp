@@ -4,18 +4,20 @@
 #include "AcceptanceRunner.h"
 #include "CloudShadows.h"
 #include "CloudShadowsMenuBridge.h"
-#include "CloudMotionResolver.h"
 #include "EnbCompat.h"
+#include "GraphicsProxyCompat.h"
 #include "GodraysIntegration.h"
-#include "NativeSkyCube.h"
 #include "ManualFpsLog.h"
 #include "CloudComparison.h"
 #include "PrivateProfile.h"
 #include "McmSettings.h"
+#include "MenuFrameworkPage.h"
 #include "Overlay.h"
 #include "RuntimeAPI.h"
 #include "ShaderTools/DFLightDescriptor.h"
-#include "ShaderTools/SkyCloudMrtPatcher.h"
+#include "WaterReflectionGuard.h"
+#include "DetourTransaction.h"
+#include "WideFileSink.h"
 
 #include <array>
 #include <atomic>
@@ -27,6 +29,7 @@
 #include <ShlObj.h>
 #include <string_view>
 #include <TlHelp32.h>
+#include <intrin.h>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -88,9 +91,12 @@ namespace
                     L"Data" / L"F4SE" / L"Plugins";
             }
             std::filesystem::create_directories(logDirectory);
-            auto pluginLogger = spdlog::basic_logger_mt(
+            // UTF-16 open: a non-ANSI Documents path must not disable logging.
+            auto pluginLogger = std::make_shared<spdlog::logger>(
                 "FO4CloudShadowsStandalone",
-                (logDirectory / L"FO4CloudShadows.log").string(), true);
+                std::make_shared<FO4CS::WideFileSink>(
+                    logDirectory / L"FO4CloudShadows.log"));
+            spdlog::register_logger(pluginLogger);
             pluginLogger->set_level(spdlog::level::info);
             pluginLogger->set_pattern("[%T.%e] [%L] %v");
             spdlog::set_default_logger(std::move(pluginLogger));
@@ -101,27 +107,38 @@ namespace
         }
     }
 
-    [[nodiscard]] bool WriteProtectedPointer(
+    enum class SlotWrite { kWritten, kChanged, kFailed };
+
+    // Replaces a shared COM method-table slot only if it still holds
+    // `expected`. A concurrent hook installed between the caller's read and
+    // this write is therefore never overwritten.
+    [[nodiscard]] SlotWrite CompareExchangeProtectedPointer(
         std::uintptr_t* destination,
+        std::uintptr_t expected,
         std::uintptr_t value) noexcept
     {
         if (!destination ||
             reinterpret_cast<std::uintptr_t>(destination) %
                 alignof(std::uintptr_t) != 0) {
-            return false;
+            return SlotWrite::kFailed;
         }
         DWORD oldProtection = 0;
         if (!VirtualProtect(
                 destination, sizeof(*destination), PAGE_READWRITE,
                 &oldProtection)) {
-            return false;
+            return SlotWrite::kFailed;
         }
-        std::atomic_ref<std::uintptr_t>(*destination).store(
-            value, std::memory_order_release);
+        const bool written =
+            std::atomic_ref<std::uintptr_t>(*destination).compare_exchange_strong(
+                expected, value, std::memory_order_acq_rel,
+                std::memory_order_acquire);
         DWORD discarded = 0;
-        return VirtualProtect(
-                   destination, sizeof(*destination), oldProtection,
-                   &discarded) != FALSE;
+        const bool restored = VirtualProtect(
+            destination, sizeof(*destination), oldProtection,
+            &discarded) != FALSE;
+        if (!written)
+            return SlotWrite::kChanged;
+        return restored ? SlotWrite::kWritten : SlotWrite::kFailed;
     }
 
     bool IsExecutableMainModuleAddress(uintptr_t address) noexcept
@@ -279,47 +296,7 @@ namespace
         0x225179e7, 0xdf65, 0x4bbf,
         { 0xa6, 0xe4, 0x42, 0xe6, 0x95, 0x96, 0x93, 0x6b }
     };
-    // The stock cloud shader owns this private interface. D3D therefore
-    // releases the cubemap-only variant with the vanilla object and pointer
-    // reuse cannot alias a stale replacement in a process-global map.
-    constexpr GUID kSkyCloudMrtShaderMarker{
-        0x1c5f0f4d, 0x61de, 0x4acb,
-        { 0x9d, 0x17, 0x26, 0x3b, 0xb7, 0x74, 0xe8, 0x51 }
-    };
-    std::atomic<uint32_t> g_nativeCloudMrtShaderCount{ 0 };
-    // The native capture routes are armed only after all intercepted context
-    // entry points are current. Passive capture never suppresses Fallout's
-    // primary clear or any draw; authenticated cloud draws append private RT1
-    // while preserving the stock colour output at RT0.
-    std::atomic<bool> g_nativePrimaryClearHookReady{ false };
-
-    [[nodiscard]] ID3D11PixelShader* AcquireNativeCloudMrtShader(
-        ID3D11PixelShader* stockShader) noexcept
-    {
-        if (!stockShader)
-            return nullptr;
-        ID3D11PixelShader* patchedShader = nullptr;
-        UINT byteCount = sizeof(patchedShader);
-        if (FAILED(stockShader->GetPrivateData(
-                kSkyCloudMrtShaderMarker, &byteCount, &patchedShader)) ||
-            byteCount != sizeof(patchedShader) || !patchedShader) {
-            if (patchedShader)
-                patchedShader->Release();
-            return nullptr;
-        }
-        // GetPrivateData AddRefs an interface installed through
-        // SetPrivateDataInterface; ownership transfers to the caller.
-        return patchedShader;
-    }
-    constexpr uint32_t kComRouteMagic = 0x46534353u;  // "FSCS"
-    constexpr uint32_t kComRouteVersion = 1;
-
-    struct ComRouteData {
-        uint32_t magic{ kComRouteMagic };
-        uint32_t version{ kComRouteVersion };
-        std::uintptr_t downstream{ 0 };
-    };
-    static_assert(std::is_trivially_copyable_v<ComRouteData>);
+    using ComRouteData = FO4CS::GraphicsProxyCompat::ComRouteData;
 
     // True for a d3d11.dll/dxgi.dll proxy loaded from the game folder (ENB and
     // similar wrappers). Such a proxy owns the game-visible swap chain and calls
@@ -388,6 +365,40 @@ namespace
             : spdlog::level::err;
     }
 
+    [[nodiscard]] bool IsReShadeProxy(HMODULE module) noexcept
+    {
+        return IsGameDirectoryGraphicsProxy(module) &&
+            GetProcAddress(module, "ReShadeRegisterAddon") &&
+            GetProcAddress(module, "ReShadeVersion");
+    }
+
+    [[nodiscard]] bool IsUpscalingPresentModule(HMODULE module) noexcept
+    {
+        // The upscaler owns the game-facing D3D11 swap-chain proxy, even when
+        // the final presentation uses D3D12. Hook this frame boundary, keeping
+        // its trampoline and proxy receiver; never call system DXGI on it.
+        if (!module || module != GetModuleHandleW(L"Upscaling.dll") ||
+            !GetProcAddress(module, "F4SEPlugin_Load"))
+            return false;
+        static const HMODULE verified = [module]() noexcept -> HMODULE {
+            wchar_t modulePath[32768]{}, gamePath[32768]{};
+            const DWORD moduleLength = GetModuleFileNameW(module, modulePath, 32768);
+            const DWORD gameLength = GetModuleFileNameW(nullptr, gamePath, 32768);
+            if (!moduleLength || moduleLength >= 32768 || !gameLength || gameLength >= 32768)
+                return nullptr;
+            try {
+                std::error_code error;
+                const auto expected = fs::path(gamePath).parent_path() /
+                    L"Data" / L"F4SE" / L"Plugins" / L"Upscaling.dll";
+                return fs::equivalent(modulePath, expected, error) && !error
+                    ? module : nullptr;
+            } catch (...) {
+                return nullptr;
+            }
+        }();
+        return verified == module;
+    }
+
     bool IsExecutableAddressInModule(
         std::uintptr_t address,
         const wchar_t* moduleName,
@@ -419,17 +430,33 @@ namespace
         const HMODULE expectedModule = GetModuleHandleW(moduleName);
         if (expectedModule && allocationModule == expectedModule)
             return true;
-        // Deliberately no system-directory fallback: ENB wraps the device and
+        // A ReShade DLL named d3d11.dll can wrap the real runtime. Shader
+        // capture explicitly unwraps only ReShade, never an unknown/ENB device.
+        if (std::wstring_view(moduleName) == L"d3d11.dll" &&
+            IsReShadeProxy(expectedModule)) {
+            wchar_t systemPath[MAX_PATH]{};
+            const UINT length = GetSystemDirectoryW(systemPath, MAX_PATH);
+            if (length && length < MAX_PATH) {
+                try {
+                    const auto nativePath = fs::path(systemPath) / L"d3d11.dll";
+                    if (allocationModule == GetModuleHandleW(nativePath.c_str()))
+                        return true;
+                } catch (...) { }
+            }
+        }
+        // No generic system-directory fallback: ENB wraps the device and
         // forwards Set/GetPrivateData to the wrapped device. Hooking the wrapped
         // device's shared system vtable as well made both routes point at ENB's
         // wrapper and recurse (access violation in ENB's CreateVertexShader,
         // 10 Sep 2026). The game-visible (outermost) device vtable is the hook.
-        // A game-folder graphics proxy that owns the swap chain's Present (ENB)
+        // A supported proxy that owns the swap chain's Present (ENB/ReShade
+        // or Upscaling)
         // is the frame boundary the game actually calls; accept it as the
         // Present implementation to detour. Release generalisation of the
         // private-profile pinned-ENB exception below.
         if (std::wstring_view(moduleName) == L"dxgi.dll" &&
-            IsGameDirectoryGraphicsProxy(allocationModule))
+            (IsGameDirectoryGraphicsProxy(allocationModule) ||
+                IsUpscalingPresentModule(allocationModule)))
             return true;
         return std::wstring_view(moduleName) == L"dxgi.dll" &&
             FO4CS::PrivateProfile::IsPinnedEnbPresent(address, allocationModule);
@@ -508,9 +535,8 @@ namespace
         ComRouteData route{};
         UINT size = sizeof(route);
         if (FAILED(object->GetPrivateData(key, &size, &route)) ||
-            size != sizeof(route) || route.magic != kComRouteMagic ||
-            route.version != kComRouteVersion || !route.downstream ||
-            route.downstream == thunk ||
+            size != sizeof(route) ||
+            !route.Matches(reinterpret_cast<std::uintptr_t>(object), thunk) ||
             !IsExecutableAddressInModule(route.downstream, moduleName)) {
             return nullptr;
         }
@@ -530,8 +556,34 @@ namespace
             !IsExecutableAddressInModule(address, moduleName)) {
             return false;
         }
-        const ComRouteData route{ kComRouteMagic, kComRouteVersion, address };
+        const ComRouteData route{ ComRouteData::kMagic, ComRouteData::kVersion,
+            address, reinterpret_cast<std::uintptr_t>(object) };
         return SUCCEEDED(object->SetPrivateData(key, sizeof(route), &route));
+    }
+
+    [[nodiscard]] ComPtr<ID3D11Device> ShaderCaptureDevice(ID3D11Device* device) noexcept
+    {
+        std::uintptr_t* vtable = nullptr;
+        if (!ReadValidatedComVTable(device, 15, &vtable))
+            return {};
+        HMODULE owner = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(vtable[0]), &owner);
+        const bool reShade = IsReShadeProxy(owner);
+        auto native = FO4CS::GraphicsProxyCompat::ShaderCaptureDevice(device, reShade);
+        if (reShade) {
+            static std::atomic<ID3D11Device*> loggedDevice{ nullptr };
+            if (loggedDevice.exchange(device) != device) {
+                if (native) {
+                    SPDLOG_INFO("[CloudShadows] ReShade shader capture uses native device {} behind proxy {}",
+                        static_cast<void*>(native.Get()), static_cast<void*>(device));
+                } else {
+                    SPDLOG_ERROR("[CloudShadows] ReShade device does not expose its native shader interface; capture left unchanged");
+                }
+            }
+        }
+        return native;
     }
 
     inline std::atomic<bool> g_createVSHookInstalled{ false };
@@ -556,10 +608,15 @@ namespace
     // Strong ownership is retained for every raw renderer pointer published
     // through CloudShadows.h. Publication/replacement happens on the render
     // thread; auxiliary device-creation callbacks never replace this trio.
+    // The owners are intentionally never destroyed: releasing D3D objects
+    // from DLL static destructors would run under the loader lock at process
+    // exit, after the driver's worker threads are already gone.
     std::mutex g_rendererBindingMutex;
-    ComPtr<ID3D11Device> g_ownedRendererDevice;
-    ComPtr<ID3D11DeviceContext> g_ownedRendererContext;
-    ComPtr<IDXGISwapChain> g_ownedRendererSwapChain;
+    ComPtr<ID3D11Device>& g_ownedRendererDevice = *new ComPtr<ID3D11Device>();
+    ComPtr<ID3D11DeviceContext>& g_ownedRendererContext =
+        *new ComPtr<ID3D11DeviceContext>();
+    ComPtr<IDXGISwapChain>& g_ownedRendererSwapChain =
+        *new ComPtr<IDXGISwapChain>();
     std::atomic<ID3D11Device*> g_publishedRendererDevice{ nullptr };
     std::atomic<ID3D11DeviceContext*> g_publishedRendererContext{ nullptr };
     std::atomic<IDXGISwapChain*> g_publishedRendererSwapChain{ nullptr };
@@ -585,6 +642,10 @@ namespace
         bool pendingEnabled{ true };
         bool pendingResetGodrayOcclusion{ false };
         bool hasPending{ false };
+        // Host menus call Load/Save from their own threads; both are queued
+        // for the next authoritative Present like ApplySettings.
+        bool pendingLoad{ false };
+        bool pendingSave{ false };
         FO4CloudShadowsMenuBridge::SettingsV1 snapshot{};
         bool snapshotInitialized{ false };
     };
@@ -636,6 +697,8 @@ namespace
         bool enabled = true;
         bool apply = false;
         bool resetGodrayOcclusion = false;
+        bool load = false;
+        bool save = false;
         {
             std::lock_guard lock(g_bridgeSettings.mutex);
             if (g_bridgeSettings.hasPending) {
@@ -646,6 +709,8 @@ namespace
                 g_bridgeSettings.hasPending = false;
                 apply = true;
             }
+            load = std::exchange(g_bridgeSettings.pendingLoad, false);
+            save = std::exchange(g_bridgeSettings.pendingSave, false);
         }
         if (apply) {
             if (resetGodrayOcclusion)
@@ -658,7 +723,20 @@ namespace
             if (wasEnabled != enabled)
                 CloudShadows::InvalidateWorldCloudCaptureForToggle();
         }
+        // Apply precedes the queued load/save, matching the host's call order.
+        if (load)
+            (void)CloudShadows::LoadSettings();
+        if (save)
+            CloudShadows::SaveSettings();
         RefreshBridgeSettingsSnapshotOnRenderThread();
+    }
+
+    // A direct render-thread change supersedes any older queued request.
+    void DiscardQueuedBridgeSettings() noexcept
+    {
+        std::lock_guard lock(g_bridgeSettings.mutex);
+        g_bridgeSettings.hasPending = false;
+        g_bridgeSettings.pendingResetGodrayOcclusion = false;
     }
 
     enum class TechniqueKind : uint8_t {
@@ -676,9 +754,7 @@ namespace
         TechniqueKind kind{ TechniqueKind::kOther };
         uint32_t skyTechnique{ 0 };
         uint32_t dfLightPixelDescriptor{ 0 };
-        uint64_t captureEpoch{ 0 };
         bool sunShaderValidated{ false };
-        bool captureEpochStarted{ false };
         bool skyShadersAuthenticated{ false };
         ComPtr<ID3D11PixelShader> dfLightVanillaPS;
         ComPtr<ID3D11PixelShader> dfLightPatchedPS;
@@ -689,6 +765,9 @@ namespace
     thread_local bool g_worldRenderPhaseActive = false;
     thread_local uint32_t g_internalDrawDepth = 0;
     thread_local uint32_t g_nativeBeginTechniqueDepth = 0;
+    std::mutex g_beginTechniqueHookMutex;
+    std::atomic_bool g_beginTechniqueHookInstalled{ false };
+    std::atomic<std::uint32_t> g_acceptedHostCapabilities{ 0u };
 
     [[nodiscard]] constexpr bool IsDirectionalSunDescriptor(
         uint32_t pixelDescriptor) noexcept
@@ -703,7 +782,6 @@ namespace
         ScopedInternalDraw& operator=(const ScopedInternalDraw&) = delete;
     };
 
-    inline std::atomic<uint64_t> g_captureEpochCounter{ 0 };
     inline std::atomic<uint32_t> g_dfLightSwapHits{0};
     inline std::atomic<uint32_t> g_dfLightMissDuringPhase{0};
 	inline std::atomic<uint64_t> g_actualDfLightSwapHits{ 0 };
@@ -719,190 +797,53 @@ namespace
                                   std::memory_order_acquire);
     }
 
-    thread_local uint64_t g_nativeIntegrationSerial = 0;
-    thread_local uint32_t g_nativeCaptureFailedFaceMask = 0;
-    thread_local uint32_t g_nativeCapturePreparedFaceMask = 0;
-    // Distinguishes a genuinely cloudless native face from a cloud draw which
-    // reached the hook but failed authentication/MRT setup. A clear face is a
-    // valid all-zero mapping; a rejected cloud candidate is not.
-    thread_local uint32_t g_nativeCaptureCloudCandidateFaceMask = 0;
+    // The thread that most recently used the authoritative immediate context.
+    // Fallout renders and presents on one thread at a time, but loading
+    // screens hand the renderer to another thread. D3D11 contexts are not
+    // thread-safe, so state queries and lifecycle work run only on this thread.
+    std::atomic<DWORD> g_immediateContextThread{ 0 };
 
-    enum class NativeFaceRejectReason : std::uint32_t {
-        kMissingRT0,
-        kRT1Occupied,
-        kConsumerPrepare,
-        kLifecycleAuthentication,
-        kCount
-    };
-    std::array<std::atomic<std::uint64_t>,
-        static_cast<std::size_t>(NativeFaceRejectReason::kCount)>
-        g_nativeFaceRejectCounts{};
-
-    void LogNativeFaceReject(
-        NativeFaceRejectReason reason,
-        std::uint32_t faceMask,
-        std::uint64_t serial,
-        std::uint32_t preparedMask,
-        std::uint32_t failedMask) noexcept
+    void NoteImmediateContextThread() noexcept
     {
-        const auto index = static_cast<std::size_t>(reason);
-        const auto count = g_nativeFaceRejectCounts[index].fetch_add(
-            1, std::memory_order_relaxed) + 1u;
-        if (count > 4u && (count & (count - 1u)) != 0u)
-            return;
-
-        const char* name = "unknown";
-        switch (reason) {
-        case NativeFaceRejectReason::kMissingRT0:
-            name = "missing-rt0";
-            break;
-        case NativeFaceRejectReason::kRT1Occupied:
-            name = "rt1-occupied";
-            break;
-        case NativeFaceRejectReason::kConsumerPrepare:
-            name = "consumer-prepare";
-            break;
-        case NativeFaceRejectReason::kLifecycleAuthentication:
-            name = "lifecycle-authentication";
-            break;
-        default:
-            break;
-        }
-        SPDLOG_WARN(
-            "[CloudShadows] Native face rejected reason={} count={} "
-            "faceMask=0x{:02X} serial={} prepared=0x{:02X} failed=0x{:02X}",
-            name, count, faceMask, serial, preparedMask, failedMask);
+        const DWORD thread = GetCurrentThreadId();
+        if (g_immediateContextThread.load(std::memory_order_relaxed) != thread)
+            g_immediateContextThread.store(thread, std::memory_order_relaxed);
     }
 
-    void MarkNativeCaptureFaceFailed(uint32_t faceIndex) noexcept
+    [[nodiscard]] bool OwnsImmediateContext() noexcept
     {
-        if (faceIndex < CloudShadows::kWorldCloudCubeFaceCount)
-            g_nativeCaptureFailedFaceMask |= 1u << faceIndex;
+        const DWORD owner =
+            g_immediateContextThread.load(std::memory_order_relaxed);
+        return owner == 0 || owner == GetCurrentThreadId();
     }
 
-    [[nodiscard]] bool EnsureNativeCaptureFacePrepared(
-        ID3D11DeviceContext* context,
-        uint32_t faceIndex) noexcept
-    {
-        if (!IsCapturedImmediateContext(context) ||
-            faceIndex >= CloudShadows::kWorldCloudCubeFaceCount)
-            return false;
-        const uint32_t faceBit = 1u << faceIndex;
-        if ((g_nativeCapturePreparedFaceMask & faceBit) != 0)
-            return true;
-        std::array<ID3D11RenderTargetView*, 2> targets{};
-        context->OMGetRenderTargets(
-            static_cast<UINT>(targets.size()), targets.data(), nullptr);
-        ComPtr<ID3D11RenderTargetView> nativeFace;
-        ComPtr<ID3D11RenderTargetView> occupiedTarget1;
-        nativeFace.Attach(targets[0]);
-        occupiedTarget1.Attach(targets[1]);
-        if (!nativeFace || occupiedTarget1) {
-            MarkNativeCaptureFaceFailed(faceIndex);
-            LogNativeFaceReject(
-                !nativeFace ? NativeFaceRejectReason::kMissingRT0 :
-                    NativeFaceRejectReason::kRT1Occupied,
-                faceBit, FO4CS::NativeSkyCube::ActiveCaptureSerial(),
-                g_nativeCapturePreparedFaceMask,
-                g_nativeCaptureFailedFaceMask);
-            return false;
-        }
+    // Initialization and device-change teardown create and release every
+    // object that Present, Prepass and capture use. Exactly one thread runs
+    // them at a time; a concurrent caller skips instead of waiting.
+    std::mutex g_lifecycleMutex;
 
-        const bool prepared =
-            CloudShadows::PrepareNativeWorldCloudCaptureFaces(
-                context, nativeFace.Get(), faceBit,
-                FO4CS::NativeSkyCube::ActiveCaptureSerial());
-        if (prepared)
-            g_nativeCapturePreparedFaceMask |= faceBit;
-        else {
-            MarkNativeCaptureFaceFailed(faceIndex);
-            LogNativeFaceReject(
-                NativeFaceRejectReason::kConsumerPrepare,
-                faceBit, FO4CS::NativeSkyCube::ActiveCaptureSerial(),
-                g_nativeCapturePreparedFaceMask,
-                g_nativeCaptureFailedFaceMask);
+    void LogHookException(const char* site) noexcept
+    {
+        static std::atomic<uint32_t> failures{ 0 };
+        const uint32_t count = failures.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 4 || (count & (count - 1)) == 0) {
+            SPDLOG_ERROR("[CloudShadows] {} failed with an exception (#{}); "
+                "the frame is left vanilla", site, count);
         }
-        return prepared;
     }
 
-    void ObserveNativeCubeDraw(ID3D11DeviceContext* context) noexcept
+    void RetryBeginTechniqueHookIfDue() noexcept;
+
+    void TryInitialize() noexcept
     {
-        // This hook sees every game draw. Test the thread-local capture flag
-        // first so ordinary gameplay never pays an authoritative-context
-        // atomic lookup for native-cube bookkeeping.
-        if (!FO4CS::NativeSkyCube::IsCaptureActive() ||
-            g_internalDrawDepth != 0 ||
-            !IsCapturedImmediateContext(context)) {
+        if (CloudShadows::g_initialized.load(std::memory_order_acquire) ||
+            !OwnsImmediateContext())
             return;
-        }
-        const uint32_t activeMask =
-            FO4CS::NativeSkyCube::ActiveFaceMask();
-        if (activeMask != 0 &&
-            (g_nativeCapturePreparedFaceMask & activeMask) == activeMask) {
+        std::unique_lock lock(g_lifecycleMutex, std::try_to_lock);
+        if (!lock.owns_lock())
             return;
-        }
-        const uint32_t face =
-            FO4CS::NativeSkyCube::ResolveActiveFace(context);
-        if (face < CloudShadows::kWorldCloudCubeFaceCount)
-            (void)EnsureNativeCaptureFacePrepared(context, face);
+        CloudShadows::Initialize();
     }
-
-    void OnNativeSkyCubeFaceLifecycle(
-        const FO4CS::NativeSkyCube::FaceLifecycleEvent& event) noexcept
-    {
-        FO4CS::RendererLifetime::Scope rendererLifetime;
-        auto* context = g_publishedRendererContext.load(
-            std::memory_order_acquire);
-        const uint32_t faceMask = event.faceMask &
-            CloudShadows::kCompleteWorldCloudCubeFaceMask;
-        if (!IsCapturedImmediateContext(context) || faceMask == 0)
-            return;
-
-        if (event.phase == FO4CS::NativeSkyCube::FacePhase::kBegin) {
-            if (event.captureSerial != g_nativeIntegrationSerial) {
-                g_nativeIntegrationSerial = event.captureSerial;
-                g_nativeCaptureFailedFaceMask = 0;
-                g_nativeCapturePreparedFaceMask = 0;
-                g_nativeCaptureCloudCandidateFaceMask = 0;
-            }
-            // Once the runtime face contract has been learned, this clears
-            // even genuinely cloudless faces before their native draw. The
-            // first-ever face is prepared lazily from its authoritative RT0.
-            if (CloudShadows::PrepareNativeWorldCloudCaptureFaces(
-                    context, nullptr, faceMask, event.captureSerial)) {
-                g_nativeCapturePreparedFaceMask |= faceMask;
-            }
-            return;
-        }
-
-        const uint32_t preparedFaceMask =
-            g_nativeCapturePreparedFaceMask & faceMask;
-        const bool cloudCandidateObserved =
-            (g_nativeCaptureCloudCandidateFaceMask & faceMask) != 0;
-        const bool authenticated = event.producerAuthenticated &&
-            cloudCandidateObserved && event.cloudDrawObserved &&
-            preparedFaceMask == faceMask &&
-            (g_nativeCaptureFailedFaceMask & faceMask) == 0;
-        if (!authenticated) {
-            LogNativeFaceReject(
-                NativeFaceRejectReason::kLifecycleAuthentication,
-                faceMask, event.captureSerial, preparedFaceMask,
-                g_nativeCaptureFailedFaceMask);
-        }
-        const bool accepted =
-            CloudShadows::CompleteNativeWorldCloudCaptureFaces(
-                context, faceMask, event.captureSerial, authenticated);
-        if (!FO4CS::NativeSkyCube::AcknowledgeFaceCompletion(
-                faceMask, event.captureSerial, accepted)) {
-            SPDLOG_ERROR(
-                "[CloudShadows] Native face-completion acknowledgement "
-                "rejected (faceMask=0x{:02X}, serial={}, accepted={})",
-                faceMask, event.captureSerial, accepted);
-        }
-        g_nativeCaptureFailedFaceMask &= ~faceMask;
-        g_nativeCaptureCloudCandidateFaceMask &= ~faceMask;
-    }
-
     void FinalizeFrameAtPresent() noexcept
     {
         auto& phase = g_techniqueState;
@@ -939,6 +880,101 @@ namespace
 
     struct IDXGISwapChain_Present
     {
+        struct FrameReport
+        {
+            bool enabled{};
+            bool maskValid{};
+            bool lightingApplied{};
+        };
+
+        // All plugin work at the frame boundary. Any failure leaves this one
+        // frame vanilla; an exception must never unwind into DXGI or the game.
+        static FrameReport BeginFrameBoundary(IDXGISwapChain* swapChain) noexcept
+        {
+            FrameReport report{};
+            try {
+                NoteImmediateContextThread();
+                FO4CS::RuntimeAPI::AdvanceValidationEpoch();
+                // Attribute this already-rendered frame before F10 or a
+                // settings reload changes the state for the NEXT frame.
+                report.enabled = CloudShadows::g_shadowsEnabled.load(
+                    std::memory_order_acquire);
+                // A later rejected secondary-view attempt does not undo a mask
+                // already dispatched for this main frame. Use the frame latch.
+                report.maskValid = CloudShadows::g_shadowMaskSuccessStamp.load(
+                    std::memory_order_acquire) != 0;
+                static thread_local uint64_t previousSwapHits = 0;
+                const auto swapHits = g_actualDfLightSwapHits.load(
+                    std::memory_order_acquire);
+                report.lightingApplied = swapHits != previousSwapHits;
+                previousSwapHits = swapHits;
+                FO4CS::CloudComparison::EndGpuFrame(CloudShadows::GetD3DContext(),
+                    report.maskValid && report.lightingApplied &&
+                        CloudShadows::g_settings.DebugMode == 0.0f);
+                ApplyPendingBridgeSettingsOnRenderThread();
+                CloudShadows::PollShadowToggle();
+                FO4CS::CloudComparison::PollControls();
+                TryInitialize();
+                RetryBeginTechniqueHookIfDue();
+                FO4CS::CloudComparison::MaintainShaders(
+                    CloudShadows::GetD3DDevice());
+                if constexpr (FO4CS::BuildFeatures::kDeveloperTools) {
+                    static uint32_t presentCount = 0;
+                    if ((++presentCount % 600) == 0) {
+                        SPDLOG_INFO(
+                            "[CloudShadows] Present #{} init={} "
+                            "frameDispatchStamp={} geometryCapture={}/{}/{} draws={}",
+                            presentCount,
+                            CloudShadows::g_initialized.load(std::memory_order_relaxed),
+                            CloudShadows::g_shadowMaskSuccessStamp.load(
+                                std::memory_order_acquire),
+                            CloudShadows::g_geometryCaptureAttempts.load(std::memory_order_relaxed),
+                            CloudShadows::g_geometryCapturePublished.load(std::memory_order_relaxed),
+                            CloudShadows::g_geometryCaptureRejected.load(std::memory_order_relaxed),
+                            CloudShadows::g_geometryCaptureDraws.load(std::memory_order_relaxed));
+                    }
+                }
+                {
+                    FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::FrameCommit);
+                    FinalizeFrameAtPresent();
+                }
+                CloudShadows::AcceptanceRunner::TickAtPresent({
+                    .actualDfLightSwapHits =
+                        g_actualDfLightSwapHits.load(std::memory_order_acquire),
+                    .lastVanillaShaderHash =
+                        g_lastActualDfLightShaderHash.load(std::memory_order_acquire),
+                    .lastPixelDescriptor =
+                        g_lastActualDfLightPixelDescriptor.load(std::memory_order_acquire)
+                });
+                // F11 menu: draw last so ImGui composites on top of the
+                // finished frame, just before the flip.
+                Overlay::Draw(swapChain);
+                FO4CS::CloudComparison::RetirePreview();
+            } catch (...) {
+                LogHookException("Present frame boundary");
+            }
+            return report;
+        }
+
+        static void EndFrameBoundary(IDXGISwapChain* swapChain, HRESULT result,
+            UINT syncInterval, const FrameReport& report) noexcept
+        {
+            try {
+                CloudShadows::AcceptanceRunner::CompletePresent(SUCCEEDED(result));
+                FO4CS::ManualFpsLog::AfterPresent(
+                    swapChain, report.enabled, result == S_OK, report.maskValid,
+                    report.lightingApplied, syncInterval != 0);
+                FO4CS::PrivateProfile::AfterPresent(
+                    swapChain, result, report.maskValid, report.lightingApplied);
+            } catch (...) {
+                LogHookException("Present completion");
+            }
+            if (result == DXGI_ERROR_DEVICE_REMOVED ||
+                result == DXGI_ERROR_DEVICE_RESET) {
+                CloudShadows::InvalidateShadowMaskState();
+            }
+        }
+
         static HRESULT WINAPI thunk(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
         {
             FO4CS::RendererLifetime::Scope rendererLifetime;
@@ -967,103 +1003,16 @@ namespace
                 return original(This, SyncInterval, Flags);
 
             ScopedPresentBoundary boundary;
-            // Attribute this already-rendered frame before F10 or a settings
-            // reload changes the state for the NEXT frame.
-            const bool fpsFrameEnabled = CloudShadows::g_shadowsEnabled.load(
-                std::memory_order_acquire);
-            // A later rejected secondary-view attempt does not undo a mask
-            // already dispatched for this main frame. Use the frame latch.
-            const bool fpsMaskValid = CloudShadows::g_shadowMaskSuccessStamp.load(
-                std::memory_order_acquire) != 0;
-            static thread_local uint64_t fpsPreviousSwapHits = 0;
-            const auto fpsSwapHits = g_actualDfLightSwapHits.load(std::memory_order_acquire);
-            const bool fpsLightingApplied = fpsSwapHits != fpsPreviousSwapHits;
-            fpsPreviousSwapHits = fpsSwapHits;
-            FO4CS::CloudComparison::EndGpuFrame(CloudShadows::GetD3DContext(),
-                fpsMaskValid && fpsLightingApplied && CloudShadows::g_settings.DebugMode == 0.0f);
-            ApplyPendingBridgeSettingsOnRenderThread();
-            CloudShadows::PollShadowToggle();
-            FO4CS::CloudComparison::PollControls();
-            static uint32_t presentCount = 0;
-            ++presentCount;
-            if (!CloudShadows::g_initialized) {
-                CloudShadows::Initialize();
-            }
-            // Main Sky now bootstraps its own geometry mapping. Keep native
-            // reflection hooks as observation/secondary-camera guards only;
-            // two producers must never share one resolver staging generation.
-            FO4CS::NativeSkyCube::SetCaptureConsumerReady(false);
-            if ((presentCount % 600) == 0) {
-                const auto nativeCube =
-                    FO4CS::NativeSkyCube::GetDiagnostics();
-                SPDLOG_INFO(
-                    "[CloudShadows] Present #{} init={} CS={} "
-                    "attemptMaskValid={} frameDispatchStamp={} "
-                    "nativeInstalled={} nativeReady={} nativeCubes={} "
-                    "nativeFaces={}/{} nativeRejected={} "
-                    "nativeReflUpdates={}/{} nativeSettle={} "
-                    "nativeClicksSky={}/{} geometryMapping={}/{}/{} draws={}",
-                    presentCount, CloudShadows::g_initialized,
-                    (void*)CloudShadows::g_cloudShadowProductionCS,
-                    CloudShadows::g_shadowMaskValid.load(std::memory_order_acquire),
-                    CloudShadows::g_shadowMaskSuccessStamp.load(
-                        std::memory_order_acquire),
-                    nativeCube.installed,
-                    nativeCube.captureConsumerReady,
-                    nativeCube.completedCubeCount,
-                    nativeCube.cloudDrawFaceCount,
-                    nativeCube.consumerAcknowledgedFaceCount,
-                    nativeCube.consumerRejectedFaceCount,
-                    // eligible/total natural reflection updates, then natural
-                    // cube clicks that carried the sky / that excluded it.
-                    nativeCube.naturalUpdateCount,
-                    nativeCube.reflectionUpdateCount,
-                    nativeCube.settleUpdatesRemaining,
-                    nativeCube.skyBearingClickCount,
-                    nativeCube.skylessClickCount,
-                    CloudShadows::g_geometryCaptureAttempts.load(std::memory_order_relaxed),
-                    CloudShadows::g_geometryCapturePublished.load(std::memory_order_relaxed),
-                    CloudShadows::g_geometryCaptureRejected.load(std::memory_order_relaxed),
-                    CloudShadows::g_geometryCaptureDraws.load(std::memory_order_relaxed));
-                // Bounded diagnostics must reach disk even while alt-tab pauses
-                // the game before the next warning or full stdio buffer.
-                spdlog::default_logger_raw()->flush();
-            }
-            {
-                FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::FrameCommit);
-                FinalizeFrameAtPresent();
-            }
-			CloudShadows::AcceptanceRunner::TickAtPresent({
-				.actualDfLightSwapHits =
-					g_actualDfLightSwapHits.load(std::memory_order_acquire),
-				.lastVanillaShaderHash =
-					g_lastActualDfLightShaderHash.load(std::memory_order_acquire),
-				.lastPixelDescriptor =
-					g_lastActualDfLightPixelDescriptor.load(std::memory_order_acquire)
-			});
-            // F11 Community Shaders-style menu — draw last so ImGui composites
-            // on top of the finished frame, just before the flip.
-            Overlay::Draw(This);
-            FO4CS::CloudComparison::RetirePreview();
+            const auto report = BeginFrameBoundary(This);
             HRESULT result;
             {
                 FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::Present);
                 result = original(This, SyncInterval, Flags);
             }
-            CloudShadows::AcceptanceRunner::CompletePresent(
-                SUCCEEDED(result));
-            FO4CS::ManualFpsLog::AfterPresent(
-                This, fpsFrameEnabled,
-                result == S_OK, fpsMaskValid, fpsLightingApplied, SyncInterval != 0);
-            FO4CS::PrivateProfile::AfterPresent(This, result, fpsMaskValid, fpsLightingApplied);
-            if (result == DXGI_ERROR_DEVICE_REMOVED ||
-                result == DXGI_ERROR_DEVICE_RESET) {
-                CloudShadows::InvalidateShadowMaskState();
-            }
+            EndFrameBoundary(This, result, SyncInterval, report);
             return result;
         }
     };
-
     bool InstallPresentHook(
         IDXGISwapChain* swapChain,
         const char* source,
@@ -1128,7 +1077,7 @@ namespace
                                current, L"dxgi.dll", &unsupportedOwner)) {
                     // An unmarked object with a non-thunk slot is a fresh COM
                     // identity. Discard any stale map entry at a reused vtable
-                    // address and learn only the stock DXGI implementation.
+                    // address and learn only a validated presentation implementation.
                     downstream = reinterpret_cast<PresentFn>(current);
                     g_presentOriginals.erase(vtable);
                     g_presentOriginals.emplace(vtable, downstream);
@@ -1155,8 +1104,7 @@ namespace
                     const auto permanentDownstream =
                         reinterpret_cast<std::uintptr_t>(downstream);
                     if (current == permanentDownstream) {
-                        // This equality is safe to repair because every route
-                        // is verified executable inside stock dxgi.dll.
+                        // Every route belongs to DXGI or a recognized proxy.
                         installThunk = true;
                         expectedCurrent = current;
                     } else {
@@ -1173,35 +1121,64 @@ namespace
         }
         (void)expectedCurrent;
         (void)installThunk;
+        // A chain whose vtable is owned by an overlay (Discord/OBS/RTSS) still
+        // reaches the detoured dxgi implementation, so it is a valid boundary
+        // once that detour exists; its private route cannot be learned.
+        if (!downstream &&
+            g_presentDetourTarget.load(std::memory_order_acquire) != 0) {
+            unsupportedInterceptor = false;
+            hookReady = true;
+        }
         if (downstream) {
             const auto target = reinterpret_cast<std::uintptr_t>(downstream);
             const auto active = g_presentDetourTarget.load(std::memory_order_acquire);
-            if (active == target) {
-                hookReady = true;
-            } else if (active != 0) {
+            static std::atomic<std::uintptr_t> loggedForeignTarget{ 0 };
+            const auto rejectForeignTarget = [&](std::uintptr_t established) noexcept {
                 // A second distinct dxgi Present implementation is not
                 // expected; keep the single established detour.
                 hookReady = false;
-                SPDLOG_WARN(
-                    "[CloudShadows] Present detour already targets {}; ignoring {} on swap={}",
-                    reinterpret_cast<const void*>(active),
-                    reinterpret_cast<const void*>(target), (void*)swapChain);
+                if (loggedForeignTarget.exchange(target) != target) {
+                    SPDLOG_WARN(
+                        "[CloudShadows] Present detour already targets {}; ignoring {} on swap={}",
+                        reinterpret_cast<const void*>(established),
+                        reinterpret_cast<const void*>(target), (void*)swapChain);
+                }
+            };
+            static ULONGLONG retryAfter = 0;
+            static uint32_t failures = 0;
+            if (active == target) {
+                hookReady = true;
+            } else if (active != 0) {
+                rejectForeignTarget(active);
             } else {
                 std::lock_guard lock(g_comHookMutex);
-                if (g_presentDetourTarget.load(std::memory_order_acquire) == target) {
+                const auto established =
+                    g_presentDetourTarget.load(std::memory_order_acquire);
+                if (established == target) {
                     hookReady = true;
+                } else if (established != 0) {
+                    // Another thread installed a different target between the
+                    // unlocked read and this lock; never overwrite its trampoline.
+                    rejectForeignTarget(established);
+                } else if (GetTickCount64() < retryAfter) {
+                    hookReady = false;
                 } else {
                     g_presentDetourOriginal = downstream;
-                    DetourThreadEnlistment threads;
+                    std::lock_guard transactionLock(FO4CS::DetourTransaction::Mutex());
+                    // Attach before suspending threads: Detours allocates its
+                    // operation and trampoline while the heap lock is free.
                     LONG err = DetourTransactionBegin();
-                    if (err == NO_ERROR) err = threads.EnlistProcessThreads();
                     if (err == NO_ERROR)
                         err = DetourAttach(
                             reinterpret_cast<PVOID*>(&g_presentDetourOriginal),
                             reinterpret_cast<PVOID>(thunk));
+                    DetourThreadEnlistment threads;
+                    if (err == NO_ERROR) err = threads.EnlistProcessThreads();
                     if (err == NO_ERROR) err = DetourTransactionCommit();
                     else DetourTransactionAbort();
                     if (err == NO_ERROR) {
+                        failures = 0;
+                        retryAfter = 0;
                         g_presentDetourTarget.store(target, std::memory_order_release);
                         hookReady = true;
                         HMODULE targetModule = nullptr;
@@ -1227,9 +1204,16 @@ namespace
                     } else {
                         g_presentDetourOriginal = nullptr;
                         hookReady = false;
-                        SPDLOG_ERROR(
-                            "[CloudShadows] Present inline detour failed ({}) on swap={}",
-                            err, (void*)swapChain);
+                        ++failures;
+                        const ULONGLONG backoff = (std::min)(
+                            60000ull, 1000ull << (std::min)(failures, 6u));
+                        retryAfter = GetTickCount64() + backoff;
+                        if (failures <= 3 || (failures & (failures - 1)) == 0) {
+                            SPDLOG_ERROR(
+                                "[CloudShadows] Present inline detour failed ({}) on swap={}; "
+                                "retry in {} ms",
+                                err, (void*)swapChain, backoff);
+                        }
                     }
                 }
             }
@@ -1328,8 +1312,14 @@ namespace
 
                 const uint64_t hash = SIE::DFLightPatcher::HashDXBC(
                     pShaderBytecode, static_cast<size_t>(BytecodeLength));
-                if (!SIE::DFLightPatcher::RecordShaderHash(
-                        *ppVertexShader, hash)) {
+                bool recorded = false;
+                try {
+                    recorded = SIE::DFLightPatcher::RecordShaderHash(
+                        *ppVertexShader, hash);
+                } catch (...) {
+                    recorded = false;
+                }
+                if (!recorded) {
                     static std::atomic<uint32_t> failures{ 0 };
                     const uint32_t n = ++failures;
                     if (n <= 5) {
@@ -1344,19 +1334,23 @@ namespace
         }
     };
 
-    bool InstallCreateVertexShaderHook(ID3D11Device* device) noexcept
+    bool InstallCreateVertexShaderHook(ID3D11Device* device, bool authoritative = true) noexcept
     {
+        const auto captureDevice = ShaderCaptureDevice(device);
+        device = captureDevice.Get();
+        // Auxiliary devices (created by overlays or the loader) must not
+        // overwrite the renderer device's hook diagnostics.
+        const auto reportAvailability = [authoritative](bool available) noexcept {
+            if (authoritative)
+                SetHookAvailable(FO4CloudShadowsMenuBridge::kCreateVertexShaderHookUnavailable, available);
+        };
         if (!device) {
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kCreateVertexShaderHookUnavailable,
-                false);
+            reportAvailability(false);
             return false;
         }
         std::uintptr_t* vtable = nullptr;
         if (!ReadValidatedComVTable(device, 12, &vtable)) {
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kCreateVertexShaderHookUnavailable,
-                false);
+            reportAvailability(false);
             return false;
         }
         const auto thunk = reinterpret_cast<std::uintptr_t>(
@@ -1418,25 +1412,31 @@ namespace
             }
         }
         if (installThunk) {
-            if (vtable[kCreateVertexShaderSlot] == expectedCurrent) {
-                if (WriteProtectedPointer(
-                        std::addressof(vtable[kCreateVertexShaderSlot]), thunk)) {
-                    hookReady = true;
-                    SPDLOG_INFO(
-                        "[CloudShadows] CreateVertexShader hook "
-                        "installed/repaired on device={}",
-                        static_cast<void*>(device));
-                } else {
-                    hookReady = false;
-                    SPDLOG_ERROR(
-                        "[CloudShadows] CreateVertexShader vtable write failed "
-                        "on device={}", static_cast<void*>(device));
-                }
-            } else {
-                hookReady = vtable[kCreateVertexShaderSlot] == thunk;
+            std::lock_guard lock(g_comHookMutex);
+            switch (CompareExchangeProtectedPointer(
+                    std::addressof(vtable[kCreateVertexShaderSlot]),
+                    expectedCurrent, thunk)) {
+            case SlotWrite::kWritten:
+                hookReady = true;
+                SPDLOG_INFO(
+                    "[CloudShadows] CreateVertexShader hook "
+                    "installed/repaired on device={}",
+                    static_cast<void*>(device));
+                break;
+            case SlotWrite::kChanged:
+                hookReady = std::atomic_ref<std::uintptr_t>(
+                    vtable[kCreateVertexShaderSlot]).load(
+                        std::memory_order_acquire) == thunk;
                 SPDLOG_INFO(
                     "[CloudShadows] Concurrent CreateVertexShader hook retained "
                     "outermost on device={}", static_cast<void*>(device));
+                break;
+            case SlotWrite::kFailed:
+                hookReady = false;
+                SPDLOG_ERROR(
+                    "[CloudShadows] CreateVertexShader vtable write failed "
+                    "on device={}", static_cast<void*>(device));
+                break;
             }
         } else if (newerOuterHook) {
             hookReady = false;
@@ -1462,88 +1462,12 @@ namespace
                 reinterpret_cast<const void*>(current),
                 static_cast<void*>(unsupportedOwner));
         }
-        SetHookAvailable(
-            FO4CloudShadowsMenuBridge::kCreateVertexShaderHookUnavailable,
-            hookReady);
+        reportAvailability(hookReady);
         return hookReady;
     }
 
     struct ID3D11Device_CreatePixelShader
     {
-        static void AttachNativeCloudMrtVariant(
-            ID3D11Device* device,
-            CreatePixelShaderFn createPixelShader,
-            const void* stockBytecode,
-            SIZE_T stockBytecodeLength,
-            ID3D11PixelShader* stockShader) noexcept
-        {
-            if (!device || !createPixelShader || !stockBytecode ||
-                stockBytecodeLength == 0 || !stockShader ||
-                SIE::SkyCloudMrtPatcher::Identify(
-                    stockBytecode,
-                    static_cast<size_t>(stockBytecodeLength)) ==
-                    SIE::SkyCloudPixelShaderVariant::kUnsupported) {
-                return;
-            }
-
-            try {
-                SIE::SkyCloudMrtPatchInfo patchInfo{};
-                ComPtr<ID3DBlob> patchedBlob;
-                patchedBlob.Attach(SIE::SkyCloudMrtPatcher::Patch(
-                    stockBytecode,
-                    static_cast<size_t>(stockBytecodeLength),
-                    SIE::SkyCloudMrtPayload::kUvMapping, &patchInfo));
-                if (!patchedBlob || !patchInfo.patchVerified) {
-                    SPDLOG_ERROR(
-                        "[CloudShadows] Native cloud MRT patch failed closed "
-                        "for stock hash=0x{:016X} bytes={} identity={} "
-                        "structure={} verified={}",
-                        patchInfo.sourceHash, patchInfo.sourceSize,
-                        patchInfo.identityMatched, patchInfo.structureMatched,
-                        patchInfo.patchVerified);
-                    return;
-                }
-
-                ComPtr<ID3D11PixelShader> patchedShader;
-                const HRESULT createResult = createPixelShader(
-                    device, patchedBlob->GetBufferPointer(),
-                    patchedBlob->GetBufferSize(), nullptr,
-                    patchedShader.GetAddressOf());
-                if (FAILED(createResult) || !patchedShader) {
-                    SPDLOG_ERROR(
-                        "[CloudShadows] Native cloud MRT shader creation "
-                        "failed for stock hash=0x{:016X}: 0x{:08X}",
-                        patchInfo.sourceHash,
-                        static_cast<uint32_t>(createResult));
-                    return;
-                }
-
-                const HRESULT attachResult =
-                    stockShader->SetPrivateDataInterface(
-                        kSkyCloudMrtShaderMarker, patchedShader.Get());
-                if (FAILED(attachResult)) {
-                    SPDLOG_ERROR(
-                        "[CloudShadows] Native cloud MRT shader lifetime "
-                        "attachment failed for stock hash=0x{:016X}: "
-                        "0x{:08X}",
-                        patchInfo.sourceHash,
-                        static_cast<uint32_t>(attachResult));
-                    return;
-                }
-                g_nativeCloudMrtShaderCount.fetch_add(
-                    1, std::memory_order_release);
-                SPDLOG_INFO(
-                    "[CloudShadows] Native cloud MRT shader ready: "
-                    "stock hash=0x{:016X} bytes={} variant={}",
-                    patchInfo.sourceHash, patchInfo.sourceSize,
-                    static_cast<uint32_t>(patchInfo.variant));
-            } catch (...) {
-                SPDLOG_ERROR(
-                    "[CloudShadows] Native cloud MRT shader creation threw; "
-                    "capture remains fail-neutral");
-            }
-        }
-
         static HRESULT WINAPI thunk(
             ID3D11Device* This,
             const void* pShaderBytecode,
@@ -1586,25 +1510,26 @@ namespace
                     }
                     return hr;
                 }
-                AttachNativeCloudMrtVariant(
-                    This, original, pShaderBytecode, BytecodeLength,
-                    *ppPixelShader);
-                FO4CS::GodraysIntegration::ObservePixelShaderCreated(
-                    This, original, pShaderBytecode,
-                    static_cast<size_t>(BytecodeLength), *ppPixelShader);
-                uint64_t h = SIE::DFLightPatcher::HashDXBC(pShaderBytecode, static_cast<size_t>(BytecodeLength));
-                // Record EVERY PS unconditionally — we need to catch shaders
-                // created before DFLightPatcher finishes initializing. A post-
-                // init rematch pass picks up anything missed here.
-                CloudShadows::g_dfLightPatcher.RecordPSHash(*ppPixelShader, h);
-                // Save raw bytecode so strict sunlight variants can be patched
-                // lazily even when no loose VanillaDXBC corpus is installed.
-                CloudShadows::g_dfLightPatcher.StoreBytecode(h, pShaderBytecode, static_cast<size_t>(BytecodeLength));
-                // If the strict payload is initialized now, classify this
-                // bytecode immediately. Operational readiness is only raised
-                // after at least one sunlight signature actually succeeds.
-                if (CloudShadows::g_dfLightPatcher.IsInitialized()) {
-                    CloudShadows::g_dfLightPatcher.RegisterVanillaPS(h, *ppPixelShader);
+                uint64_t h = 0;
+                // Classification allocates; the game's shader is already
+                // created, so a failure here must never reach its caller.
+                try {
+                    FO4CS::GodraysIntegration::ObservePixelShaderCreated(
+                        This, original, pShaderBytecode,
+                        static_cast<size_t>(BytecodeLength), *ppPixelShader);
+                    h = SIE::DFLightPatcher::HashDXBC(pShaderBytecode, static_cast<size_t>(BytecodeLength));
+                    // Record every PS identity: shaders created before the
+                    // patcher initializes are rematched by hash afterwards.
+                    CloudShadows::g_dfLightPatcher.RecordPSHash(*ppPixelShader, h);
+                    // Retain candidate DFLight bytecode so strict sunlight
+                    // variants can be patched without a loose corpus.
+                    CloudShadows::g_dfLightPatcher.StoreBytecode(h, pShaderBytecode, static_cast<size_t>(BytecodeLength));
+                    // Once the strict payload exists, classify immediately.
+                    // Readiness rises only after a sunlight signature succeeds.
+                    if (CloudShadows::g_dfLightPatcher.IsInitialized())
+                        CloudShadows::g_dfLightPatcher.RegisterVanillaPS(h, *ppPixelShader);
+                } catch (...) {
+                    LogHookException("CreatePixelShader classification");
                 }
                 static std::atomic<uint32_t> psCreateCount = 0;
                 uint32_t n = ++psCreateCount;
@@ -1618,19 +1543,23 @@ namespace
         }
     };
 
-    bool InstallCreatePixelShaderHook(ID3D11Device* device) noexcept
+    bool InstallCreatePixelShaderHook(ID3D11Device* device, bool authoritative = true) noexcept
     {
+        const auto captureDevice = ShaderCaptureDevice(device);
+        device = captureDevice.Get();
+        // Auxiliary devices (created by overlays or the loader) must not
+        // overwrite the renderer device's hook diagnostics.
+        const auto reportAvailability = [authoritative](bool available) noexcept {
+            if (authoritative)
+                SetHookAvailable(FO4CloudShadowsMenuBridge::kCreatePixelShaderHookUnavailable, available);
+        };
         if (!device) {
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kCreatePixelShaderHookUnavailable,
-                false);
+            reportAvailability(false);
             return false;
         }
         std::uintptr_t* vtable = nullptr;
         if (!ReadValidatedComVTable(device, 15, &vtable)) {
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kCreatePixelShaderHookUnavailable,
-                false);
+            reportAvailability(false);
             return false;
         }
         const auto thunk = reinterpret_cast<std::uintptr_t>(
@@ -1693,23 +1622,28 @@ namespace
             }
         }
         if (installThunk) {
-            if (vtable[15] == expectedCurrent) {
-                if (WriteProtectedPointer(std::addressof(vtable[15]), thunk)) {
-                    hookReady = true;
-                    SPDLOG_INFO(
-                        "[CloudShadows] CreatePixelShader hook installed/repaired on device={}",
-                        (void*)device);
-                } else {
-                    hookReady = false;
-                    SPDLOG_ERROR(
-                        "[CloudShadows] CreatePixelShader vtable write failed on device={}",
-                        (void*)device);
-                }
-            } else {
-                hookReady = vtable[15] == thunk;
+            std::lock_guard lock(g_comHookMutex);
+            switch (CompareExchangeProtectedPointer(
+                    std::addressof(vtable[15]), expectedCurrent, thunk)) {
+            case SlotWrite::kWritten:
+                hookReady = true;
+                SPDLOG_INFO(
+                    "[CloudShadows] CreatePixelShader hook installed/repaired on device={}",
+                    (void*)device);
+                break;
+            case SlotWrite::kChanged:
+                hookReady = std::atomic_ref<std::uintptr_t>(vtable[15]).load(
+                    std::memory_order_acquire) == thunk;
                 SPDLOG_INFO(
                     "[CloudShadows] Concurrent CreatePixelShader hook retained outermost on device={}",
                     (void*)device);
+                break;
+            case SlotWrite::kFailed:
+                hookReady = false;
+                SPDLOG_ERROR(
+                    "[CloudShadows] CreatePixelShader vtable write failed on device={}",
+                    (void*)device);
+                break;
             }
         } else if (newerOuterHook) {
             hookReady = false;
@@ -1733,9 +1667,7 @@ namespace
                 reinterpret_cast<const void*>(current),
                 static_cast<void*>(unsupportedOwner));
         }
-        SetHookAvailable(
-            FO4CloudShadowsMenuBridge::kCreatePixelShaderHookUnavailable,
-            hookReady);
+        reportAvailability(hookReady);
         return hookReady;
     }
 
@@ -1755,14 +1687,9 @@ namespace
         if (!context || !shader)
             return false;
         *shader = nullptr;
-        std::array<ID3D11ClassInstance*, D3D11_SHADER_MAX_INTERFACES> instances{};
-        UINT instanceCount = static_cast<UINT>(instances.size());
-        context->PSGetShader(shader, instances.data(), &instanceCount);
-        for (UINT i = 0; i < (std::min)(instanceCount,
-                 static_cast<UINT>(instances.size())); ++i) {
-            if (instances[i])
-                instances[i]->Release();
-        }
+        // A null instance array reports only the bound class-instance count.
+        UINT instanceCount = 0;
+        context->PSGetShader(shader, nullptr, &instanceCount);
         if (instanceCount != 0) {
             if (*shader) {
                 (*shader)->Release();
@@ -1787,23 +1714,10 @@ namespace
         *vertexShader = nullptr;
         *pixelShader = nullptr;
 
-        std::array<ID3D11ClassInstance*, D3D11_SHADER_MAX_INTERFACES> instances{};
-        UINT vertexClassCount = static_cast<UINT>(instances.size());
-        context->VSGetShader(vertexShader, instances.data(), &vertexClassCount);
-        for (UINT i = 0; i < (std::min)(vertexClassCount,
-                 static_cast<UINT>(instances.size())); ++i) {
-            if (instances[i])
-                instances[i]->Release();
-        }
-
-        instances = {};
-        UINT pixelClassCount = static_cast<UINT>(instances.size());
-        context->PSGetShader(pixelShader, instances.data(), &pixelClassCount);
-        for (UINT i = 0; i < (std::min)(pixelClassCount,
-                 static_cast<UINT>(instances.size())); ++i) {
-            if (instances[i])
-                instances[i]->Release();
-        }
+        UINT vertexClassCount = 0;
+        context->VSGetShader(vertexShader, nullptr, &vertexClassCount);
+        UINT pixelClassCount = 0;
+        context->PSGetShader(pixelShader, nullptr, &pixelClassCount);
 
         if (!*vertexShader || !*pixelShader || vertexClassCount != 0 ||
             pixelClassCount != 0) {
@@ -1893,9 +1807,23 @@ namespace
                 (expected.compatiblePixel != 0 && pixelHash == expected.compatiblePixel));
     }
 
-    static SwapState BeginSwap(ID3D11DeviceContext* ctx)
+    static SwapState BeginSwapUnchecked(ID3D11DeviceContext* ctx, SwapState& s);
+
+    // Never lets an exception reach the driver entry. A failure before the
+    // swap leaves the draw vanilla; EndSwap releases whatever was acquired.
+    static SwapState BeginSwap(ID3D11DeviceContext* ctx) noexcept
     {
         SwapState s;
+        try {
+            return BeginSwapUnchecked(ctx, s);
+        } catch (...) {
+            LogHookException("DFLight shader swap");
+            return s;
+        }
+    }
+
+    static SwapState BeginSwapUnchecked(ID3D11DeviceContext* ctx, SwapState& s)
+    {
         // Code detours can see driver entry points shared by deferred
         // contexts. All cloud work is intentionally restricted to the one
         // captured immediate context whose BeginTechnique state we own.
@@ -2087,20 +2015,28 @@ namespace
         ShaderIdentity result{};
         if (!shader)
             return result;
-        // BeginTechnique repeatedly visits a small process-lifetime set of
-        // BSShader objects. Cache their immutable class/name identity so VR can
-        // classify DFPrepass/DFLight/DFComposite without a VirtualQuery on every
-        // technique. Matching the vtable as well as the object address prevents
-        // a recycled allocation from inheriting a stale identity.
-        static thread_local std::array<ShaderIdentityCacheEntry, 32> cache{};
-        static thread_local std::uint32_t nextCacheEntry = 0;
+        // BeginTechnique repeatedly visits a process-lifetime set of BSShader
+        // objects. Cache their immutable class/name identity, including
+        // unreadable ones, so no technique repeats memory validation. Matching
+        // the vtable as well as the object address prevents a recycled
+        // allocation from inheriting a stale identity.
+        static thread_local std::unordered_map<void*, ShaderIdentityCacheEntry> cache;
         const auto vtable = ReadShaderVtable(shader);
         if (vtable != 0) {
-            for (const auto& entry : cache) {
-                if (entry.shader == shader && entry.vtable == vtable)
-                    return entry.identity;
-            }
+            if (const auto found = cache.find(shader);
+                found != cache.end() && found->second.vtable == vtable)
+                return found->second.identity;
         }
+        const auto remember = [&](const ShaderIdentity& identity) {
+            if (vtable == 0)
+                return;
+            // The engine owns a few hundred shader objects; a runaway map
+            // means objects are being recycled, so start over.
+            if (cache.size() >= 4096)
+                cache.clear();
+            cache.insert_or_assign(shader,
+                ShaderIdentityCacheEntry{ shader, vtable, identity });
+        };
         auto& runtime = FO4CS::RuntimeAPI::GetSingleton();
         const auto address = reinterpret_cast<std::uintptr_t>(shader);
         // BSShader layout (Combined Ghidra project, BSShader::BSShader):
@@ -2113,6 +2049,7 @@ namespace
         if (!runtime.ValidateMemory(
                 address, filenameOffset + sizeof(const char*),
                 FO4CS::AddressKind::kReadable)) {
+            remember(result);
             return result;
         }
         std::memcpy(&result.type,
@@ -2126,6 +2063,7 @@ namespace
         if (!filename || !runtime.ValidateMemory(
                 filenameAddress, result.fxpFilename.size(),
                 FO4CS::AddressKind::kReadable)) {
+            remember(result);
             return result;
         }
         std::memcpy(
@@ -2135,44 +2073,66 @@ namespace
             result.fxpFilename.data(), '\0', result.fxpFilename.size()));
         if (!terminator || terminator == result.fxpFilename.data()) {
             result.fxpFilename.fill('\0');
+            remember(result);
             return result;
         }
         result.fxpFilenameLength = static_cast<std::uint8_t>(
             terminator - result.fxpFilename.data());
-        if (vtable != 0) {
-            auto& entry = cache[nextCacheEntry++ % cache.size()];
-            entry.shader = shader;
-            entry.vtable = vtable;
-            entry.identity = result;
-        }
+        remember(result);
         return result;
     }
 
-    void CloseCaptureEpochForLighting() noexcept
+    // Identity of the last fully verified renderer binding. While the engine
+    // keeps publishing the same objects and every hooked entry still routes
+    // through this plugin, maintenance needs no VirtualQuery, private-data or
+    // Detours work. Guarded by g_lifecycleMutex.
+    struct RendererBindingSnapshot
     {
-        auto& phase = g_techniqueState;
-        if (!phase.captureEpochStarted)
-            return;
-        phase.captureEpochStarted = false;
+        ID3D11Device* device{};
+        ID3D11DeviceContext* context{};
+        IDXGISwapChain* swapChain{};
+        std::uintptr_t createVertexShader{};
+        std::uintptr_t createPixelShader{};
+        std::array<std::uintptr_t, 4> drawEntries{};
+
+        bool operator==(const RendererBindingSnapshot&) const = default;
+    };
+    RendererBindingSnapshot g_verifiedRendererBindings{};
+    bool g_rendererBindingsVerified = false;
+    bool g_invalidRendererSpanLogged = false;
+    std::atomic<ULONGLONG> g_nextRendererMaintenance{ 0 };
+
+    // Only for objects this plugin already holds references to, so their COM
+    // method tables are known-valid memory. Slots are read atomically because
+    // drivers may republish entries concurrently.
+    [[nodiscard]] RendererBindingSnapshot ReadOwnedBindingSnapshot(
+        ID3D11Device* device,
+        ID3D11DeviceContext* context,
+        IDXGISwapChain* swapChain) noexcept
+    {
+        RendererBindingSnapshot snapshot{ device, context, swapChain };
+        auto* deviceVTable = *reinterpret_cast<std::uintptr_t**>(device);
+        auto* contextVTable = *reinterpret_cast<std::uintptr_t**>(context);
+        const auto slot = [](std::uintptr_t* table, std::size_t index) noexcept {
+            return std::atomic_ref<std::uintptr_t>(table[index]).load(
+                std::memory_order_acquire);
+        };
+        snapshot.createVertexShader = slot(deviceVTable, 12);
+        snapshot.createPixelShader = slot(deviceVTable, 15);
+        snapshot.drawEntries = {
+            slot(contextVTable, 12), slot(contextVTable, 13),
+            slot(contextVTable, 20), slot(contextVTable, 21)
+        };
+        return snapshot;
     }
 
-    bool OpenCaptureEpoch(ID3D11DeviceContext* context) noexcept
+    [[nodiscard]] bool RendererMaintenanceDue() noexcept
     {
-        // FO4 1.10.163 draws the main Sky into the exact kMainTemp resource and
-        // subresource with a full-output viewport. Reflection and secondary Sky
-        // passes must never publish an empty generation which Present could commit.
-        if (!CloudShadows::IsMainSkyWorldView(context))
-            return false;
-        auto& phase = g_techniqueState;
-        if (phase.captureEpochStarted)
-            return true;
-        phase.captureEpoch = g_captureEpochCounter.fetch_add(1, std::memory_order_relaxed) + 1;
-        phase.captureEpochStarted = true;
-        CloudShadows::g_worldCloudPendingEpoch.store(phase.captureEpoch, std::memory_order_release);
-        return true;
+        return GetTickCount64() >=
+            g_nextRendererMaintenance.load(std::memory_order_relaxed);
     }
 
-    void MaintainRendererBindings() noexcept
+    void MaintainRendererBindingsLocked()
     {
         FO4CS::RendererLifetime::Scope rendererLifetime;
         auto* rd = CloudShadows::GetRendererData();
@@ -2181,10 +2141,22 @@ namespace
 
         auto* device = reinterpret_cast<ID3D11Device*>(rd->device);
         auto* context = reinterpret_cast<ID3D11DeviceContext*>(rd->context);
+        auto* swapChain = reinterpret_cast<IDXGISwapChain*>(
+            rd->renderWindow[0].swapChain);
+        if (g_rendererBindingsVerified &&
+            CloudShadows::g_initialized.load(std::memory_order_acquire) &&
+            device == g_ownedRendererDevice.Get() &&
+            context == g_ownedRendererContext.Get() &&
+            ReadOwnedBindingSnapshot(device, context, swapChain) ==
+                g_verifiedRendererBindings) {
+            return;
+        }
+        g_rendererBindingsVerified = false;
+
         std::uintptr_t* deviceVTable = nullptr;
         std::uintptr_t* contextVTable = nullptr;
         if (!ReadValidatedComVTable(device, 15, &deviceVTable) ||
-            !ReadValidatedComVTable(context, 50, &contextVTable)) {
+            !ReadValidatedComVTable(context, 21, &contextVTable)) {
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kCreateVertexShaderHookUnavailable,
                 false);
@@ -2193,23 +2165,22 @@ namespace
                 false);
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-            SPDLOG_ERROR(
-                "[CloudShadows] RendererData published an invalid D3D11 "
-                "device/context COM span; bindings rejected");
+            if (!g_invalidRendererSpanLogged) {
+                g_invalidRendererSpanLogged = true;
+                SPDLOG_ERROR(
+                    "[CloudShadows] RendererData published an invalid D3D11 "
+                    "device/context COM span; bindings rejected until it changes");
+            }
             return;
+        }
+        if (g_invalidRendererSpanLogged) {
+            g_invalidRendererSpanLogged = false;
+            SPDLOG_INFO("[CloudShadows] RendererData device/context span is valid again");
         }
         const bool deviceChanged = g_d3dDevice && g_d3dDevice != device;
         if (deviceChanged) {
             SPDLOG_WARN("[CloudShadows] Renderer device changed (old={} new={}); rebuilding device-owned state",
                 (void*)g_d3dDevice, (void*)device);
-            // Shader private-data attachments are owned by the old D3D
-            // device. Never arm a native capture for the replacement device
-            // until that device has created and attached its own authenticated
-            // stock-cloud MRT variants.
-            FO4CS::NativeSkyCube::SetCaptureConsumerReady(false);
-            g_nativeCloudMrtShaderCount.store(0, std::memory_order_release);
-            g_nativePrimaryClearHookReady.store(
-                false, std::memory_order_release);
             Overlay::Shutdown();
             CloudShadows::ReleaseDeviceResources();
             g_createVSHookInstalled.store(false, std::memory_order_release);
@@ -2252,20 +2223,43 @@ namespace
             SPDLOG_INFO("[CloudShadows] Main immediate context captured/updated: {}", (void*)context);
         }
 
-        if (rd->renderWindow[0].swapChain) {
-            InstallPresentHook(
-                reinterpret_cast<IDXGISwapChain*>(rd->renderWindow[0].swapChain),
-                "RendererData maintenance", true);
-        }
+        const bool presentReady = swapChain && InstallPresentHook(
+            swapChain, "RendererData maintenance", true);
 
-        g_createVSHookInstalled.store(
-            InstallCreateVertexShaderHook(device), std::memory_order_release);
-        g_createPSHookInstalled.store(
-            InstallCreatePixelShaderHook(device), std::memory_order_release);
+        const bool createVertexShaderReady = InstallCreateVertexShaderHook(device);
+        const bool createPixelShaderReady = InstallCreatePixelShaderHook(device);
+        g_createVSHookInstalled.store(createVertexShaderReady, std::memory_order_release);
+        g_createPSHookInstalled.store(createPixelShaderReady, std::memory_order_release);
 
-        if (!CloudShadows::g_initialized)
+        if (!CloudShadows::g_initialized.load(std::memory_order_acquire))
             CloudShadows::Initialize();
-        CloudShadows::VerifyDrawHookIntegrity();
+        const bool drawsReady = CloudShadows::VerifyDrawHookIntegrity();
+
+        if (presentReady && createVertexShaderReady && createPixelShaderReady &&
+            drawsReady && CloudShadows::g_initialized.load(std::memory_order_acquire)) {
+            g_verifiedRendererBindings =
+                ReadOwnedBindingSnapshot(device, context, swapChain);
+            g_rendererBindingsVerified = true;
+        }
+    }
+
+    // BeginTechnique drives renderer ownership, hook repair and initialization
+    // at about 1 Hz, and only on the thread that owns the immediate context.
+    void MaintainRendererBindings() noexcept
+    {
+        if (!OwnsImmediateContext())
+            return;
+        std::unique_lock lifecycle(g_lifecycleMutex, std::try_to_lock);
+        if (!lifecycle.owns_lock())
+            return;
+        g_nextRendererMaintenance.store(
+            GetTickCount64() + 1000, std::memory_order_relaxed);
+        try {
+            MaintainRendererBindingsLocked();
+        } catch (...) {
+            g_rendererBindingsVerified = false;
+            LogHookException("Renderer maintenance");
+        }
     }
 
     void ObserveBeginTechniqueResult(
@@ -2292,11 +2286,11 @@ namespace
         auto& phase = g_techniqueState;
         phase = {};
 
-        // Bootstrap immediately, then poll renderer ownership at a bounded
-        // cadence. GetRendererData validates relocated memory, so doing it for
-        // every one of Fallout's hundreds of techniques per frame caused
+        // Bootstrap immediately, then re-verify renderer ownership about once
+        // per second. GetRendererData validates relocated memory, so doing it
+        // for every one of Fallout's hundreds of techniques per frame caused
         // thousands of VirtualQuery calls per second while the feature was ON.
-        if (total <= 10 || !g_d3dContext || (total % 2048u) == 0u)
+        if (total <= 10 || !g_d3dContext || RendererMaintenanceDue())
             MaintainRendererBindings();
 
         const bool vrTarget =
@@ -2328,8 +2322,6 @@ namespace
                 std::memory_order_acquire) != 0 &&
             CloudShadows::g_worldCloudCommittedEpoch.load(
                 std::memory_order_acquire) != 0;
-        const bool nativeCaptureActive =
-            FO4CS::NativeSkyCube::IsCaptureActive();
         const uint32_t possibleSkyTechnique = vertexDescriptor & 0xFFu;
         const bool possibleSkyDescriptor =
             possibleSkyTechnique >= CloudShadows::kSkyTechniqueTexture &&
@@ -2339,7 +2331,7 @@ namespace
         // but that gate cannot identify VR's DFPrepass/DFComposite world-phase
         // boundaries. Classify exact VR FXP names broadly; shader identities
         // are cached so this does not reintroduce VirtualQuery per technique.
-        if (!nativeCaptureActive && !vrTarget && !coarseDirectionalSun &&
+        if (!vrTarget && !coarseDirectionalSun &&
             !possibleSkyDescriptor) {
             return;
         }
@@ -2360,8 +2352,14 @@ namespace
         const bool isDFLight = fxp == "DFLight" ||
             (vrTarget && fxp == "DFLightVR");
         const bool isDFComposite = fxp == "DFComposite";
-        const bool privateCapture = nativeCaptureActive ||
-            FO4CS::NativeSkyCube::IsReflectionUpdateActive();
+        // Fallout replaces the camera during a water-reflection update; its
+        // lighting and Sky passes must never be classified as the main view.
+        const bool privateCapture =
+            FO4CS::WaterReflectionGuard::IsReflectionUpdateActive();
+        // D3D11 contexts are not thread-safe: inspect the immediate context
+        // only from the thread that is currently rendering with it.
+        const bool ownsImmediateContext =
+            IsCapturedImmediateContext(g_d3dContext) && OwnsImmediateContext();
 
         // All three deferred passes share the generic Lighting shader type.
         // Exact FXP identity is the reviewed world-phase contract used by the
@@ -2373,16 +2371,14 @@ namespace
             else if (isDFComposite)
                 g_worldRenderPhaseActive = false;
         }
-        if (vrTarget && !nativeCaptureActive &&
+        if (vrTarget &&
             !isDFPrepass && !isDFLight && !isDFComposite && fxp != "Sky") {
             return;
         }
 
         if (isDFPrepass) {
-            CloseCaptureEpochForLighting();
             phase.kind = TechniqueKind::kDFPrepass;
         } else if (isDFLight) {
-            CloseCaptureEpochForLighting();
             phase.kind = TechniqueKind::kDFLight;
 			phase.dfLightPixelDescriptor = pixelDescriptor;
 
@@ -2401,7 +2397,7 @@ namespace
             const bool onMainImmediateContext =
                 possibleDirectionalSun && mainWorldPhase &&
                 committedCloudField && !privateCapture &&
-                IsCapturedImmediateContext(g_d3dContext);
+                ownsImmediateContext;
             if (onMainImmediateContext)
                 GetStaticBoundPixelShader(g_d3dContext, &boundPS);
             ComPtr<ID3D11PixelShader> patched;
@@ -2457,8 +2453,8 @@ namespace
             ID3D11VertexShader* boundVertexShader = nullptr;
             ID3D11PixelShader* boundPixelShader = nullptr;
             const bool staticShaders =
-                cloudTechnique &&
-                IsCapturedImmediateContext(g_d3dContext) &&
+                cloudTechnique && !privateCapture &&
+                ownsImmediateContext &&
                 GetStaticBoundSkyShaders(
                     g_d3dContext, &boundVertexShader, &boundPixelShader);
             uint64_t observedVertexHash = 0;
@@ -2502,6 +2498,23 @@ namespace
 
     }
 
+    // The observer allocates (logging, shader identity, patcher lookups).
+    // An exception must never unwind into the engine's BeginTechnique.
+    void ObserveBeginTechniqueSafely(
+        void* shader, uint32_t vertexDescriptor, uint32_t hullDescriptor,
+        uint32_t domainDescriptor, uint32_t pixelDescriptor,
+        bool result) noexcept
+    {
+        try {
+            ObserveBeginTechniqueResult(
+                shader, vertexDescriptor, hullDescriptor, domainDescriptor,
+                pixelDescriptor, result);
+        } catch (...) {
+            g_techniqueState = {};
+            LogHookException("BeginTechnique observer");
+        }
+    }
+
     bool WINAPI Detour_BeginTechniqueFlat(
         void* shader, uint32_t vertexDescriptor, uint32_t hullDescriptor,
         uint32_t domainDescriptor, uint32_t pixelDescriptor)
@@ -2509,7 +2522,7 @@ namespace
         const bool result = s_original_BeginTechniqueFlat(
             shader, vertexDescriptor, hullDescriptor,
             domainDescriptor, pixelDescriptor);
-        ObserveBeginTechniqueResult(
+        ObserveBeginTechniqueSafely(
             shader, vertexDescriptor, hullDescriptor, domainDescriptor,
             pixelDescriptor, result);
         return result;
@@ -2525,11 +2538,32 @@ namespace
             shader, vertexDescriptor, hullDescriptor,
             domainDescriptor, pixelDescriptor, outputStruct);
         --g_nativeBeginTechniqueDepth;
-        ObserveBeginTechniqueResult(
+        ObserveBeginTechniqueSafely(
             shader, vertexDescriptor, hullDescriptor, domainDescriptor,
             pixelDescriptor, result);
         return result;
     }
+
+    // Fallout4VR 1.2.72 has exactly three BSGraphics::SetShaders callers
+    // (Combined Ghidra project): BSShader::BeginTechnique at RVA 0x2814BE0 and
+    // the two cached-batch submitters at 0x28AA8D0/0x28AAF00. When a host
+    // forwards BeginTechnique instead of this plugin's detour, the depth
+    // counter above never rises, so the call site identifies a cached batch.
+    [[nodiscard]] bool IsCachedBatchSetShadersCaller(const void* returnAddress) noexcept
+    {
+        const auto moduleBase = reinterpret_cast<std::uintptr_t>(
+            GetModuleHandleW(nullptr));
+        const auto address = reinterpret_cast<std::uintptr_t>(returnAddress);
+        if (!moduleBase || address < moduleBase)
+            return true;
+        const auto rva = address - moduleBase;
+        constexpr std::uintptr_t kCachedBatchFirst = 0x28AA8D0;
+        constexpr std::uintptr_t kCachedBatchWindow = 0x2000;
+        return rva >= kCachedBatchFirst &&
+            rva < kCachedBatchFirst + kCachedBatchWindow;
+    }
+
+    void ObserveSetShadersVR(void* vertex, void* hull, void* domain, void* pixel);
 
     void WINAPI Detour_SetShadersVR(
         void* graphics, void* vertex, void* hull, void* domain, void* pixel)
@@ -2540,16 +2574,30 @@ namespace
         // replace (including clear) the previous draw classification here.
         if (g_nativeBeginTechniqueDepth != 0 || g_internalDrawDepth != 0)
             return;
+        if (!g_beginTechniqueHookInstalled.load(std::memory_order_acquire) &&
+            !IsCachedBatchSetShadersCaller(_ReturnAddress()))
+            return;
+        try {
+            ObserveSetShadersVR(vertex, hull, domain, pixel);
+        } catch (...) {
+            g_techniqueState = {};
+            LogHookException("VR SetShaders observer");
+        }
+    }
+
+    void ObserveSetShadersVR(void* vertex, void* hull, void* domain, void* pixel)
+    {
         const bool enabled = CloudShadows::g_shadowsEnabled.load(
             std::memory_order_acquire);
-        FO4CS::RendererLifetime::Scope rendererLifetime(enabled);
         auto& phase = g_techniqueState;
         phase = {};
         if (!enabled) {
             g_worldRenderPhaseActive = false;
             return;
         }
-        if (!vertex || !pixel || !IsCapturedImmediateContext(g_d3dContext))
+        if (!vertex || !pixel || !IsCapturedImmediateContext(g_d3dContext) ||
+            !OwnsImmediateContext() ||
+            FO4CS::WaterReflectionGuard::IsReflectionUpdateActive())
             return;
 
         const auto pixelDescriptor =
@@ -2557,7 +2605,16 @@ namespace
         // Cached CloudsFade can reuse the Clouds VS wrapper. Its PS descriptor
         // and exact VS/PS bytecode pair identify the actual cloud formula.
         const auto skyTechnique = pixelDescriptor;
-        if (CloudShadows::IsCloudTechnique(skyTechnique)) {
+        const bool cloudCandidate = CloudShadows::IsCloudTechnique(skyTechnique);
+        // Most cached batches are neither: leave before the lifetime lock and
+        // any D3D or private-data call.
+        if (!cloudCandidate &&
+            (!IsDirectionalSunDescriptor(pixelDescriptor) ||
+             CloudShadows::g_worldCloudActiveLayers.load(std::memory_order_acquire) == 0 ||
+             CloudShadows::g_worldCloudCommittedEpoch.load(std::memory_order_acquire) == 0))
+            return;
+        FO4CS::RendererLifetime::Scope rendererLifetime;
+        if (cloudCandidate) {
             ComPtr<ID3D11VertexShader> boundVS;
             ComPtr<ID3D11PixelShader> boundPS;
             const auto expected = ExpectedStockSkyShaderHashes(
@@ -2597,24 +2654,18 @@ namespace
         // exact bound sun shader identifies the candidate; Prepass at Draw
         // still requires the actual main sunlight targets, full stereo viewport,
         // main depth and native sun/camera buffers before changing lighting.
-        if (!IsDirectionalSunDescriptor(pixelDescriptor) ||
-            CloudShadows::g_worldCloudActiveLayers.load(
-                std::memory_order_acquire) == 0 ||
-            CloudShadows::g_worldCloudCommittedEpoch.load(
-                std::memory_order_acquire) == 0 ||
-            FO4CS::NativeSkyCube::IsCaptureActive() ||
-            FO4CS::NativeSkyCube::IsReflectionUpdateActive()) {
-            return;
-        }
-        ComPtr<ID3D11PixelShader> boundPS;
-        if (!GetStaticBoundPixelShader(g_d3dContext, boundPS.GetAddressOf()))
+        // The engine just bound the wrapper's native shader (+8); use it
+        // instead of querying the context. BeginSwap still verifies the live
+        // binding before the draw.
+        ComPtr<ID3D11PixelShader> boundPS =
+            FO4CS::EngineAPI::detail::ReadField<ID3D11PixelShader*>(pixel, 8);
+        if (!boundPS)
             return;
         ComPtr<ID3D11PixelShader> patched;
         patched.Attach(CloudShadows::g_dfLightPatcher.AcquireDescriptor(
             pixelDescriptor, boundPS.Get()));
         if (!patched)
             return;
-        CloseCaptureEpochForLighting();
         phase.kind = TechniqueKind::kDFLight;
         phase.dfLightPixelDescriptor = pixelDescriptor;
         phase.sunShaderValidated = true;
@@ -2628,9 +2679,6 @@ namespace
         }
     }
 
-	std::mutex g_beginTechniqueHookMutex;
-	std::atomic_bool g_beginTechniqueHookInstalled{ false };
-	std::atomic<std::uint32_t> g_acceptedHostCapabilities{ 0u };
 
 	std::uint32_t BridgeSetHostActive(
 		std::uint32_t hostCapabilities) noexcept
@@ -2728,6 +2776,7 @@ namespace
 		CloudShadows::ValidateSettings(next);
 		const bool enabled = request.enabled != 0u;
 		if (IsRenderThread()) {
+			DiscardQueuedBridgeSettings();
 			const bool wasEnabled = CloudShadows::g_shadowsEnabled.load(
 				std::memory_order_acquire);
 			CloudShadows::g_settings = next;
@@ -2751,6 +2800,7 @@ namespace
 	{
 		const CloudShadows::Settings defaults{};
 		if (IsRenderThread()) {
+			DiscardQueuedBridgeSettings();
 			FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(false);
 			const bool wasEnabled = CloudShadows::g_shadowsEnabled.load(
 				std::memory_order_acquire);
@@ -2777,9 +2827,10 @@ namespace
 	bool BridgeLoadSettings() noexcept
 	{
 		if (!IsRenderThread()) {
-			SPDLOG_ERROR(
-				"[CloudShadows][MenuBridge] LoadSettings rejected off the render thread");
-			return false;
+			// Queued: the render thread reloads at its next Present.
+			std::lock_guard lock(g_bridgeSettings.mutex);
+			g_bridgeSettings.pendingLoad = true;
+			return true;
 		}
 		const bool loaded = CloudShadows::LoadSettings();
 		RefreshBridgeSettingsSnapshotOnRenderThread();
@@ -2789,8 +2840,8 @@ namespace
 	void BridgeSaveSettings() noexcept
 	{
 		if (!IsRenderThread()) {
-			SPDLOG_ERROR(
-				"[CloudShadows][MenuBridge] SaveSettings rejected off the render thread");
+			std::lock_guard lock(g_bridgeSettings.mutex);
+			g_bridgeSettings.pendingSave = true;
 			return;
 		}
 		CloudShadows::SaveSettings();
@@ -2845,21 +2896,10 @@ namespace
 			FO4CloudShadowsMenuBridge::kHostForwardsBeginTechnique) == 0u) {
 			return;
 		}
-		try {
-			ObserveBeginTechniqueResult(
-				shader, vertexDescriptor,
-				hullDescriptor, domainDescriptor, pixelDescriptor,
-				succeeded != 0u);
-		} catch (const std::exception& error) {
-			g_techniqueState = {};
-			SPDLOG_ERROR(
-				"[CloudShadows][MenuBridge] BeginTechnique observer failed: {}",
-				error.what());
-		} catch (...) {
-			g_techniqueState = {};
-			SPDLOG_ERROR(
-				"[CloudShadows][MenuBridge] BeginTechnique observer failed with an unknown exception");
-		}
+		ObserveBeginTechniqueSafely(
+			shader, vertexDescriptor,
+			hullDescriptor, domainDescriptor, pixelDescriptor,
+			succeeded != 0u);
 	}
 
 	const FO4CloudShadowsMenuBridge::ApiV1 g_menuBridgeApi{
@@ -2895,8 +2935,6 @@ namespace CloudShadows
     using PFN_Draw = void(WINAPI*)(ID3D11DeviceContext*, UINT, UINT);
     using PFN_DrawIndexedInstanced = void(WINAPI*)(ID3D11DeviceContext*, UINT, UINT, UINT, INT, UINT);
     using PFN_DrawInstanced = void(WINAPI*)(ID3D11DeviceContext*, UINT, UINT, UINT, UINT);
-    using PFN_ClearRenderTargetView = void(WINAPI*)(
-        ID3D11DeviceContext*, ID3D11RenderTargetView*, const FLOAT[4]);
 
     // Driver entry points may change after device removal/recreation. Each
     // unique entry gets an immutable process-lifetime trampoline; no old
@@ -2915,14 +2953,17 @@ namespace CloudShadows
     DrawDetourRoutes<PFN_Draw> s_drawRoutes;
     DrawDetourRoutes<PFN_DrawIndexedInstanced> s_drawIndexedInstancedRoutes;
     DrawDetourRoutes<PFN_DrawInstanced> s_drawInstancedRoutes;
-    DrawDetourRoutes<PFN_ClearRenderTargetView> s_clearRenderTargetRoutes;
     std::mutex s_drawHookMutex;
+    // Deterministic attach/commit failures are retried with backoff instead
+    // of suspending every thread on each maintenance pass. Guarded by
+    // s_drawHookMutex.
+    ULONGLONG s_drawHookRetryAfter = 0;
+    uint32_t s_drawHookFailures = 0;
 
     thread_local PFN_DrawIndexed s_downstreamDrawIndexed = nullptr;
     thread_local PFN_Draw s_downstreamDraw = nullptr;
     thread_local PFN_DrawIndexedInstanced s_downstreamDrawIndexedInstanced = nullptr;
     thread_local PFN_DrawInstanced s_downstreamDrawInstanced = nullptr;
-    thread_local bool g_downstreamDrawInvoked = false;
 
     template <class TFunction>
     class ScopedDownstreamRoute
@@ -2942,81 +2983,6 @@ namespace CloudShadows
         TFunction previous_;
     };
 
-    uint64_t HashLayerIdentityValue(uint64_t hash, uint64_t value) noexcept
-    {
-        for (uint32_t byte = 0; byte < 8; ++byte) {
-            hash ^= static_cast<uint8_t>(value >> (byte * 8));
-            hash *= 0x100000001b3ULL;
-        }
-        return hash;
-    }
-
-    uint64_t BuildStableLayerId(
-        ID3D11DeviceContext* ctx,
-        const CloudShadows::CloudDrawCommand& command) noexcept
-    {
-        uint64_t hash = 0xcbf29ce484222325ULL;
-
-        ID3D11InputLayout* inputLayout = nullptr;
-        ctx->IAGetInputLayout(&inputLayout);
-        hash = HashLayerIdentityValue(hash, reinterpret_cast<uintptr_t>(inputLayout));
-
-        // Stock Sky geometry is interleaved in IA slot 0. Hashing all 32 IA
-        // slots made the logical cloud identity depend on stale, unused driver
-        // bindings and could churn slices between otherwise identical frames.
-        ID3D11Buffer* vertexBuffer = nullptr;
-        UINT vertexStride = 0;
-        UINT vertexOffset = 0;
-        ctx->IAGetVertexBuffers(0, 1, &vertexBuffer, &vertexStride, &vertexOffset);
-        hash = HashLayerIdentityValue(hash, reinterpret_cast<uintptr_t>(vertexBuffer));
-        hash = HashLayerIdentityValue(hash, vertexStride);
-        hash = HashLayerIdentityValue(hash, vertexOffset);
-
-        ID3D11Buffer* indexBuffer = nullptr;
-        DXGI_FORMAT indexFormat = DXGI_FORMAT_UNKNOWN;
-        UINT indexOffset = 0;
-        const bool indexedDraw =
-            command.kind == CloudShadows::CloudDrawKind::DrawIndexed ||
-            command.kind == CloudShadows::CloudDrawKind::DrawIndexedInstanced;
-        // The IA index binding is ignored by non-indexed draws and may contain
-        // stale driver state. Hash a fixed null marker for those kinds so it
-        // cannot churn an otherwise stable logical layer.
-        if (indexedDraw)
-            ctx->IAGetIndexBuffer(&indexBuffer, &indexFormat, &indexOffset);
-        hash = HashLayerIdentityValue(hash, reinterpret_cast<uintptr_t>(indexBuffer));
-        hash = HashLayerIdentityValue(hash, static_cast<uint32_t>(indexFormat));
-        hash = HashLayerIdentityValue(hash, indexOffset);
-
-        D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-        ctx->IAGetPrimitiveTopology(&topology);
-        hash = HashLayerIdentityValue(hash, static_cast<uint32_t>(topology));
-
-        // Canonicalise the graphics call to its geometry range. Fallout VR can
-        // submit the player Sky as a stereo-instanced draw while the natural
-        // reflection face is necessarily single-view; InstanceCount,
-        // StartInstanceLocation and the Draw-vs-DrawInstanced enum therefore
-        // are not properties of the logical cloud layer.  Hashing them made
-        // the live layer fail to match its captured mapping.  The Sky
-        // technique and t0/t1 textures are also intentionally excluded because
-        // they change during weather lerps while the layer remains the same.
-        const bool instancedDraw =
-            command.kind == CloudShadows::CloudDrawKind::DrawIndexedInstanced ||
-            command.kind == CloudShadows::CloudDrawKind::DrawInstanced;
-        hash = HashLayerIdentityValue(hash, indexedDraw ? 1u : 0u);
-        hash = HashLayerIdentityValue(hash, command.a);
-        hash = HashLayerIdentityValue(
-            hash, instancedDraw ? command.c : command.b);
-        if (indexedDraw) {
-            hash = HashLayerIdentityValue(
-                hash, static_cast<uint32_t>(command.d));
-        }
-
-        if (inputLayout) inputLayout->Release();
-        if (vertexBuffer) vertexBuffer->Release();
-        if (indexBuffer) indexBuffer->Release();
-        return hash;
-    }
-
     static void InvokeOriginalWorldCloudDraw(
         ID3D11DeviceContext* ctx,
         const CloudShadows::CloudDrawCommand& command)
@@ -3026,194 +2992,26 @@ namespace CloudShadows
         // Preserve every vanilla argument, including VR instance count.
         switch (command.kind) {
         case CloudShadows::CloudDrawKind::DrawIndexed:
-            if (s_downstreamDrawIndexed) {
-                g_downstreamDrawInvoked = true;
+            if (s_downstreamDrawIndexed)
                 s_downstreamDrawIndexed(ctx, command.a, command.b, command.d);
-            }
             break;
         case CloudShadows::CloudDrawKind::Draw:
-            if (s_downstreamDraw) {
-                g_downstreamDrawInvoked = true;
+            if (s_downstreamDraw)
                 s_downstreamDraw(ctx, command.a, command.b);
-            }
             break;
         case CloudShadows::CloudDrawKind::DrawIndexedInstanced:
             if (s_downstreamDrawIndexedInstanced) {
-                g_downstreamDrawInvoked = true;
                 s_downstreamDrawIndexedInstanced(ctx, command.a, command.b,
                     command.c, command.d, command.e);
             }
             break;
         case CloudShadows::CloudDrawKind::DrawInstanced:
             if (s_downstreamDrawInstanced) {
-                g_downstreamDrawInvoked = true;
                 s_downstreamDrawInstanced(ctx, command.a, command.b,
                     command.c, command.e);
             }
             break;
         }
-    }
-
-    bool ProcessNativeCloudDraw(
-        ID3D11DeviceContext* context,
-        const CloudShadows::CloudDrawCommand& command,
-        CloudShadows::CloudDrawReissue downstreamDraw) noexcept
-    {
-        if (!context || !downstreamDraw ||
-            !FO4CS::NativeSkyCube::IsCaptureActive()) {
-            return false;
-        }
-
-        const uint32_t face =
-            FO4CS::NativeSkyCube::ResolveActiveFace(context);
-        const auto failCapture = [&]() noexcept {
-            MarkNativeCaptureFaceFailed(face);
-            return false;
-        };
-        if (face >= CloudShadows::kWorldCloudCubeFaceCount ||
-            !EnsureNativeCaptureFacePrepared(context, face)) {
-            return failCapture();
-        }
-        g_nativeCaptureCloudCandidateFaceMask |= 1u << face;
-
-        auto& phase = g_techniqueState;
-        if (phase.kind != TechniqueKind::kSky ||
-            !CloudShadows::IsCloudTechnique(phase.skyTechnique) ||
-            !phase.skyShadersAuthenticated ||
-            !phase.skyVertexShader || !phase.skyPixelShader) {
-            return failCapture();
-        }
-
-        ComPtr<ID3D11VertexShader> boundVertexShader;
-        ComPtr<ID3D11PixelShader> boundPixelShader;
-        ID3D11VertexShader* rawVertexShader = nullptr;
-        ID3D11PixelShader* rawPixelShader = nullptr;
-        if (!GetStaticBoundSkyShaders(
-                context, &rawVertexShader, &rawPixelShader)) {
-            return failCapture();
-        }
-        boundVertexShader.Attach(rawVertexShader);
-        boundPixelShader.Attach(rawPixelShader);
-        if (boundVertexShader.Get() != phase.skyVertexShader.Get() ||
-            boundPixelShader.Get() != phase.skyPixelShader.Get()) {
-            return failCapture();
-        }
-        // BeginTechnique authenticated these exact immutable shader objects.
-        // Pointer identity above proves that the draw still owns that pair;
-        // repeating both private-data hash lookups for every cloud layer only
-        // adds COM/driver traffic inside the already expensive cube pass.
-
-        ComPtr<ID3D11PixelShader> mappingPixelShader;
-        mappingPixelShader.Attach(AcquireNativeCloudMrtShader(
-            boundPixelShader.Get()));
-        const FO4CS::CloudMotionResolver::CaptureLayerFace mappingLayer{
-            .stableLayerId = command.stableLayerId,
-            .faceIndex = face,
-            .technique = static_cast<
-                FO4CS::CloudMotionResolver::CloudTechnique>(
-                    phase.skyTechnique)
-        };
-        FO4CS::CloudMotionResolver::CaptureFaceTarget mappingTarget;
-        if (!mappingPixelShader || command.stableLayerId == 0 ||
-            !FO4CS::CloudMotionResolver::AcquireLayerMappingTarget(
-                context, mappingLayer, mappingTarget) ||
-            !mappingTarget.mappingRtv) {
-            return failCapture();
-        }
-
-        std::array<ID3D11RenderTargetView*,
-            D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> rawTargets{};
-        ID3D11DepthStencilView* rawDepthStencil = nullptr;
-        context->OMGetRenderTargets(
-            static_cast<UINT>(rawTargets.size()), rawTargets.data(),
-            &rawDepthStencil);
-        std::array<ComPtr<ID3D11RenderTargetView>,
-            D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> originalTargets;
-        for (size_t index = 0; index < rawTargets.size(); ++index)
-            originalTargets[index].Attach(rawTargets[index]);
-        ComPtr<ID3D11DepthStencilView> originalDepthStencil;
-        originalDepthStencil.Attach(rawDepthStencil);
-        if (!originalTargets[0] || originalTargets[1])
-            return failCapture();
-
-        ID3D11BlendState* rawBlendState = nullptr;
-        std::array<float, 4> blendFactor{ 1.0f, 1.0f, 1.0f, 1.0f };
-        UINT sampleMask = UINT_MAX;
-        context->OMGetBlendState(
-            &rawBlendState, blendFactor.data(), &sampleMask);
-        ComPtr<ID3D11BlendState> originalBlendState;
-        originalBlendState.Attach(rawBlendState);
-        ID3D11BlendState* mappingBlendState =
-            CloudShadows::GetNativeWorldCloudCaptureBlendState(
-                originalBlendState.Get());
-        if (!mappingBlendState)
-            return failCapture();
-
-        std::array<ID3D11RenderTargetView*,
-            D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> captureTargets{};
-        for (size_t index = 0; index < originalTargets.size(); ++index)
-            captureTargets[index] = originalTargets[index].Get();
-        // Piggyback the naturally scheduled cloud draw. The authenticated MRT
-        // shader preserves its stock Target0 result and copies visible-cloud
-        // alpha to private Target1, so Fallout's colour cube remains exact.
-        captureTargets[CloudShadows::kNativeWorldCloudOpacityTargetSlot] =
-            mappingTarget.mappingRtv.Get();
-
-        context->OMSetRenderTargets(
-            static_cast<UINT>(captureTargets.size()),
-            captureTargets.data(), originalDepthStencil.Get());
-        context->OMSetBlendState(
-            mappingBlendState, blendFactor.data(), sampleMask);
-        context->PSSetShader(mappingPixelShader.Get(), nullptr, 0);
-
-        // Exactly one downstream vanilla draw executes for this submission.
-        const bool priorDownstreamDrawInvoked = g_downstreamDrawInvoked;
-        g_downstreamDrawInvoked = false;
-        downstreamDraw(context, command);
-        const bool drawInvoked = g_downstreamDrawInvoked;
-        g_downstreamDrawInvoked = priorDownstreamDrawInvoked;
-
-        context->PSSetShader(boundPixelShader.Get(), nullptr, 0);
-        context->OMSetBlendState(
-            originalBlendState.Get(), blendFactor.data(), sampleMask);
-        std::array<ID3D11RenderTargetView*,
-            D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> restoreTargets{};
-        for (size_t index = 0; index < originalTargets.size(); ++index)
-            restoreTargets[index] = originalTargets[index].Get();
-        context->OMSetRenderTargets(
-            static_cast<UINT>(restoreTargets.size()),
-            restoreTargets.data(), originalDepthStencil.Get());
-
-        const bool mappingCompleted =
-            FO4CS::CloudMotionResolver::CompleteLayerMapping(
-                mappingLayer, drawInvoked);
-        if (!drawInvoked || !mappingCompleted) {
-            MarkNativeCaptureFaceFailed(face);
-            // `true` means the detour must not issue a fallback draw. Once the
-            // downstream trampoline has submitted vanilla geometry, capture
-            // bookkeeping failure can reject only this refresh; replaying the
-            // draw would corrupt RT0 and violate passive exactly-once capture.
-            return drawInvoked;
-        }
-
-        FO4CS::NativeSkyCube::MarkCloudDrawCaptured(context);
-        // Compatibility telemetry names predate passive MRT capture. These
-        // counters now count piggybacked cloud submissions, not extra draws.
-        CloudShadows::g_reRenderCount.fetch_add(
-            1, std::memory_order_relaxed);
-        CloudShadows::g_worldCloudReplacementDraws.fetch_add(
-            1, std::memory_order_relaxed);
-        const uint32_t drawOrdinal =
-            CloudShadows::g_cloudDrawCount.fetch_add(
-                1, std::memory_order_relaxed) + 1;
-        if (drawOrdinal <= 12 || (drawOrdinal % 2000) == 0) {
-            SPDLOG_INFO(
-                "[CloudShadows] Passive cloud MRT draw #{} "
-                "technique={} face={} serial={}",
-                drawOrdinal, phase.skyTechnique, face,
-                FO4CS::NativeSkyCube::ActiveCaptureSerial());
-        }
-        return true;
     }
 
     bool ProcessCloudDraw(
@@ -3224,18 +3022,17 @@ namespace CloudShadows
         if (g_internalDrawDepth != 0 || !IsCapturedImmediateContext(ctx))
             return false;
         auto& phase = g_techniqueState;
-        if (phase.kind != TechniqueKind::kSky) {
+        if (phase.kind != TechniqueKind::kSky)
             return false;
-        }
 
-        // F10/the menu is a true master bypass. Natural reflection rendering
-        // remains untouched; only the private MRT attachment is disabled.
+        // F10/the menu is a true master bypass.
         if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire))
             return false;
 
-        const bool nativeCapture =
-            FO4CS::NativeSkyCube::IsCaptureActive();
-        if (!nativeCapture && !CloudShadows::IsMainSkyWorldView(ctx)) {
+        // One authoritative main-view check per Sky draw. The capture path
+        // below trusts this result instead of repeating it. Every main Sky
+        // technique opens the frame, so a cloudless sky publishes clear.
+        if (!CloudShadows::IsMainSkyWorldView(ctx)) {
             if (CloudShadows::IsCloudTechnique(phase.skyTechnique)) {
                 static std::atomic_uint32_t mainSkyRejections{};
                 const auto count = mainSkyRejections.fetch_add(
@@ -3252,13 +3049,11 @@ namespace CloudShadows
         command.authentication = phase.skyShadersAuthenticated
             ? CloudShadows::CloudDrawAuthentication::kStockVisibleCloudShaders
             : CloudShadows::CloudDrawAuthentication::kUnauthenticated;
-        if (CloudShadows::IsCloudTechnique(phase.skyTechnique))
-            command.stableLayerId = BuildStableLayerId(ctx, command);
-
-        if (!nativeCapture && CloudShadows::IsCloudTechnique(phase.skyTechnique)) {
-            // BeginTechnique alone cannot attest a later draw: another hook
-            // may have replaced either shader in between. Reject its cloud
-            // data while still submitting the visible draw exactly once.
+        // BeginTechnique alone cannot attest a later draw: another hook may
+        // have replaced either shader in between. Reject its cloud data while
+        // still submitting the visible draw exactly once.
+        if (command.authentication !=
+                CloudShadows::CloudDrawAuthentication::kUnauthenticated) {
             ComPtr<ID3D11VertexShader> vertexShader;
             ComPtr<ID3D11PixelShader> pixelShader;
             if (!GetStaticBoundSkyShaders(ctx, vertexShader.GetAddressOf(),
@@ -3270,19 +3065,52 @@ namespace CloudShadows
             }
         }
 
-        // Natural reflection Sky is the sole opacity producer. A successful
-        // path invokes the one original draw with stock RT0 plus private RT1.
-        // Rejection returns false so the caller executes the vanilla draw with
-        // untouched state; no failure path is allowed to suppress rendering.
-        cpuTiming.Stop();
-        if (nativeCapture)
-            return ProcessNativeCloudDraw(
-                ctx, command, &InvokeOriginalWorldCloudDraw);
-
         // Submit the visible Sky once. Private low-resolution draws then blend
         // complete cloud opacity, including overlapping surfaces in one mesh.
+        // Every rejection returns false so the caller submits the vanilla draw.
+        cpuTiming.Stop();
         return CloudShadows::ProcessWorldCloudDraw(
             ctx, command, &InvokeOriginalWorldCloudDraw);
+    }
+
+    // Common per-draw classification. The immediate-context owner is noted on
+    // every immediate draw so BeginTechnique/SetShaders observers never query
+    // that context from another thread.
+    struct DrawClassification
+    {
+        bool immediate{};
+        bool enabled{};
+    };
+
+    [[nodiscard]] DrawClassification ClassifyDraw(ID3D11DeviceContext* context) noexcept
+    {
+        DrawClassification result{};
+        result.immediate = context &&
+            context == g_publishedRendererContext.load(std::memory_order_acquire);
+        if (result.immediate)
+            NoteImmediateContextThread();
+        result.enabled = CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire) &&
+            g_internalDrawDepth == 0;
+        return result;
+    }
+
+    [[nodiscard]] bool NeedsRendererLifetime(const DrawClassification& draw) noexcept
+    {
+        return draw.enabled && draw.immediate &&
+            (g_techniqueState.kind == TechniqueKind::kSky ||
+             g_techniqueState.kind == TechniqueKind::kDFLight ||
+             FO4CS::GodraysIntegration::IsCloudOcclusionEnabled());
+    }
+
+    // Executes `submit` exactly once in every path. The DFLight sunlight draw
+    // is bracketed by the patched-shader swap; every other draw is vanilla.
+    template <class TSubmit>
+    void SubmitWithSunlightSwap(ID3D11DeviceContext* context, TSubmit&& submit)
+    {
+        auto swap = BeginSwap(context);
+        submit();
+        RecordSubmittedSwap(swap);
+        EndSwap(context, swap);
     }
 
     template <std::size_t Route>
@@ -3294,81 +3122,37 @@ namespace CloudShadows
         const auto original = s_drawIndexedRoutes.originals[Route];
         if (!original)
             return;
-        FO4CS::RendererLifetime::Scope rendererLifetime(
-            ((CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire) &&
-                 (g_techniqueState.kind == TechniqueKind::kSky ||
-                  g_techniqueState.kind == TechniqueKind::kDFLight ||
-                  FO4CS::GodraysIntegration::IsCloudOcclusionEnabled())) ||
-                FO4CS::NativeSkyCube::IsCaptureActive()) &&
-            This == g_publishedRendererContext.load(std::memory_order_acquire));
-        ObserveNativeCubeDraw(This);
-        if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)) {
+        const auto draw = ClassifyDraw(This);
+        FO4CS::RendererLifetime::Scope rendererLifetime(NeedsRendererLifetime(draw));
+        const auto submit = [&] {
             original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
-            return;
-        }
-        if (g_internalDrawDepth != 0) {
-            original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
+        };
+        if (!draw.enabled) {
+            submit();
             return;
         }
         auto godraySwap = FO4CS::GodraysIntegration::BeginDraw(This);
         if (godraySwap.swapped) {
-            original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
-            FO4CS::GodraysIntegration::EndDraw(
-                This, godraySwap, true);
+            submit();
+            FO4CS::GodraysIntegration::EndDraw(This, godraySwap, true);
             return;
         }
         const auto& phase = g_techniqueState;
-        const bool nativePassiveCapture =
-            FO4CS::NativeSkyCube::IsCaptureActive() &&
-            IsCapturedImmediateContext(This);
-        const bool nativeCloudDraw =
-            nativePassiveCapture &&
-            phase.kind == TechniqueKind::kSky &&
-            CloudShadows::IsCloudTechnique(phase.skyTechnique);
-        if (nativePassiveCapture) {
-            bool captured = false;
-            if (nativeCloudDraw) {
-                ScopedDownstreamRoute route(
-                    s_downstreamDrawIndexed, original);
-                captured = ProcessCloudDraw(This, {
-                    CloudShadows::CloudDrawKind::DrawIndexed,
-                    IndexCount, StartIndexLocation, 0,
-                    BaseVertexLocation, 0 });
-            }
-            // ProcessCloudDraw invokes the downstream draw exactly once only
-            // on successful MRT setup. Every other path remains vanilla.
-            if (!captured)
-                original(This, IndexCount, StartIndexLocation,
-                    BaseVertexLocation);
-            return;
-        }
-        if (phase.kind == TechniqueKind::kSky &&
-            IsCapturedImmediateContext(This)) {
+        if (draw.immediate && phase.kind == TechniqueKind::kSky) {
             ScopedDownstreamRoute route(s_downstreamDrawIndexed, original);
             if (!ProcessCloudDraw(This, {
                     CloudShadows::CloudDrawKind::DrawIndexed,
                     IndexCount, StartIndexLocation, 0,
-                    BaseVertexLocation, 0 })) {
-                original(This, IndexCount, StartIndexLocation,
-                    BaseVertexLocation);
-            }
+                    BaseVertexLocation, 0 }))
+                submit();
             return;
         }
-        const bool cloudLitDraw =
-            phase.kind == TechniqueKind::kDFLight &&
-            phase.sunShaderValidated;
-        if (!cloudLitDraw || !IsCapturedImmediateContext(This)) {
-            original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
+        if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
+            phase.sunShaderValidated) {
+            SubmitWithSunlightSwap(This, submit);
             return;
         }
-        if (cloudLitDraw) {
-            auto swap = BeginSwap(This);
-            original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
-            RecordSubmittedSwap(swap);
-            EndSwap(This, swap);
-            return;
-        }
-        original(This, IndexCount, StartIndexLocation, BaseVertexLocation);
+        submit();
     }
 
     template <std::size_t Route>
@@ -3379,74 +3163,36 @@ namespace CloudShadows
         const auto original = s_drawRoutes.originals[Route];
         if (!original)
             return;
-        FO4CS::RendererLifetime::Scope rendererLifetime(
-            ((CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire) &&
-                 (g_techniqueState.kind == TechniqueKind::kSky ||
-                  g_techniqueState.kind == TechniqueKind::kDFLight ||
-                  FO4CS::GodraysIntegration::IsCloudOcclusionEnabled())) ||
-                FO4CS::NativeSkyCube::IsCaptureActive()) &&
-            This == g_publishedRendererContext.load(std::memory_order_acquire));
-        ObserveNativeCubeDraw(This);
-        if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)) {
+        const auto draw = ClassifyDraw(This);
+        FO4CS::RendererLifetime::Scope rendererLifetime(NeedsRendererLifetime(draw));
+        const auto submit = [&] {
             original(This, VertexCount, StartVertexLocation);
-            return;
-        }
-        if (g_internalDrawDepth != 0) {
-            original(This, VertexCount, StartVertexLocation);
+        };
+        if (!draw.enabled) {
+            submit();
             return;
         }
         auto godraySwap = FO4CS::GodraysIntegration::BeginDraw(This);
         if (godraySwap.swapped) {
-            original(This, VertexCount, StartVertexLocation);
-            FO4CS::GodraysIntegration::EndDraw(
-                This, godraySwap, true);
+            submit();
+            FO4CS::GodraysIntegration::EndDraw(This, godraySwap, true);
             return;
         }
         const auto& phase = g_techniqueState;
-        const bool nativePassiveCapture =
-            FO4CS::NativeSkyCube::IsCaptureActive() &&
-            IsCapturedImmediateContext(This);
-        const bool nativeCloudDraw =
-            nativePassiveCapture &&
-            phase.kind == TechniqueKind::kSky &&
-            CloudShadows::IsCloudTechnique(phase.skyTechnique);
-        if (nativePassiveCapture) {
-            bool captured = false;
-            if (nativeCloudDraw) {
-                ScopedDownstreamRoute route(s_downstreamDraw, original);
-                captured = ProcessCloudDraw(This, {
-                    CloudShadows::CloudDrawKind::Draw,
-                    VertexCount, StartVertexLocation, 0, 0, 0 });
-            }
-            if (!captured)
-                original(This, VertexCount, StartVertexLocation);
-            return;
-        }
-        if (phase.kind == TechniqueKind::kSky &&
-            IsCapturedImmediateContext(This)) {
+        if (draw.immediate && phase.kind == TechniqueKind::kSky) {
             ScopedDownstreamRoute route(s_downstreamDraw, original);
             if (!ProcessCloudDraw(This, {
                     CloudShadows::CloudDrawKind::Draw,
-                    VertexCount, StartVertexLocation, 0, 0, 0 })) {
-                original(This, VertexCount, StartVertexLocation);
-            }
+                    VertexCount, StartVertexLocation, 0, 0, 0 }))
+                submit();
             return;
         }
-        const bool cloudLitDraw =
-            phase.kind == TechniqueKind::kDFLight &&
-            phase.sunShaderValidated;
-        if (!cloudLitDraw || !IsCapturedImmediateContext(This)) {
-            original(This, VertexCount, StartVertexLocation);
+        if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
+            phase.sunShaderValidated) {
+            SubmitWithSunlightSwap(This, submit);
             return;
         }
-        if (cloudLitDraw) {
-            auto swap = BeginSwap(This);
-            original(This, VertexCount, StartVertexLocation);
-            RecordSubmittedSwap(swap);
-            EndSwap(This, swap);
-            return;
-        }
-        original(This, VertexCount, StartVertexLocation);
+        submit();
     }
 
     template <std::size_t Route>
@@ -3459,91 +3205,40 @@ namespace CloudShadows
         const auto original = s_drawIndexedInstancedRoutes.originals[Route];
         if (!original)
             return;
-        FO4CS::RendererLifetime::Scope rendererLifetime(
-            ((CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire) &&
-                 (g_techniqueState.kind == TechniqueKind::kSky ||
-                  g_techniqueState.kind == TechniqueKind::kDFLight ||
-                  FO4CS::GodraysIntegration::IsCloudOcclusionEnabled())) ||
-                FO4CS::NativeSkyCube::IsCaptureActive()) &&
-            This == g_publishedRendererContext.load(std::memory_order_acquire));
-        ObserveNativeCubeDraw(This);
-        if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)) {
+        const auto draw = ClassifyDraw(This);
+        FO4CS::RendererLifetime::Scope rendererLifetime(NeedsRendererLifetime(draw));
+        const auto submit = [&] {
             original(This, IndexCountPerInstance, InstanceCount,
                 StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
-            return;
-        }
-        if (g_internalDrawDepth != 0) {
-            original(This, IndexCountPerInstance, InstanceCount,
-                StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        };
+        if (!draw.enabled) {
+            submit();
             return;
         }
         auto godraySwap = FO4CS::GodraysIntegration::BeginDraw(This);
         if (godraySwap.swapped) {
-            original(This, IndexCountPerInstance, InstanceCount,
-                StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
-            FO4CS::GodraysIntegration::EndDraw(
-                This, godraySwap, true);
+            submit();
+            FO4CS::GodraysIntegration::EndDraw(This, godraySwap, true);
             return;
         }
         const auto& phase = g_techniqueState;
-        const bool nativePassiveCapture =
-            FO4CS::NativeSkyCube::IsCaptureActive() &&
-            IsCapturedImmediateContext(This);
-        const bool nativeCloudDraw =
-            nativePassiveCapture &&
-            phase.kind == TechniqueKind::kSky &&
-            CloudShadows::IsCloudTechnique(phase.skyTechnique);
-        if (nativePassiveCapture) {
-            bool captured = false;
-            if (nativeCloudDraw) {
-                ScopedDownstreamRoute route(
-                    s_downstreamDrawIndexedInstanced, original);
-                captured = ProcessCloudDraw(This, {
-                    CloudShadows::CloudDrawKind::DrawIndexedInstanced,
-                    IndexCountPerInstance, InstanceCount,
-                    StartIndexLocation, BaseVertexLocation,
-                    StartInstanceLocation });
-            }
-            if (!captured) {
-                original(This, IndexCountPerInstance, InstanceCount,
-                    StartIndexLocation, BaseVertexLocation,
-                    StartInstanceLocation);
-            }
-            return;
-        }
-        if (phase.kind == TechniqueKind::kSky &&
-            IsCapturedImmediateContext(This)) {
+        if (draw.immediate && phase.kind == TechniqueKind::kSky) {
             ScopedDownstreamRoute route(
                 s_downstreamDrawIndexedInstanced, original);
             if (!ProcessCloudDraw(This, {
                     CloudShadows::CloudDrawKind::DrawIndexedInstanced,
                     IndexCountPerInstance, InstanceCount,
                     StartIndexLocation, BaseVertexLocation,
-                    StartInstanceLocation })) {
-                original(This, IndexCountPerInstance, InstanceCount,
-                    StartIndexLocation, BaseVertexLocation,
-                    StartInstanceLocation);
-            }
+                    StartInstanceLocation }))
+                submit();
             return;
         }
-        const bool cloudLitDraw =
-            phase.kind == TechniqueKind::kDFLight &&
-            phase.sunShaderValidated;
-        if (!cloudLitDraw || !IsCapturedImmediateContext(This)) {
-            original(This, IndexCountPerInstance, InstanceCount,
-                StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
+            phase.sunShaderValidated) {
+            SubmitWithSunlightSwap(This, submit);
             return;
         }
-        if (cloudLitDraw) {
-            auto swap = BeginSwap(This);
-            original(This, IndexCountPerInstance, InstanceCount,
-                StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
-            RecordSubmittedSwap(swap);
-            EndSwap(This, swap);
-            return;
-        }
-        original(This, IndexCountPerInstance, InstanceCount,
-            StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+        submit();
     }
 
     template <std::size_t Route>
@@ -3556,99 +3251,38 @@ namespace CloudShadows
         const auto original = s_drawInstancedRoutes.originals[Route];
         if (!original)
             return;
-        FO4CS::RendererLifetime::Scope rendererLifetime(
-            ((CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire) &&
-                 (g_techniqueState.kind == TechniqueKind::kSky ||
-                  g_techniqueState.kind == TechniqueKind::kDFLight ||
-                  FO4CS::GodraysIntegration::IsCloudOcclusionEnabled())) ||
-                FO4CS::NativeSkyCube::IsCaptureActive()) &&
-            This == g_publishedRendererContext.load(std::memory_order_acquire));
-        ObserveNativeCubeDraw(This);
-        if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)) {
+        const auto draw = ClassifyDraw(This);
+        FO4CS::RendererLifetime::Scope rendererLifetime(NeedsRendererLifetime(draw));
+        const auto submit = [&] {
             original(This, VertexCountPerInstance, InstanceCount,
                 StartVertexLocation, StartInstanceLocation);
-            return;
-        }
-        if (g_internalDrawDepth != 0) {
-            original(This, VertexCountPerInstance, InstanceCount,
-                StartVertexLocation, StartInstanceLocation);
+        };
+        if (!draw.enabled) {
+            submit();
             return;
         }
         auto godraySwap = FO4CS::GodraysIntegration::BeginDraw(This);
         if (godraySwap.swapped) {
-            original(This, VertexCountPerInstance, InstanceCount,
-                StartVertexLocation, StartInstanceLocation);
-            FO4CS::GodraysIntegration::EndDraw(
-                This, godraySwap, true);
+            submit();
+            FO4CS::GodraysIntegration::EndDraw(This, godraySwap, true);
             return;
         }
         const auto& phase = g_techniqueState;
-        const bool nativePassiveCapture =
-            FO4CS::NativeSkyCube::IsCaptureActive() &&
-            IsCapturedImmediateContext(This);
-        const bool nativeCloudDraw =
-            nativePassiveCapture &&
-            phase.kind == TechniqueKind::kSky &&
-            CloudShadows::IsCloudTechnique(phase.skyTechnique);
-        if (nativePassiveCapture) {
-            bool captured = false;
-            if (nativeCloudDraw) {
-                ScopedDownstreamRoute route(
-                    s_downstreamDrawInstanced, original);
-                captured = ProcessCloudDraw(This, {
-                    CloudShadows::CloudDrawKind::DrawInstanced,
-                    VertexCountPerInstance, InstanceCount,
-                    StartVertexLocation, 0, StartInstanceLocation });
-            }
-            if (!captured) {
-                original(This, VertexCountPerInstance, InstanceCount,
-                    StartVertexLocation, StartInstanceLocation);
-            }
-            return;
-        }
-        if (phase.kind == TechniqueKind::kSky &&
-            IsCapturedImmediateContext(This)) {
+        if (draw.immediate && phase.kind == TechniqueKind::kSky) {
             ScopedDownstreamRoute route(s_downstreamDrawInstanced, original);
             if (!ProcessCloudDraw(This, {
                     CloudShadows::CloudDrawKind::DrawInstanced,
                     VertexCountPerInstance, InstanceCount,
-                    StartVertexLocation, 0, StartInstanceLocation })) {
-                original(This, VertexCountPerInstance, InstanceCount,
-                    StartVertexLocation, StartInstanceLocation);
-            }
+                    StartVertexLocation, 0, StartInstanceLocation }))
+                submit();
             return;
         }
-        const bool cloudLitDraw =
-            phase.kind == TechniqueKind::kDFLight &&
-            phase.sunShaderValidated;
-        if (!cloudLitDraw || !IsCapturedImmediateContext(This)) {
-            original(This, VertexCountPerInstance, InstanceCount,
-                StartVertexLocation, StartInstanceLocation);
+        if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
+            phase.sunShaderValidated) {
+            SubmitWithSunlightSwap(This, submit);
             return;
         }
-        if (cloudLitDraw) {
-            auto swap = BeginSwap(This);
-            original(This, VertexCountPerInstance, InstanceCount,
-                StartVertexLocation, StartInstanceLocation);
-            RecordSubmittedSwap(swap);
-            EndSwap(This, swap);
-            return;
-        }
-        original(This, VertexCountPerInstance, InstanceCount,
-            StartVertexLocation, StartInstanceLocation);
-    }
-
-    template <std::size_t Route>
-    static void WINAPI Detour_ClearRenderTargetView(
-        ID3D11DeviceContext* This,
-        ID3D11RenderTargetView* RenderTargetView,
-        const FLOAT ColorRGBA[4])
-    {
-        const auto original = s_clearRenderTargetRoutes.originals[Route];
-        if (!original)
-            return;
-        // Passive capture never owns or suppresses Fallout's colour-cube clear.
-        original(This, RenderTargetView, ColorRGBA);
+        submit();
     }
 
     template <std::size_t... Routes>
@@ -3687,15 +3321,6 @@ namespace CloudShadows
         };
     }
 
-    template <std::size_t... Routes>
-    [[nodiscard]] constexpr auto MakeClearRenderTargetDetours(
-        std::index_sequence<Routes...>) noexcept
-    {
-        return std::array<PFN_ClearRenderTargetView, sizeof...(Routes)>{
-            &Detour_ClearRenderTargetView<Routes>...
-        };
-    }
-
     constexpr auto s_drawIndexedDetours = MakeDrawIndexedDetours(
         std::make_index_sequence<kMaximumDrawDetourRoutes>{});
     constexpr auto s_drawDetours = MakeDrawDetours(
@@ -3705,9 +3330,6 @@ namespace CloudShadows
             std::make_index_sequence<kMaximumDrawDetourRoutes>{});
     constexpr auto s_drawInstancedDetours = MakeDrawInstancedDetours(
         std::make_index_sequence<kMaximumDrawDetourRoutes>{});
-    constexpr auto s_clearRenderTargetDetours =
-        MakeClearRenderTargetDetours(
-            std::make_index_sequence<kMaximumDrawDetourRoutes>{});
 
     template <class TFunction>
     [[nodiscard]] bool ReserveDrawRoute(
@@ -3747,89 +3369,80 @@ namespace CloudShadows
         routes.originals[route] = nullptr;
     }
 
-    bool NativeCaptureRoutesCurrent() noexcept
-    {
-        FO4CS::RendererLifetime::Scope rendererLifetime;
-        auto* context = g_d3dContext;
-        if (!IsCapturedImmediateContext(context) ||
-            !g_nativePrimaryClearHookReady.load(
-                std::memory_order_acquire)) {
-            return false;
-        }
-
-        auto* vtable = *reinterpret_cast<std::uintptr_t**>(context);
-        if (!vtable)
-            return false;
-        const std::array<std::uintptr_t, 5> current{
-            std::atomic_ref<std::uintptr_t>(vtable[12]).load(
-                std::memory_order_acquire),
-            std::atomic_ref<std::uintptr_t>(vtable[13]).load(
-                std::memory_order_acquire),
-            std::atomic_ref<std::uintptr_t>(vtable[20]).load(
-                std::memory_order_acquire),
-            std::atomic_ref<std::uintptr_t>(vtable[21]).load(
-                std::memory_order_acquire),
-            std::atomic_ref<std::uintptr_t>(vtable[50]).load(
-                std::memory_order_acquire)
-        };
-
-        std::lock_guard lock(s_drawHookMutex);
-        const auto routed = [](const auto& routes,
-                                std::uintptr_t target) noexcept {
-            for (std::size_t index = 0; index < routes.count; ++index) {
-                if (routes.targets[index] == target)
-                    return true;
-            }
-            return false;
-        };
-        return routed(s_drawIndexedRoutes, current[0]) &&
-            routed(s_drawRoutes, current[1]) &&
-            routed(s_drawIndexedInstancedRoutes, current[2]) &&
-            routed(s_drawInstancedRoutes, current[3]) &&
-            routed(s_clearRenderTargetRoutes, current[4]);
-    }
-
-    void VerifyDrawHookIntegrity() noexcept
+    bool VerifyDrawHookIntegrity() noexcept
     {
         FO4CS::RendererLifetime::Scope rendererLifetime;
         std::lock_guard hookLock(s_drawHookMutex);
 
         auto* ctx = g_d3dContext;
         if (!IsCapturedImmediateContext(ctx))
-            return;
+            return false;
         std::uintptr_t* vtbl = nullptr;
-        if (!ReadValidatedComVTable(ctx, 50, &vtbl)) {
-            g_nativePrimaryClearHookReady.store(
-                false, std::memory_order_release);
+        if (!ReadValidatedComVTable(ctx, 21, &vtbl)) {
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-            return;
+            return false;
         }
-        const std::array<std::uintptr_t, 5> targets{
-            vtbl[12], vtbl[13], vtbl[20], vtbl[21], vtbl[50]
+        const std::array<std::uintptr_t, 4> targets{
+            vtbl[12], vtbl[13], vtbl[20], vtbl[21]
         };
 
-        auto executable = [](std::uintptr_t address) noexcept {
-            if (!address)
-                return false;
-            MEMORY_BASIC_INFORMATION mbi{};
-            if (VirtualQuery(reinterpret_cast<void*>(address), &mbi, sizeof(mbi)) != sizeof(mbi) ||
-                mbi.State != MEM_COMMIT || (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS))) {
-                return false;
+        // A driver or overlay may route distinct method tables through one
+        // shared entry. Routes are keyed by the entry address itself, so two
+        // tables that share a function share one immutable detour. Distinct
+        // methods must never share an entry: a second detour on the same
+        // code would chain both and process every draw twice.
+        const auto routedAs = [](const auto& routes, std::uintptr_t target) noexcept {
+            for (std::size_t index = 0; index < routes.count; ++index) {
+                if (routes.targets[index] == target)
+                    return true;
             }
-            const DWORD protection = mbi.Protect & 0xFFu;
-            return protection == PAGE_EXECUTE || protection == PAGE_EXECUTE_READ ||
-                protection == PAGE_EXECUTE_READWRITE || protection == PAGE_EXECUTE_WRITECOPY;
+            return false;
         };
+        const std::array<bool, 4> crossRouted{
+            routedAs(s_drawRoutes, targets[0]) ||
+                routedAs(s_drawIndexedInstancedRoutes, targets[0]) ||
+                routedAs(s_drawInstancedRoutes, targets[0]),
+            routedAs(s_drawIndexedRoutes, targets[1]) ||
+                routedAs(s_drawIndexedInstancedRoutes, targets[1]) ||
+                routedAs(s_drawInstancedRoutes, targets[1]),
+            routedAs(s_drawIndexedRoutes, targets[2]) ||
+                routedAs(s_drawRoutes, targets[2]) ||
+                routedAs(s_drawInstancedRoutes, targets[2]),
+            routedAs(s_drawIndexedRoutes, targets[3]) ||
+                routedAs(s_drawRoutes, targets[3]) ||
+                routedAs(s_drawIndexedInstancedRoutes, targets[3])
+        };
+        bool sharedEntry = crossRouted[0] || crossRouted[1] ||
+            crossRouted[2] || crossRouted[3];
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            for (std::size_t j = i + 1; j < targets.size(); ++j)
+                sharedEntry = sharedEntry || targets[i] == targets[j];
+        }
+        if (sharedEntry) {
+            SetHookAvailable(
+                FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
+            static bool loggedSharedEntry = false;
+            if (!loggedSharedEntry) {
+                loggedSharedEntry = true;
+                SPDLOG_ERROR("[CloudShadows] Refusing draw detours: distinct draw "
+                    "methods share one entry point (0x{:016X} 0x{:016X} 0x{:016X} 0x{:016X})",
+                    static_cast<uint64_t>(targets[0]), static_cast<uint64_t>(targets[1]),
+                    static_cast<uint64_t>(targets[2]), static_cast<uint64_t>(targets[3]));
+            }
+            return false;
+        }
         for (auto target : targets) {
-            if (!executable(target)) {
-                g_nativePrimaryClearHookReady.store(
-                    false, std::memory_order_release);
+            if (!IsExecutableAddress(target)) {
                 SetHookAvailable(
                     FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-                SPDLOG_ERROR("[CloudShadows] Refusing draw detour: non-executable vtable target 0x{:016X}",
-                    static_cast<uint64_t>(target));
-                return;
+                static std::uintptr_t loggedTarget = 0;
+                if (loggedTarget != target) {
+                    loggedTarget = target;
+                    SPDLOG_ERROR("[CloudShadows] Refusing draw detour: non-executable vtable target 0x{:016X}",
+                        static_cast<uint64_t>(target));
+                }
+                return false;
             }
         }
 
@@ -3837,12 +3450,19 @@ namespace CloudShadows
         std::size_t drawRoute = 0;
         std::size_t drawIndexedInstancedRoute = 0;
         std::size_t drawInstancedRoute = 0;
-        std::size_t clearRenderTargetRoute = 0;
         bool addDrawIndexed = false;
         bool addDraw = false;
         bool addDrawIndexedInstanced = false;
         bool addDrawInstanced = false;
-        bool addClearRenderTarget = false;
+        const auto rollBack = [&]() noexcept {
+            RollBackDrawRoute(
+                s_drawIndexedRoutes, drawIndexedRoute, addDrawIndexed);
+            RollBackDrawRoute(s_drawRoutes, drawRoute, addDraw);
+            RollBackDrawRoute(s_drawIndexedInstancedRoutes,
+                drawIndexedInstancedRoute, addDrawIndexedInstanced);
+            RollBackDrawRoute(
+                s_drawInstancedRoutes, drawInstancedRoute, addDrawInstanced);
+        };
         const bool capacityReady =
             ReserveDrawRoute(s_drawIndexedRoutes, targets[0],
                 drawIndexedRoute, addDrawIndexed) &&
@@ -3851,43 +3471,39 @@ namespace CloudShadows
             ReserveDrawRoute(s_drawIndexedInstancedRoutes, targets[2],
                 drawIndexedInstancedRoute, addDrawIndexedInstanced) &&
             ReserveDrawRoute(s_drawInstancedRoutes, targets[3],
-                drawInstancedRoute, addDrawInstanced) &&
-            ReserveDrawRoute(s_clearRenderTargetRoutes, targets[4],
-                clearRenderTargetRoute, addClearRenderTarget);
+                drawInstancedRoute, addDrawInstanced);
         if (!capacityReady) {
-            RollBackDrawRoute(
-                s_drawIndexedRoutes, drawIndexedRoute, addDrawIndexed);
-            RollBackDrawRoute(s_drawRoutes, drawRoute, addDraw);
-            RollBackDrawRoute(s_drawIndexedInstancedRoutes,
-                drawIndexedInstancedRoute, addDrawIndexedInstanced);
-            RollBackDrawRoute(
-                s_drawInstancedRoutes, drawInstancedRoute, addDrawInstanced);
-            RollBackDrawRoute(
-                s_clearRenderTargetRoutes, clearRenderTargetRoute,
-                addClearRenderTarget);
-            g_nativePrimaryClearHookReady.store(
-                false, std::memory_order_release);
+            rollBack();
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-            SPDLOG_CRITICAL(
-                "[CloudShadows] Draw-detour route capacity exhausted after {} "
-                "device generations",
-                kMaximumDrawDetourRoutes);
-            return;
+            static bool loggedCapacity = false;
+            if (!loggedCapacity) {
+                loggedCapacity = true;
+                SPDLOG_CRITICAL(
+                    "[CloudShadows] Draw-detour route capacity exhausted after {} "
+                    "device generations",
+                    kMaximumDrawDetourRoutes);
+            }
+            return false;
         }
 
         if (!addDrawIndexed && !addDraw && !addDrawIndexedInstanced &&
-            !addDrawInstanced && !addClearRenderTarget) {
-            g_nativePrimaryClearHookReady.store(
-                true, std::memory_order_release);
+            !addDrawInstanced) {
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kDrawHookUnavailable, true);
-            return;
+            return true;
         }
 
-        DetourThreadEnlistment threads;
+        const ULONGLONG now = GetTickCount64();
+        if (now < s_drawHookRetryAfter) {
+            rollBack();
+            return false;
+        }
+
+        // Attach first: Detours allocates its operations and trampolines
+        // before any thread is suspended, which keeps the heap lock free.
+        std::lock_guard transactionLock(FO4CS::DetourTransaction::Mutex());
         LONG err = DetourTransactionBegin();
-        if (err == NO_ERROR) err = threads.EnlistProcessThreads();
         if (err == NO_ERROR && addDrawIndexed) {
             err = DetourAttach(
                 reinterpret_cast<PVOID*>(
@@ -3917,67 +3533,43 @@ namespace CloudShadows
                 reinterpret_cast<PVOID>(
                     s_drawInstancedDetours[drawInstancedRoute]));
         }
-        if (err == NO_ERROR && addClearRenderTarget) {
-            err = DetourAttach(
-                reinterpret_cast<PVOID*>(
-                    &s_clearRenderTargetRoutes.originals[
-                        clearRenderTargetRoute]),
-                reinterpret_cast<PVOID>(
-                    s_clearRenderTargetDetours[clearRenderTargetRoute]));
-        }
-        if (err != NO_ERROR) {
+        DetourThreadEnlistment threads;
+        if (err == NO_ERROR)
+            err = threads.EnlistProcessThreads();
+        const bool attached = err == NO_ERROR;
+        if (attached)
+            err = DetourTransactionCommit();
+        else
             DetourTransactionAbort();
-            RollBackDrawRoute(
-                s_drawIndexedRoutes, drawIndexedRoute, addDrawIndexed);
-            RollBackDrawRoute(s_drawRoutes, drawRoute, addDraw);
-            RollBackDrawRoute(s_drawIndexedInstancedRoutes,
-                drawIndexedInstancedRoute, addDrawIndexedInstanced);
-            RollBackDrawRoute(
-                s_drawInstancedRoutes, drawInstancedRoute, addDrawInstanced);
-            RollBackDrawRoute(
-                s_clearRenderTargetRoutes, clearRenderTargetRoute,
-                addClearRenderTarget);
-            g_nativePrimaryClearHookReady.store(
-                false, std::memory_order_release);
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-            SPDLOG_ERROR("[CloudShadows] Draw-detour attach failed: {}", err);
-            return;
-        }
-        err = DetourTransactionCommit();
         if (err != NO_ERROR) {
-            RollBackDrawRoute(
-                s_drawIndexedRoutes, drawIndexedRoute, addDrawIndexed);
-            RollBackDrawRoute(s_drawRoutes, drawRoute, addDraw);
-            RollBackDrawRoute(s_drawIndexedInstancedRoutes,
-                drawIndexedInstancedRoute, addDrawIndexedInstanced);
-            RollBackDrawRoute(
-                s_drawInstancedRoutes, drawInstancedRoute, addDrawInstanced);
-            RollBackDrawRoute(
-                s_clearRenderTargetRoutes, clearRenderTargetRoute,
-                addClearRenderTarget);
-            g_nativePrimaryClearHookReady.store(
-                false, std::memory_order_release);
+            rollBack();
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kDrawHookUnavailable, false);
-            SPDLOG_ERROR(
-                "[CloudShadows] Draw-detour commit failed: {}", err);
-            return;
+            ++s_drawHookFailures;
+            const ULONGLONG backoff = (std::min)(
+                60000ull, 1000ull << (std::min)(s_drawHookFailures, 6u));
+            s_drawHookRetryAfter = now + backoff;
+            if (s_drawHookFailures <= 3 ||
+                (s_drawHookFailures & (s_drawHookFailures - 1)) == 0) {
+                SPDLOG_ERROR(
+                    "[CloudShadows] Draw-detour {} failed: {} (attempt {}, retry in {} ms)",
+                    attached ? "commit" : "attach", err, s_drawHookFailures, backoff);
+            }
+            return false;
         }
-        g_nativePrimaryClearHookReady.store(
-            true, std::memory_order_release);
+        s_drawHookFailures = 0;
+        s_drawHookRetryAfter = 0;
         SetHookAvailable(
             FO4CloudShadowsMenuBridge::kDrawHookUnavailable, true);
         SPDLOG_INFO(
             "[CloudShadows] Draw detour generation installed: "
             "DrawIndexed=0x{:016X}[{}] Draw=0x{:016X}[{}] "
-            "DII=0x{:016X}[{}] DI=0x{:016X}[{}] "
-            "ClearRTV=0x{:016X}[{}]",
+            "DII=0x{:016X}[{}] DI=0x{:016X}[{}]",
             static_cast<uint64_t>(targets[0]), drawIndexedRoute,
             static_cast<uint64_t>(targets[1]), drawRoute,
             static_cast<uint64_t>(targets[2]), drawIndexedInstancedRoute,
-            static_cast<uint64_t>(targets[3]), drawInstancedRoute,
-            static_cast<uint64_t>(targets[4]), clearRenderTargetRoute);
+            static_cast<uint64_t>(targets[3]), drawInstancedRoute);
+        return true;
     }
 
 }
@@ -3985,6 +3577,47 @@ namespace CloudShadows
 namespace
 {
 
+
+    // Commits one Detours transaction. Every target is attached first, so
+    // Detours allocates its operations and trampolines while the heap lock
+    // is free; only then are the other threads enlisted (suspended).
+    [[nodiscard]] LONG CommitDetourTransaction(
+        std::initializer_list<std::pair<PVOID*, PVOID>> attachments,
+        bool detach = false) noexcept
+    {
+        std::lock_guard transactionLock(FO4CS::DetourTransaction::Mutex());
+        LONG error = DetourTransactionBegin();
+        for (const auto& [original, detour] : attachments) {
+            if (error != NO_ERROR)
+                break;
+            error = detach ? DetourDetach(original, detour) :
+                DetourAttach(original, detour);
+        }
+        DetourThreadEnlistment threads;
+        if (error == NO_ERROR)
+            error = threads.EnlistProcessThreads();
+        if (error != NO_ERROR) {
+            DetourTransactionAbort();
+            return error;
+        }
+        return DetourTransactionCommit();
+    }
+
+    // A transient failure (for example a concurrent transaction from another
+    // plugin) must not leave BeginTechnique permanently unhooked. Present
+    // retries with exponential backoff; the F4SE messages retry immediately.
+    std::atomic<ULONGLONG> g_beginTechniqueRetryAfter{ 0 };
+    std::atomic<uint32_t> g_beginTechniqueFailures{ 0 };
+
+    void RecordBeginTechniqueFailure() noexcept
+    {
+        const uint32_t failures = g_beginTechniqueFailures.fetch_add(
+            1, std::memory_order_relaxed) + 1;
+        const ULONGLONG backoff = (std::min)(
+            300000ull, 2000ull << (std::min)(failures, 8u));
+        g_beginTechniqueRetryAfter.store(
+            GetTickCount64() + backoff, std::memory_order_relaxed);
+    }
 
     void TryInstallBeginTechniqueHook()
     {
@@ -3999,30 +3632,27 @@ namespace
             if (!address || !IsExecutableMainModuleAddress(address)) {
                 SetHookAvailable(
                     FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable, false);
-                SPDLOG_ERROR("[CloudShadows] VR shader-binding address unavailable");
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    SPDLOG_ERROR("[CloudShadows] VR shader-binding address unavailable");
+                }
                 return;
             }
             s_original_SetShadersVR = reinterpret_cast<SetShadersVR_t>(address);
-            DetourThreadEnlistment threads;
-            LONG error = DetourTransactionBegin();
-            if (error == NO_ERROR) error = threads.EnlistProcessThreads();
-            if (error == NO_ERROR) {
-                error = DetourAttach(
-                    reinterpret_cast<PVOID*>(&s_original_SetShadersVR),
-                    reinterpret_cast<PVOID>(&Detour_SetShadersVR));
-            }
+            const LONG error = CommitDetourTransaction({
+                { reinterpret_cast<PVOID*>(&s_original_SetShadersVR),
+                  reinterpret_cast<PVOID>(&Detour_SetShadersVR) } });
             if (error != NO_ERROR) {
-                DetourTransactionAbort();
-            } else {
-                error = DetourTransactionCommit();
-            }
-            if (error != NO_ERROR) {
+                s_original_SetShadersVR = reinterpret_cast<SetShadersVR_t>(address);
                 SetHookAvailable(
                     FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable, false);
+                RecordBeginTechniqueFailure();
                 SPDLOG_ERROR("[CloudShadows] VR shader-binding detour failed: {}", error);
                 return;
             }
             vrBindingHookInstalled = true;
+            g_beginTechniqueFailures.store(0, std::memory_order_relaxed);
             SPDLOG_INFO("[CloudShadows] VR BSGraphics::SetShaders detour "
                 "installed @ 0x{:X}", address);
         }
@@ -4037,9 +3667,13 @@ namespace
 			SetHookAvailable(
 				FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable,
 				true);
-			SPDLOG_INFO(
-				"[CloudShadows][MenuBridge] compatible host forwards BeginTechnique; "
-				"standalone engine detour skipped");
+			static bool logged = false;
+			if (!logged) {
+				logged = true;
+				SPDLOG_INFO(
+					"[CloudShadows][MenuBridge] compatible host forwards BeginTechnique; "
+					"standalone engine detour skipped");
+			}
 			return;
 		}
         // Reviewed OG/AE Address Library IDs plus the exact VR RVA all resolve
@@ -4049,60 +3683,68 @@ namespace
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable,
                 false);
-            SPDLOG_WARN("[CloudShadows] BeginTechnique address unresolved — DFLight descriptor-swap disabled");
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                SPDLOG_WARN("[CloudShadows] BeginTechnique address unresolved — DFLight descriptor-swap disabled");
+            }
             return;
         }
         if (!IsExecutableMainModuleAddress(addr)) {
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable,
                 false);
-            SPDLOG_CRITICAL("[CloudShadows] Refusing BeginTechnique detour: 0x{:016X} is not in an executable Fallout4.exe section",
-                static_cast<uint64_t>(addr));
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                SPDLOG_CRITICAL("[CloudShadows] Refusing BeginTechnique detour: 0x{:016X} is not in an executable Fallout4.exe section",
+                    static_cast<uint64_t>(addr));
+            }
             return;
         }
+        LONG err = NO_ERROR;
         if (vrAbi) {
             s_original_BeginTechniqueVR =
                 reinterpret_cast<BeginTechniqueVR_t>(addr);
+            err = CommitDetourTransaction({
+                { reinterpret_cast<PVOID*>(&s_original_BeginTechniqueVR),
+                  reinterpret_cast<PVOID>(&Detour_BeginTechniqueVR) } });
         } else {
             s_original_BeginTechniqueFlat =
                 reinterpret_cast<BeginTechniqueFlat_t>(addr);
+            err = CommitDetourTransaction({
+                { reinterpret_cast<PVOID*>(&s_original_BeginTechniqueFlat),
+                  reinterpret_cast<PVOID>(&Detour_BeginTechniqueFlat) } });
         }
-        DetourThreadEnlistment threads;
-        LONG err = DetourTransactionBegin();
-        if (err == NO_ERROR) err = threads.EnlistProcessThreads();
-        if (err == NO_ERROR) {
-            if (vrAbi) {
-                err = DetourAttach(
-                    reinterpret_cast<PVOID*>(&s_original_BeginTechniqueVR),
-                    reinterpret_cast<PVOID>(&Detour_BeginTechniqueVR));
-            } else {
-                err = DetourAttach(
-                    reinterpret_cast<PVOID*>(&s_original_BeginTechniqueFlat),
-                    reinterpret_cast<PVOID>(&Detour_BeginTechniqueFlat));
-            }
-        }
-        if (err != NO_ERROR) {
-            DetourTransactionAbort();
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable,
-                false);
-            SPDLOG_ERROR("[CloudShadows] DetourAttach BeginTechnique failed: {}", err);
-            return;
-        }
-        err = DetourTransactionCommit();
         if (err != NO_ERROR) {
             SetHookAvailable(
                 FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable,
                 false);
+            RecordBeginTechniqueFailure();
             SPDLOG_ERROR("[CloudShadows] DetourAttach BeginTechnique failed: {}", err);
             return;
         }
 		g_beginTechniqueHookInstalled.store(true, std::memory_order_release);
+        g_beginTechniqueFailures.store(0, std::memory_order_relaxed);
         SetHookAvailable(
             FO4CloudShadowsMenuBridge::kBeginTechniqueHookUnavailable, true);
         SPDLOG_INFO(
             "[CloudShadows] BSShader::BeginTechnique detour installed @ 0x{:X} ABI={}",
             addr, vrAbi ? "VR-6" : "flat-5");
+    }
+
+    // Present-driven retry for a failed BeginTechnique/SetShaders install.
+    void RetryBeginTechniqueHookIfDue() noexcept
+    {
+        if (g_beginTechniqueHookInstalled.load(std::memory_order_acquire) ||
+            g_beginTechniqueFailures.load(std::memory_order_relaxed) == 0 ||
+            GetTickCount64() < g_beginTechniqueRetryAfter.load(std::memory_order_relaxed))
+            return;
+        try {
+            TryInstallBeginTechniqueHook();
+        } catch (...) {
+            LogHookException("BeginTechnique hook retry");
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -4132,10 +3774,14 @@ namespace
         // Install identity capture on every created device. RendererData later
         // chooses the actual game device; this also covers a device recreated
         // after removal before its first shader is created.
-        g_createVSHookInstalled.store(
-            InstallCreateVertexShaderHook(device), std::memory_order_release);
-        g_createPSHookInstalled.store(
-            InstallCreatePixelShaderHook(device), std::memory_order_release);
+        auto* renderer = g_publishedRendererDevice.load(std::memory_order_acquire);
+        const bool authoritative = !renderer || renderer == device;
+        const bool vertexHooked = InstallCreateVertexShaderHook(device, authoritative);
+        const bool pixelHooked = InstallCreatePixelShaderHook(device, authoritative);
+        if (authoritative) {
+            g_createVSHookInstalled.store(vertexHooked, std::memory_order_release);
+            g_createPSHookInstalled.store(pixelHooked, std::memory_order_release);
+        }
 
         // RendererData/Present publishes the authoritative device/context on
         // the render thread. This callback may run on an auxiliary device-
@@ -4176,17 +3822,21 @@ namespace
             (void*)(ppSwapChain ? *ppSwapChain : nullptr));
 
         if (SUCCEEDED(ret)) {
-            CaptureCreatedD3DObjects(
-                ppDevice ? *ppDevice : nullptr,
-                ppImmediateContext ? *ppImmediateContext : nullptr);
+            try {
+                CaptureCreatedD3DObjects(
+                    ppDevice ? *ppDevice : nullptr,
+                    ppImmediateContext ? *ppImmediateContext : nullptr);
 
-            // Install Present on the *real* swap chain the game actually
-            // renders through. F4SE-message-time installation would hook a
-            // stale first swap chain; the game may create a second
-            // swap chain (different vtable) and render through that.
-            if (ppSwapChain && *ppSwapChain)
-                InstallPresentHook(
-                    *ppSwapChain, "CreateDeviceAndSwapChain", false);
+                // Install Present on the *real* swap chain the game actually
+                // renders through. F4SE-message-time installation would hook a
+                // stale first swap chain; the game may create a second
+                // swap chain (different vtable) and render through that.
+                if (ppSwapChain && *ppSwapChain)
+                    InstallPresentHook(
+                        *ppSwapChain, "CreateDeviceAndSwapChain", false);
+            } catch (...) {
+                LogHookException("D3D11CreateDeviceAndSwapChain observer");
+            }
         }
         return ret;
     }
@@ -4215,9 +3865,13 @@ namespace
             SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
 
         if (SUCCEEDED(ret)) {
-            CaptureCreatedD3DObjects(
-                ppDevice ? *ppDevice : nullptr,
-                ppImmediateContext ? *ppImmediateContext : nullptr);
+            try {
+                CaptureCreatedD3DObjects(
+                    ppDevice ? *ppDevice : nullptr,
+                    ppImmediateContext ? *ppImmediateContext : nullptr);
+            } catch (...) {
+                LogHookException("D3D11CreateDevice observer");
+            }
         }
         return ret;
     }
@@ -4257,26 +3911,11 @@ namespace
         }
         s_origCreateDevice = procCd;
 
-        DetourThreadEnlistment threads;
-        LONG err = DetourTransactionBegin();
-        if (err == NO_ERROR) err = threads.EnlistProcessThreads();
-        if (err == NO_ERROR) {
-            err = DetourAttach(reinterpret_cast<PVOID*>(&s_origCreateDeviceAndSwapChain),
-                reinterpret_cast<PVOID>(&hk_D3D11CreateDeviceAndSwapChain));
-        }
-        if (err == NO_ERROR && procCd) {
-            err = DetourAttach(reinterpret_cast<PVOID*>(&s_origCreateDevice),
-                reinterpret_cast<PVOID>(&hk_D3D11CreateDevice));
-        }
-        if (err != NO_ERROR) {
-            DetourTransactionAbort();
-            SPDLOG_ERROR("[CloudShadows] DetourAttach D3D11 create-device failed: {}", err);
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kCreateDeviceHookUnavailable,
-                false);
-            return false;
-        }
-        err = DetourTransactionCommit();
+        const LONG err = CommitDetourTransaction({
+            { reinterpret_cast<PVOID*>(&s_origCreateDeviceAndSwapChain),
+              reinterpret_cast<PVOID>(&hk_D3D11CreateDeviceAndSwapChain) },
+            { reinterpret_cast<PVOID*>(&s_origCreateDevice),
+              reinterpret_cast<PVOID>(&hk_D3D11CreateDevice) } });
         if (err != NO_ERROR) {
             SPDLOG_ERROR("[CloudShadows] DetourAttach D3D11 create-device failed: {}", err);
             SetHookAvailable(
@@ -4296,32 +3935,15 @@ namespace
     {
         if (!s_createDeviceHooksInstalled.load(std::memory_order_acquire))
             return true;
-        DetourThreadEnlistment threads;
-        LONG err = DetourTransactionBegin();
-        if (err == NO_ERROR)
-            err = threads.EnlistProcessThreads();
-        if (err == NO_ERROR) {
-            err = DetourDetach(
-                reinterpret_cast<PVOID*>(&s_origCreateDeviceAndSwapChain),
-                reinterpret_cast<PVOID>(&hk_D3D11CreateDeviceAndSwapChain));
-        }
-        if (err == NO_ERROR) {
-            err = DetourDetach(
-                reinterpret_cast<PVOID*>(&s_origCreateDevice),
-                reinterpret_cast<PVOID>(&hk_D3D11CreateDevice));
-        }
+        const LONG err = CommitDetourTransaction({
+            { reinterpret_cast<PVOID*>(&s_origCreateDeviceAndSwapChain),
+              reinterpret_cast<PVOID>(&hk_D3D11CreateDeviceAndSwapChain) },
+            { reinterpret_cast<PVOID*>(&s_origCreateDevice),
+              reinterpret_cast<PVOID>(&hk_D3D11CreateDevice) } }, true);
         if (err != NO_ERROR) {
-            DetourTransactionAbort();
             SPDLOG_CRITICAL(
                 "[CloudShadows] Unable to roll back D3D11 create-device "
                 "detours after load failure: {}", err);
-            return false;
-        }
-        err = DetourTransactionCommit();
-        if (err != NO_ERROR) {
-            SPDLOG_CRITICAL(
-                "[CloudShadows] Unable to commit D3D11 create-device detour "
-                "rollback after load failure: {}", err);
             return false;
         }
         s_createDeviceHooksInstalled.store(false, std::memory_order_release);
@@ -4342,16 +3964,10 @@ namespace
         }
     }
 
-    void TryInstallNativeSkyCubeHooks() noexcept
+    void TryInstallReflectionGuard() noexcept
     {
-        FO4CS::NativeSkyCube::SetFaceLifecycleCallback(
-            &OnNativeSkyCubeFaceLifecycle);
-        if (!FO4CS::NativeSkyCube::Install()) {
-            SPDLOG_ERROR(
-                "[CloudShadows] Native sky-cubemap producer unavailable; "
-                "visible rendering remains vanilla and cloud shadows stay "
-                "fail-neutral");
-        }
+        std::lock_guard transactionLock(FO4CS::DetourTransaction::Mutex());
+        (void)FO4CS::WaterReflectionGuard::Install();
     }
 
     void FO4CS_F4SEAPI OnMessage(FO4CS::F4SECompat::Message* a_msg)
@@ -4370,7 +3986,8 @@ namespace
         case FO4CS::F4SECompat::kPostPostLoad:
             SPDLOG_INFO("[CloudShadows] kPostPostLoad - trying hooks");
 			{
-			TryInstallNativeSkyCubeHooks();
+			FO4CS::MenuFrameworkPage::Install();
+			TryInstallReflectionGuard();
 			bool hostActivationPending = false;
 			if (GetModuleHandleW(L"RealisticReflections.dll")) {
 				using namespace FO4CloudShadowsMenuBridge;
@@ -4425,22 +4042,16 @@ namespace
             break;
         case FO4CS::F4SECompat::kInputLoaded:
         case FO4CS::F4SECompat::kGameDataReady:
-			if (a_msg->type == FO4CS::F4SECompat::kGameDataReady)
-				FO4CS::NativeSkyCube::SetLoadBlocked(false);
 			TryInstallBeginTechniqueHook();
             TryInstallHooks();
             break;
         case FO4CS::F4SECompat::kPreLoadGame:
-            FO4CS::NativeSkyCube::SetLoadBlocked(true);
-            FO4CS::NativeSkyCube::RequestWorldReset();
             CloudShadows::RequestWorldCloudReset();
             TryInstallHooks();
             break;
         case FO4CS::F4SECompat::kPostLoadGame:
         case FO4CS::F4SECompat::kNewGame:
-            FO4CS::NativeSkyCube::RequestWorldReset();
             CloudShadows::RequestWorldCloudReset();
-            FO4CS::NativeSkyCube::SetLoadBlocked(false);
             TryInstallHooks();
             break;
         default:
@@ -4519,10 +4130,18 @@ extern "C" DLLEXPORT bool FO4CS_F4SEAPI F4SEPlugin_Load(
                 logger->flush();
             return true;  // stay resident but inert
         }
-        SPDLOG_INFO(
-            "[CloudShadows] ENB {} detected with its cloud shadows disabled ({}); "
-            "Cloud Shadows runs normally",
-            enbVersion, enbConfig);
+        if (enb.cloudShadowsSettingPresent) {
+            SPDLOG_INFO(
+                "[CloudShadows] ENB {} detected with its cloud shadows disabled ({}); "
+                "Cloud Shadows runs normally",
+                enbVersion, enbConfig);
+        } else {
+            SPDLOG_WARN(
+                "[CloudShadows] ENB {} detected, but {} does not set [EFFECT] "
+                "EnableCloudShadows; Cloud Shadows runs. If ENB's own cloud shadows "
+                "are also visible, set EnableCloudShadows=false there.",
+                enbVersion, enbConfig);
+        }
     }
 
     auto messaging = runtime.Messaging();

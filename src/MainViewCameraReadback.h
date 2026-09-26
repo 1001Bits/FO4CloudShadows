@@ -11,14 +11,16 @@
 
 namespace FO4CS
 {
-    // Establish a world anchor from the exact b12 consumed by a validated
-    // main DFLight draw. GraphicsState::posAdjust can still describe a loading
-    // or secondary camera here. One asynchronous copy is needed per world;
-    // the owner stops calling this once its anchor is confirmed.
+    // Read the exact b12 camera consumed by a validated main DFLight draw.
+    // GraphicsState::posAdjust can still describe a loading or secondary
+    // camera here. The first completed copy establishes the world anchor;
+    // later copies, a few per second, drive travel re-anchoring.
     class MainViewCameraReadback
     {
     public:
         using Point = std::array<float, 3>;
+
+        [[nodiscard]] bool Pending() const noexcept { return pending_; }
 
         void Reset() noexcept
         {

@@ -58,19 +58,35 @@ namespace FO4CS::ManualFpsLog
         s_request.fetch_add(1, std::memory_order_release);
         s_armed.store(true, std::memory_order_release);
         CloudComparison::ArmMeasurements();
-        CloudComparison::SetStatus(fmt::format("{} | {} | settling 3s, then measuring 10s",
-            CloudComparison::MethodName(), enabled ? "ON" : "OFF"));
-        SPDLOG_INFO("[CloudShadows][FPS] method={} shadows {}; settling 3s, then logging "
+        CloudComparison::SetStatus(fmt::format("Shadows {} | settling 3s, then measuring 10s",
+            enabled ? "ON" : "OFF"));
+        SPDLOG_INFO("[CloudShadows][FPS] shadows {}; settling 3s, then logging "
                     "10s averages. Keep camera fixed and menus closed. "
                     "Application FPS includes frame caps and stalls; no GPU-cost inference.",
-            CloudComparison::MethodName(), enabled ? "ON" : "OFF");
+            enabled ? "ON" : "OFF");
         Flush();
     }
 
     void Stop() noexcept { s_armed.store(false, std::memory_order_release); }
 
+    void AfterPresentUnchecked(IDXGISwapChain* source, bool frameEnabled,
+        bool succeeded, bool maskValid, bool lightingApplied, bool vsync);
+
+    // Formatting allocates; a failure must never terminate the game from
+    // this noexcept Present callback.
     void AfterPresent(IDXGISwapChain* source, bool frameEnabled,
         bool succeeded, bool maskValid, bool lightingApplied, bool vsync) noexcept
+    {
+        try {
+            AfterPresentUnchecked(source, frameEnabled, succeeded, maskValid,
+                lightingApplied, vsync);
+        } catch (...) {
+            s_armed.store(false, std::memory_order_release);
+        }
+    }
+
+    void AfterPresentUnchecked(IDXGISwapChain* source, bool frameEnabled,
+        bool succeeded, bool maskValid, bool lightingApplied, bool vsync)
     {
         if (!s_armed.load(std::memory_order_acquire)) return;
         const auto request = s_request.load(std::memory_order_acquire);
@@ -110,26 +126,25 @@ namespace FO4CS::ManualFpsLog
                 (result.maskFrames == result.frames && result.lightingFrames == result.frames);
             const bool checked = result.counterMatches && result.clockMatches;
             const auto rays = GodraysIntegration::GetDiagnostics();
-            const auto rayVariants = CloudComparison::GetMethod() == CloudComparison::Method::SunMask
-                ? rays.authenticatedSunMaskVariants : rays.authenticatedDirectionalVariants;
+            const auto rayVariants = rays.authenticatedDirectionalVariants;
             const bool rayPathReady = !result.enabled || !rays.cloudOcclusionEnabled ||
                 (rays.renderVolumeHookInstalled && rays.nativeConsumerSupported && rayVariants == 3);
             const auto gpu = CloudComparison::GetTimings();
-            SPDLOG_INFO("[CloudShadows][FPS] method={} shadows={} avg={:.2f} FPS mean={:.3f} ms "
+            SPDLOG_INFO("[CloudShadows][FPS] shadows={} avg={:.2f} FPS mean={:.3f} ms "
                         "frames={} duration={:.3f}s max={:.3f} ms over50ms={} "
                         "maskFrames={} lightingFrames={} vsyncFrames={} request={} "
                         "dxgiPresents={} counterMatches={} clockMatches={} comparisonValid={} "
                         "gpuFrames={} gpuCaptureMs={:.4f} gpuProjectionMs={:.4f} "
                         "cpuCaptureAndPrepassMs={:.4f} captureDraws={:.2f} gpuDropped={} "
                         "godrayCloud={} godrayVariants={} godrayPathReady={}",
-                CloudComparison::MethodName(), result.enabled ? "ON" : "OFF", result.fps, result.meanFrameMs,
+                result.enabled ? "ON" : "OFF", result.fps, result.meanFrameMs,
                 result.frames, result.seconds, result.maxFrameMs, result.framesOver50Ms,
                 result.maskFrames, result.lightingFrames, result.vsyncFrames, request,
                 result.dxgiPresents, result.counterMatches, result.clockMatches, checked && working && rayPathReady,
                 gpu.frames, gpu.captureMs, gpu.projectionMs, gpu.cpuMs, gpu.draws, gpu.dropped,
                 rays.cloudOcclusionEnabled, rayVariants, rayPathReady);
-            CloudComparison::SetStatus(fmt::format("{} | {} | {:.1f} application FPS | {}{}{}",
-                CloudComparison::MethodName(), result.enabled ? "ON" : "OFF", result.fps,
+            CloudComparison::SetStatus(fmt::format("Shadows {} | {:.1f} application FPS | {}{}{}",
+                result.enabled ? "ON" : "OFF", result.fps,
                 checked ? "DXGI/clock checked" : "UNVERIFIED COUNTERS",
                 working ? "" : " | INVALID: cloud lighting missing",
                 rayPathReady ? "" : " | INVALID: enabled godray lookup unavailable"));
@@ -149,8 +164,8 @@ namespace FO4CS::ManualFpsLog
             if (now - lastStatus >= 0.25 &&
                 (!window.IsMeasuring() || window.RemainingSeconds(now) < 8.0)) {
                 lastStatus = now;
-                CloudComparison::SetStatus(fmt::format("{} | {} | {} {:.1f}s remaining",
-                    CloudComparison::MethodName(), frameEnabled ? "ON" : "OFF",
+                CloudComparison::SetStatus(fmt::format("Shadows {} | {} {:.1f}s remaining",
+                    frameEnabled ? "ON" : "OFF",
                     window.IsMeasuring() ? "measuring" : "settling", window.RemainingSeconds(now)));
             }
         }

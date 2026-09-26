@@ -6,6 +6,10 @@
 #include "McmSettings.h"
 #include "CloudComparison.h"
 #include "Overlay.h"
+#include "Utf8Path.h"
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+#include "ConstantBufferProbe.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -14,6 +18,7 @@
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <vector>
 
 #include <bcrypt.h>
@@ -91,14 +96,14 @@ namespace CloudShadows
                 relativePath.has_root_name() || relativePath.has_root_directory()) {
                 SPDLOG_ERROR(
                     "[CloudShadows] Refusing non-relative game asset path: {}",
-                    relativePath.string());
+                    FO4CS::Utf8Path(relativePath));
                 return false;
             }
             for (const auto& component : relativePath) {
                 if (component == L"..") {
                     SPDLOG_ERROR(
                         "[CloudShadows] Refusing traversing game asset path: {}",
-                        relativePath.string());
+                        FO4CS::Utf8Path(relativePath));
                     return false;
                 }
             }
@@ -111,7 +116,7 @@ namespace CloudShadows
                 SPDLOG_ERROR(
                     "[CloudShadows] GetModuleFileNameW failed or truncated "
                     "while resolving {} (error={})",
-                    relativePath.string(), GetLastError());
+                    FO4CS::Utf8Path(relativePath), GetLastError());
                 return false;
             }
             hostPath.resize(length);
@@ -127,11 +132,11 @@ namespace CloudShadows
         } catch (const std::exception& e) {
             SPDLOG_ERROR(
                 "[CloudShadows] Failed resolving game asset path {}: {}",
-                relativePath.string(), e.what());
+                FO4CS::Utf8Path(relativePath), e.what());
         } catch (...) {
             SPDLOG_ERROR(
                 "[CloudShadows] Failed resolving game asset path {}",
-                relativePath.string());
+                FO4CS::Utf8Path(relativePath));
         }
         destination.clear();
         return false;
@@ -151,7 +156,7 @@ namespace CloudShadows
                 SPDLOG_ERROR(
                     "[CloudShadows] Shader manifest hash is missing/malformed "
                     "for {}",
-                    relativePath.string());
+                    FO4CS::Utf8Path(relativePath));
                 return false;
             }
 
@@ -178,7 +183,7 @@ namespace CloudShadows
                     !hexNibble(expectedSha256[i * 2u + 1u], low)) {
                     SPDLOG_ERROR(
                         "[CloudShadows] Shader manifest hash is malformed for {}",
-                        relativePath.string());
+                        FO4CS::Utf8Path(relativePath));
                     return false;
                 }
                 expected[i] = static_cast<uint8_t>((high << 4u) | low);
@@ -188,7 +193,7 @@ namespace CloudShadows
             if (!file.is_open()) {
                 SPDLOG_ERROR(
                     "[CloudShadows] Shader asset missing/unreadable: {}",
-                    path.string());
+                    FO4CS::Utf8Path(path));
                 return false;
             }
             const auto end = file.tellg();
@@ -197,7 +202,7 @@ namespace CloudShadows
             if (byteCount <= 0 || byteCount > kMaximumShaderBytes) {
                 SPDLOG_ERROR(
                     "[CloudShadows] Shader asset has invalid size: {}",
-                    path.string());
+                    FO4CS::Utf8Path(path));
                 return false;
             }
             source.resize(static_cast<size_t>(byteCount));
@@ -207,7 +212,7 @@ namespace CloudShadows
                     static_cast<std::streamsize>(source.size())) {
                 SPDLOG_ERROR(
                     "[CloudShadows] Shader asset read was incomplete: {}",
-                    path.string());
+                    FO4CS::Utf8Path(path));
                 source.clear();
                 return false;
             }
@@ -245,7 +250,7 @@ namespace CloudShadows
                 SPDLOG_ERROR(
                     "[CloudShadows] SHA-256 provider returned an invalid "
                     "object/digest size for {}",
-                    path.string());
+                    FO4CS::Utf8Path(path));
                 source.clear();
                 return false;
             }
@@ -268,7 +273,7 @@ namespace CloudShadows
             if (status < 0) {
                 SPDLOG_ERROR(
                     "[CloudShadows] SHA-256 failed for {} (status=0x{:08X})",
-                    path.string(), static_cast<uint32_t>(status));
+                    FO4CS::Utf8Path(path), static_cast<uint32_t>(status));
                 source.clear();
                 return false;
             }
@@ -276,7 +281,7 @@ namespace CloudShadows
                 SPDLOG_ERROR(
                     "[CloudShadows] Shader asset hash mismatch; refusing stale "
                     "source: {}",
-                    path.string());
+                    FO4CS::Utf8Path(path));
                 source.clear();
                 return false;
             }
@@ -284,11 +289,11 @@ namespace CloudShadows
         } catch (const std::exception& e) {
             SPDLOG_ERROR(
                 "[CloudShadows] Shader authentication failed for {}: {}",
-                relativePath.string(), e.what());
+                FO4CS::Utf8Path(relativePath), e.what());
         } catch (...) {
             SPDLOG_ERROR(
                 "[CloudShadows] Shader authentication failed for {}",
-                relativePath.string());
+                FO4CS::Utf8Path(relativePath));
         }
         source.clear();
         return false;
@@ -314,9 +319,12 @@ namespace CloudShadows
         // RendererData; hard-coding the usually observed physical slots is not
         // valid when the manager repoints targets. DrawWorld::DeferredLightsImpl
         // binds logical RT33 at OM0, optionally RT34 at OM1, and logical depth 1.
+        constexpr uint32_t kMainLogicalRenderTarget = 1;
+        constexpr uint32_t kMainTempLogicalRenderTarget = 2;
+        // Physical slots usually observed for kMain/kMainTemp. Used only when
+        // the manager's logical map cannot be read.
         constexpr uint32_t kMainRenderTargetPhysicalIndex = 3;
         constexpr uint32_t kMainTempRenderTargetPhysicalIndex = 4;
-        constexpr uint32_t kMainDepthStencilLogicalIndex = 1;
         // RenderTargetManager logical->physical maps. Verified in the Ghidra
         // Combined project: 1.11.240 widened the 12-entry per-depth-target
         // record array at +0xC80 from 0x18 to 0x1C bytes (+0x30 total), which
@@ -334,12 +342,38 @@ namespace CloudShadows
             return FO4CS::RuntimeAPI::GetSingleton().Target() ==
                 FO4CS::F4SECompat::RuntimeTarget::kVR;
         }
+        // Logical deferred-light targets and the matching main depth. Flat
+        // DeferredLightsImpl binds 33/34 with depth 1. VR's DrawWorld passes
+        // branch on the byte at Renderer+4 (Combined Ghidra project, VR
+        // DeferredLightsImpl 0x1427FF8B0 via FUN_141D947D0): clear selects
+        // 36/37 with depth 1, set selects 106/107 with depth 12. Either set
+        // is accepted, but the targets and depth must come from the same one.
+        struct DeferredTargetSet
+        {
+            uint32_t accumulation0;
+            uint32_t accumulation1;
+            uint32_t depth;
+        };
+        constexpr DeferredTargetSet kFlatDeferredTargets{ 33, 34, 1 };
+        constexpr std::array<DeferredTargetSet, 2> kVRDeferredTargets{{
+            { 36, 37, 1 }, { 106, 107, 12 }
+        }};
+
+        [[nodiscard]] uint32_t DeferredTargetSetCount() noexcept
+        {
+            return IsVRRuntime() ? static_cast<uint32_t>(kVRDeferredTargets.size()) : 1u;
+        }
+
+        [[nodiscard]] const DeferredTargetSet& DeferredTargets(uint32_t set) noexcept
+        {
+            return IsVRRuntime() ? kVRDeferredTargets[set < kVRDeferredTargets.size() ? set : 0]
+                                 : kFlatDeferredTargets;
+        }
+
         [[nodiscard]] uint32_t DeferredLightingTargetLogicalIndex(uint32_t slot) noexcept
         {
-            // VR's diffuse/specular logical IDs are 36/37. The authenticated
-            // main sunlight draw resolves these to the live RT110/RT111 in
-            // the reviewed VR capture; their physical slots remain dynamic.
-            return (IsVRRuntime() ? 36u : 33u) + slot;
+            const auto& targets = DeferredTargets(0);
+            return slot == 0 ? targets.accumulation0 : targets.accumulation1;
         }
         [[nodiscard]] bool IsAERuntime() noexcept
         {
@@ -589,6 +623,27 @@ namespace CloudShadows
             return physicalIndex < FO4CS::EngineAPI::PhysicalRenderTargetCount();
         }
 
+        uint32_t ResolveLogicalRenderTargetOr(
+            uint32_t logicalIndex,
+            uint32_t fallbackPhysicalIndex) noexcept
+        {
+            uint32_t physicalIndex = 0;
+            return ResolveLogicalRenderTarget(logicalIndex, physicalIndex) ?
+                physicalIndex : fallbackPhysicalIndex;
+        }
+
+        uint32_t MainRenderTargetPhysicalIndex() noexcept
+        {
+            return ResolveLogicalRenderTargetOr(
+                kMainLogicalRenderTarget, kMainRenderTargetPhysicalIndex);
+        }
+
+        uint32_t MainTempRenderTargetPhysicalIndex() noexcept
+        {
+            return ResolveLogicalRenderTargetOr(
+                kMainTempLogicalRenderTarget, kMainTempRenderTargetPhysicalIndex);
+        }
+
         bool ResolveLogicalDepthStencilTarget(
             uint32_t logicalIndex,
             uint32_t& physicalIndex) noexcept
@@ -670,7 +725,8 @@ namespace CloudShadows
         }
 
         bool IsMainDepthShaderResourceView(
-            ID3D11ShaderResourceView* view) noexcept
+            ID3D11ShaderResourceView* view,
+            uint32_t logicalDepthIndex) noexcept
         {
             if (!view)
                 return false;
@@ -679,7 +735,7 @@ namespace CloudShadows
                 return false;
             uint32_t physicalDepthStencilTargetIndex = 0;
             if (!ResolveLogicalDepthStencilTarget(
-                    kMainDepthStencilLogicalIndex,
+                    logicalDepthIndex,
                     physicalDepthStencilTargetIndex)) {
                 return false;
             }
@@ -713,7 +769,8 @@ namespace CloudShadows
 
         void LogMainDepthRejection(
             ID3D11ShaderResourceView* boundDepth,
-            const D3D11_VIEWPORT& viewport) noexcept
+            const D3D11_VIEWPORT& viewport,
+            uint32_t logicalDepthIndex) noexcept
         {
             static std::atomic<uint32_t> rejectionCount{ 0 };
             const uint32_t ordinal = rejectionCount.fetch_add(
@@ -725,7 +782,7 @@ namespace CloudShadows
             uint32_t expectedDepthPhysicalIndex = 0;
             if (auto* rendererData = GetRendererData()) {
                 if (ResolveLogicalDepthStencilTarget(
-                        kMainDepthStencilLogicalIndex,
+                        logicalDepthIndex,
                         expectedDepthPhysicalIndex)) {
                     const auto* target = rendererData->DepthTargetAt(expectedDepthPhysicalIndex);
                     expectedDepth = target ? target->DepthShaderResourceView() : nullptr;
@@ -739,7 +796,7 @@ namespace CloudShadows
                 "slice={}/{} expectedDepthPhysical={} SRV={} res={} {}x{} fmt={} "
                 "dim={} mip={} levels={} slice={}/{} "
                 "viewport={:.1f},{:.1f} {:.1f}x{:.1f}",
-                ordinal, IsMainDepthShaderResourceView(boundDepth),
+                ordinal, IsMainDepthShaderResourceView(boundDepth, logicalDepthIndex),
                 bound.view, bound.resource, bound.width, bound.height,
                 bound.format, bound.dimension, bound.mostDetailedMip,
                 bound.mipLevels, bound.firstSlice, bound.arraySize,
@@ -756,33 +813,42 @@ namespace CloudShadows
     bool IsMainRenderTargetView(ID3D11RenderTargetView* view) noexcept
     {
         return IsRendererPhysicalRenderTargetView(
-            view, kMainRenderTargetPhysicalIndex);
+            view, MainRenderTargetPhysicalIndex());
     }
 
+    // DrawWorld::DeferredComposite (1.10.163 0x142855E60) leaves the lit
+    // scene, and the forward pass that draws the Sky after it, on logical
+    // kMainTemp when screen-space reflections or subsurface scattering are on
+    // and on logical kMain when both are off. Either is the player's view.
     bool IsMainSkyRenderTargetView(ID3D11RenderTargetView* view) noexcept
     {
         return IsRendererPhysicalRenderTargetView(
-            view, kMainTempRenderTargetPhysicalIndex);
+                   view, MainTempRenderTargetPhysicalIndex()) ||
+            IsMainRenderTargetView(view);
     }
 
     namespace
     {
-        bool IsMainDeferredLightingTargetSet(
+        // Returns the matched logical set, or DeferredTargetSetCount() when
+        // the bound targets are not the main deferred-light accumulation.
+        uint32_t MatchMainDeferredLightingTargetSet(
             ID3D11RenderTargetView* accumulation0,
             ID3D11RenderTargetView* accumulation1,
             UINT renderTargetCount) noexcept
         {
-            if (!IsRendererLogicalRenderTargetView(
-                    accumulation0,
-                    DeferredLightingTargetLogicalIndex(0))) {
-                return false;
+            const uint32_t sets = DeferredTargetSetCount();
+            for (uint32_t set = 0; set < sets; ++set) {
+                const auto& targets = DeferredTargets(set);
+                if (!IsRendererLogicalRenderTargetView(
+                        accumulation0, targets.accumulation0))
+                    continue;
+                if (renderTargetCount == 1)
+                    return accumulation1 == nullptr ? set : sets;
+                return renderTargetCount == 2 &&
+                    IsRendererLogicalRenderTargetView(
+                        accumulation1, targets.accumulation1) ? set : sets;
             }
-            if (renderTargetCount == 1)
-                return accumulation1 == nullptr;
-            return renderTargetCount == 2 &&
-                IsRendererLogicalRenderTargetView(
-                    accumulation1,
-                    DeferredLightingTargetLogicalIndex(1));
+            return sets;
         }
     }
 
@@ -803,11 +869,11 @@ namespace CloudShadows
         ID3D11RenderTargetView* mainView = nullptr;
         ID3D11Texture2D* mainTexture = nullptr;
         if (auto* rendererData = GetRendererData()) {
-            if (const auto* skyTarget = rendererData->RenderTargetAt(kMainTempRenderTargetPhysicalIndex)) {
+            if (const auto* skyTarget = rendererData->RenderTargetAt(MainTempRenderTargetPhysicalIndex())) {
                 skyView = skyTarget->TargetView();
                 skyTexture = skyTarget->Texture();
             }
-            if (const auto* mainTarget = rendererData->RenderTargetAt(kMainRenderTargetPhysicalIndex)) {
+            if (const auto* mainTarget = rendererData->RenderTargetAt(MainRenderTargetPhysicalIndex())) {
                 mainView = mainTarget->TargetView();
                 mainTexture = mainTarget->Texture();
             }
@@ -923,7 +989,7 @@ namespace CloudShadows
     {
         width = height = 0;
         if (auto* rd = GetRendererData()) {
-            const auto* target = rd->RenderTargetAt(kMainRenderTargetPhysicalIndex);
+            const auto* target = rd->RenderTargetAt(MainRenderTargetPhysicalIndex());
             auto* texture = target ? target->Texture() : nullptr;
             if (texture) {
                 D3D11_TEXTURE2D_DESC desc{};
@@ -1229,8 +1295,10 @@ namespace CloudShadows
             bool pending{ false };
         };
 
-        ScreenMaskEvidenceState s_screenMaskEvidence;
-        ComPtr<ID3D11Device> s_maskFormatDevice;
+        // Never destroyed: releasing D3D objects from a DLL static destructor
+        // would run under the loader lock at process exit.
+        ScreenMaskEvidenceState& s_screenMaskEvidence = *new ScreenMaskEvidenceState();
+        ComPtr<ID3D11Device>& s_maskFormatDevice = *new ComPtr<ID3D11Device>();
         DXGI_FORMAT s_maskFormat = DXGI_FORMAT_UNKNOWN;
 
         constexpr uint32_t kCloudTelemetryRecordCount = 8;
@@ -1250,7 +1318,7 @@ namespace CloudShadows
             bool pending{ false };
         };
 
-        CloudTelemetryReadbackState s_cloudTelemetry;
+        CloudTelemetryReadbackState& s_cloudTelemetry = *new CloudTelemetryReadbackState();
 
         void ResetScreenMaskEvidence() noexcept
         {
@@ -2025,7 +2093,10 @@ namespace CloudShadows
 		value.SunFadeEnd = 0.0f;
 		value.MaxLayers = std::clamp(finiteOr(value.MaxLayers, 16.0f), 1.0f,
 			static_cast<float>(kMaxWorldCloudLayers));
-		value.DebugMode = FO4CS::BuildFeatures::kDeveloperTools
+		// Debug views are a developer feature: always available in developer
+		// builds, and in release builds only while the Development Menu is on.
+		value.DebugMode = FO4CS::BuildFeatures::kDeveloperTools ||
+                g_hotkeysEnabled.load(std::memory_order_acquire)
             ? std::clamp(finiteOr(value.DebugMode, 0.0f), 0.0f, 4.0f) : 0.0f;
 	}
 
@@ -2046,7 +2117,7 @@ namespace CloudShadows
             const auto writeTime = fs::last_write_time(path);
             std::ifstream file(path);
             if (!file.is_open()) {
-                SPDLOG_WARN("[CloudShadows] Cannot open settings: {}", path.string());
+                SPDLOG_WARN("[CloudShadows] Cannot open settings: {}", FO4CS::Utf8Path(path));
                 return false;
             }
 
@@ -2085,16 +2156,11 @@ namespace CloudShadows
             }
             read("Opacity", next.Opacity);
             read("CloudHeight", next.CloudHeight);
+            // Parse every value before applying any: a later malformed key
+            // must not leave the hotkeys half-applied.
+            std::optional<bool> hotkeys;
             if (j.contains("Hotkeys"))
-                g_hotkeysEnabled.store(j.at("Hotkeys").get<bool>(), std::memory_order_release);
-            if (j.contains("CaptureMethod")) {
-                const auto method = j.at("CaptureMethod").get<int>();
-                if (method != 0 && method != 1)
-                    throw std::runtime_error("CaptureMethod must be 0 (cubemap) or 1 (sun 2D)");
-                FO4CS::CloudComparison::SetMethod(method == 1
-                    ? FO4CS::CloudComparison::Method::SunMask
-                    : FO4CS::CloudComparison::Method::Cubemap);
-            }
+                hotkeys = j.at("Hotkeys").get<bool>();
             read("LayerHeightStep", next.LayerHeightStep);
             read("WorldTileSize", next.WorldTileSize);
             read("LayerScaleMultiplier", next.LayerScaleMultiplier);
@@ -2109,6 +2175,8 @@ namespace CloudShadows
             next.DebugMode = 0.0f;
             read("MaxLayers", next.MaxLayers);
             ValidateSettings(next);
+            if (hotkeys)
+                g_hotkeysEnabled.store(*hotkeys, std::memory_order_release);
             g_settings = next;
             if (g_shadowsEnabled.exchange(enabled, std::memory_order_acq_rel) != enabled)
                 InvalidateWorldCloudCaptureForToggle();
@@ -2176,8 +2244,6 @@ namespace CloudShadows
             FO4CS::GodraysIntegration::IsCloudOcclusionEnabled();
         j["Opacity"] = g_settings.Opacity;
         j["CloudHeight"] = g_settings.CloudHeight;
-        j["CaptureMethod"] = FO4CS::CloudComparison::GetMethod() ==
-            FO4CS::CloudComparison::Method::SunMask ? 1 : 0;
         j["Hotkeys"] = g_hotkeysEnabled.load(std::memory_order_relaxed);
 
         try {
@@ -2213,18 +2279,42 @@ namespace CloudShadows
 
         const auto shaderRelativePath = fs::path("Data") / "Shaders" /
             "CloudShadows" / "FO4CloudShadowScreenCS.hlsl";
+        // A deterministic failure (missing/stale asset, compiler error) is
+        // remembered for this device and asset stamp. Initialization retries
+        // then cost one stat instead of a re-read, re-hash and O3 compile on
+        // the render thread; replacing the file or the device retries.
+        struct CompileFailure
+        {
+            ID3D11Device* device{};
+            fs::file_time_type writeTime{};
+            std::uintmax_t size{};
+            bool valid{};
+        };
+        static CompileFailure s_failure;
+        fs::path shaderPath;
+        if (!ResolveGameRelativePath(shaderRelativePath, shaderPath))
+            return;
+        std::error_code statError;
+        const auto writeTime = fs::last_write_time(shaderPath, statError);
+        const auto size = statError ? 0 : fs::file_size(shaderPath, statError);
+        if (s_failure.valid && s_failure.device == device &&
+            s_failure.writeTime == writeTime && s_failure.size == size)
+            return;
+        const auto rememberFailure = [&]() noexcept {
+            s_failure = { device, writeTime, size, true };
+        };
         std::string src;
         if (!ReadAuthenticatedShaderSource(
                 shaderRelativePath, FO4CS_SCREEN_SHADER_SHA256, src)) {
             SPDLOG_ERROR(
                 "[CloudShadows] Compute shader unavailable because its "
                 "runtime source is not the build-authenticated asset");
+            rememberFailure();
             return;
         }
-        fs::path shaderPath;
-        if (!ResolveGameRelativePath(shaderRelativePath, shaderPath))
-            return;
-        const auto sourceName = shaderPath.string();
+        // The compiler's source name is diagnostic only; the relative ASCII
+        // path never goes through the ANSI code page.
+        const auto sourceName = shaderRelativePath.generic_string();
         const UINT flags = D3DCOMPILE_ENABLE_STRICTNESS |
             D3DCOMPILE_WARNINGS_ARE_ERRORS | D3DCOMPILE_OPTIMIZATION_LEVEL3;
         const bool vrTarget =
@@ -2271,8 +2361,10 @@ namespace CloudShadows
         if (!compileEntry("mainProduction", productionCandidate) ||
             !compileEntry("main", diagnosticCandidate) ||
             !FO4CS::CloudComparison::CompileShaders(device, src, sourceName, vrTarget)) {
+            rememberFailure();
             return;
         }
+        s_failure = {};
 
         if (g_cloudShadowProductionCS)
             g_cloudShadowProductionCS->Release();
@@ -2324,6 +2416,27 @@ namespace CloudShadows
                 return true;
             }
         }
+        // A failed allocation (for example video-memory exhaustion) is not
+        // retried on every sunlight draw: back off per requested extent.
+        static uint32_t failedWidth = 0, failedHeight = 0, failures = 0;
+        static ULONGLONG retryAfter = 0;
+        if (failures != 0 && failedWidth == width && failedHeight == height &&
+            GetTickCount64() < retryAfter)
+            return false;
+        const auto fail = [&]() {
+            if (failedWidth != width || failedHeight != height)
+                failures = 0;
+            failedWidth = width;
+            failedHeight = height;
+            ++failures;
+            retryAfter = GetTickCount64() +
+                (std::min)(60000ull, 1000ull << (std::min)(failures, 6u));
+            if (failures == 1 || (failures & (failures - 1)) == 0) {
+                SPDLOG_ERROR("[CloudShadows] Failed to create the {}x{} screen mask "
+                    "(attempt {}); retrying with backoff", width, height, failures);
+            }
+            return false;
+        };
 
         D3D11_TEXTURE2D_DESC texDesc = {};
         texDesc.Width = width;
@@ -2340,7 +2453,7 @@ namespace CloudShadows
         ComPtr<ID3D11UnorderedAccessView> newUAV;
         HRESULT hr = device->CreateTexture2D(&texDesc, nullptr, newTexture.GetAddressOf());
         if (FAILED(hr))
-            return false;
+            return fail();
 
         D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
         srvDesc.Format = texDesc.Format;
@@ -2350,7 +2463,7 @@ namespace CloudShadows
 
         hr = device->CreateShaderResourceView(newTexture.Get(), &srvDesc, newSRV.GetAddressOf());
         if (FAILED(hr))
-            return false;
+            return fail();
 
         D3D11_UNORDERED_ACCESS_VIEW_DESC uavDesc = {};
         uavDesc.Format = texDesc.Format;
@@ -2359,7 +2472,8 @@ namespace CloudShadows
 
         hr = device->CreateUnorderedAccessView(newTexture.Get(), &uavDesc, newUAV.GetAddressOf());
         if (FAILED(hr))
-            return false;
+            return fail();
+        failures = 0;
 
         const float clearVal[4] = { 1.0f, 1.0f, 1.0f, 1.0f };
         context->ClearUnorderedAccessViewFloat(newUAV.Get(), clearVal);
@@ -2447,7 +2561,7 @@ namespace CloudShadows
 
     void ReleaseDeviceResources() noexcept
     {
-        g_initialized = false;
+        g_initialized.store(false, std::memory_order_release);
         ResetInitializationRetryState();
         InvalidateShadowMaskState();
         ResetScreenMaskEvidence();
@@ -2490,8 +2604,53 @@ namespace CloudShadows
         // reads b12 through c60, b2 through c45, and b8 c0 for per-eye inverse
         // reprojection, absolute eye origins, sun direction, depth scaling,
         // and the exact side-by-side NDC transform.
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+        // Draw-local camera diagnostics for view rotation, shake and upscaling.
+        // Asynchronous samples distinguish a moving capture from an incorrect
+        // receiver transform without waiting on the rendering thread.
+        void LogViewDiagnostics(ID3D11DeviceContext* context,
+            ID3D11Buffer* perFrame, UINT perFrameFirst,
+            ID3D11Buffer* perCall, UINT perCallFirst, bool vr) noexcept
+        {
+            try {
+                static auto& frameProbe = *new FO4CS::ConstantBufferProbe();
+                static auto& callProbe = *new FO4CS::ConstantBufferProbe();
+                FO4CS::ConstantBufferProbe::Sample sample;
+                const bool sampled = vr
+                    ? frameProbe.Poll(context, perFrame, perFrameFirst,
+                        { 12, 13, 14, 15, 32, 33, 34, 35, 59, 60 }, sample)
+                    : frameProbe.Poll(context, perFrame, perFrameFirst,
+                        { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
+                          12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+                          24, 25, 26, 27, 35, 36, 37, 38, 39, 40 }, sample);
+                if (sampled) {
+                    SPDLOG_INFO("[CloudShadows][ViewDiag] DFLight b12{}",
+                        FO4CS::ConstantBufferProbe::Describe(sample));
+                    XMFLOAT3 sun{};
+                    const bool sunValid = FO4CS::EngineAPI::ReadVisibleSunDirection(
+                        FO4CS::EngineAPI::GetSky(), sun);
+                    XMFLOAT3 origin{};
+                    const bool originValid = GetCommittedWorldCloudOrigin(origin);
+                    SPDLOG_INFO("[CloudShadows][ViewDiag] visibleSun valid={} ({:.4f},{:.4f},{:.4f}) "
+                        "fieldOrigin valid={} ({:.1f},{:.1f},{:.1f})",
+                        sunValid, sun.x, sun.y, sun.z,
+                        originValid, origin.x, origin.y, origin.z);
+                }
+                if (callProbe.Poll(context, perCall, perCallFirst, { 0, 1, 2, 45 }, sample)) {
+                    SPDLOG_INFO("[CloudShadows][ViewDiag] DFLight b2{}",
+                        FO4CS::ConstantBufferProbe::Describe(sample));
+                }
+            } catch (...) {
+            }
+        }
+#endif
+
         constexpr UINT kEnginePerFrameRegisterCountFlat = 36;
-        constexpr UINT kEnginePerCallRegisterCountFlat = 28;
+        // OG 1.10.163 DFLight reads b2 through c27 (dynamic-resolution depth
+        // scale). 1.11.240's DFLight binds 25 registers and never reads c27,
+        // whose contents there are whatever another technique left behind.
+        constexpr UINT kEnginePerCallRegisterCountLegacy = 28;
+        constexpr UINT kEnginePerCallRegisterCountAE = 25;
         constexpr UINT kEnginePerFrameRegisterCountVR = 61;
         constexpr UINT kEnginePerCallRegisterCountVR = 46;
         constexpr UINT kEngineStereoRegisterCountVR = 1;
@@ -2506,10 +2665,14 @@ namespace CloudShadows
 
         UINT RequiredEnginePerCallRegisterCount() noexcept
         {
-            return FO4CS::RuntimeAPI::GetSingleton().Target() ==
-                    FO4CS::F4SECompat::RuntimeTarget::kVR
-                ? kEnginePerCallRegisterCountVR
-                : kEnginePerCallRegisterCountFlat;
+            switch (FO4CS::RuntimeAPI::GetSingleton().Target()) {
+            case FO4CS::F4SECompat::RuntimeTarget::kVR:
+                return kEnginePerCallRegisterCountVR;
+            case FO4CS::F4SECompat::RuntimeTarget::kAE:
+                return kEnginePerCallRegisterCountAE;
+            default:
+                return kEnginePerCallRegisterCountLegacy;
+            }
         }
 
         enum class PrepassRejectReason : uint32_t
@@ -2595,6 +2758,10 @@ namespace CloudShadows
             return true;
         }
 
+        // Set while the player is outside an exterior cell, so leaving the
+        // exterior requests one world reset rather than one per call.
+        std::atomic<bool> s_nonExteriorResetRequested{ false };
+
         // Keep structured exception handling in a small POD-only function.
         // The renderer singletons can be transient while a save is loading;
         // an invalid engine pointer must make this frame neutral, never crash.
@@ -2612,9 +2779,12 @@ namespace CloudShadows
                 auto* player = FO4CS::EngineAPI::GetPlayerCharacter();
                 auto* cell = player ? player->parentCell : nullptr;
                 if (!FO4CS::EngineAPI::IsExteriorCell(cell)) {
-                    RequestWorldCloudReset();
+                    if (!s_nonExteriorResetRequested.exchange(
+                            true, std::memory_order_acq_rel))
+                        RequestWorldCloudReset();
                     return false;
                 }
+                s_nonExteriorResetRequested.store(false, std::memory_order_release);
                 if (!sky || !camera || !graphicsState ||
                     FO4CS::EngineAPI::ReadSkyMode(sky) !=
                         FO4CS::EngineAPI::SkyMode::kFull) {
@@ -2977,6 +3147,22 @@ namespace CloudShadows
         return true;
     }
 
+    namespace
+    {
+        std::atomic<ULONGLONG> s_singleCloudLockDue{ 0 };
+    }
+
+    void RequestSingleCloudLock(uint32_t delayMilliseconds) noexcept
+    {
+        s_singleCloudLockDue.store(
+            GetTickCount64() + delayMilliseconds, std::memory_order_release);
+    }
+
+    void CancelSingleCloudLock() noexcept
+    {
+        s_singleCloudLockDue.store(0, std::memory_order_release);
+    }
+
     void PollShadowToggle() noexcept
     {
         static auto nextSettingsPoll = std::chrono::steady_clock::now() +
@@ -2990,7 +3176,31 @@ namespace CloudShadows
         // the disabled, near-zero-overhead pass-through path. Present is the
         // authoritative once-per-frame boundary and does not depend on Prepass.
         static SHORT previousF10 = 0;
-        if (!g_hotkeysEnabled.load(std::memory_order_relaxed)) {
+        static bool previousHotkeys = false;
+        const bool hotkeys = g_hotkeysEnabled.load(std::memory_order_relaxed);
+        if (hotkeys != previousHotkeys) {
+            previousHotkeys = hotkeys;
+            if (hotkeys) {
+                // Prime the edge detector: a key held while the switch was
+                // off (whose bits were never read) must not toggle shadows.
+                previousF10 = GetAsyncKeyState(VK_F10);
+            } else {
+                // The Development Menu owns F7/F8/F11. Turning it off must not
+                // leave its sky preview, HUD or measurements running unreachable.
+                FO4CS::CloudComparison::StopMeasurements();
+                Overlay::CloseForDisabledHotkeys();
+                CancelSingleCloudLock();
+                g_settings.DebugMode = 0.0f;
+                g_singleCloudIsolationEnabled.store(false, std::memory_order_release);
+            }
+        }
+        if (const ULONGLONG lockDue = s_singleCloudLockDue.load(std::memory_order_acquire);
+            lockDue != 0 && GetTickCount64() >= lockDue) {
+            CancelSingleCloudLock();
+            if (hotkeys)
+                (void)LockSingleCloudToCurrentView();
+        }
+        if (!hotkeys) {
             previousF10 = 0;
             return;
         }
@@ -3006,12 +3216,14 @@ namespace CloudShadows
             return;
         }
 
+        // Only the physical up->down edge toggles. The "pressed since last
+        // call" bit also reports keyboard auto-repeat and presses seen by
+        // other GetAsyncKeyState callers, which toggled shadows repeatedly.
         const SHORT currentF10 = GetAsyncKeyState(VK_F10);
-        const bool pressedSinceLastPoll = (currentF10 & 0x0001) != 0;
         const bool downEdge = (currentF10 & 0x8000) != 0 &&
             (previousF10 & 0x8000) == 0;
         previousF10 = currentF10;
-        if (!pressedSinceLastPoll && !downEdge)
+        if (!downEdge)
             return;
 
         const bool enabled =
@@ -3051,6 +3263,11 @@ namespace CloudShadows
         if (!TryReadExteriorFrame(viewToWorld, cameraPosition)) {
             return RejectPrepass(PrepassRejectReason::kExteriorFrame);
         }
+        // Night, zero opacity or no lighting patch: the mask would be
+        // exactly neutral, so skip the full-resolution dispatch. This is the
+        // expected state for half of all game time and is not logged.
+        if (!CloudShadowsCanBeVisible())
+            return false;
 
         FO4CS::CloudComparison::GpuScope projectionTiming(context,
             FO4CS::CloudComparison::Work::Projection);
@@ -3062,10 +3279,11 @@ namespace CloudShadows
         uint32_t outputHeight = 0;
         uint32_t accumulation1Width = 0;
         uint32_t accumulation1Height = 0;
-        if ((renderTargetCount != 1 && renderTargetCount != 2) ||
-            !IsMainDeferredLightingTargetSet(
-                accumulationTarget0, accumulationTarget1,
-                renderTargetCount) ||
+        const uint32_t targetSet = (renderTargetCount == 1 || renderTargetCount == 2)
+            ? MatchMainDeferredLightingTargetSet(
+                accumulationTarget0, accumulationTarget1, renderTargetCount)
+            : DeferredTargetSetCount();
+        if (targetSet >= DeferredTargetSetCount() ||
             !GetRTVExtent(
                 accumulationTarget0, outputWidth, outputHeight) ||
             (renderTargetCount == 2 &&
@@ -3134,8 +3352,9 @@ namespace CloudShadows
         context->PSGetShaderResources(3, 1, depthSRV.GetAddressOf());
         uint32_t depthWidth = 0;
         uint32_t depthHeight = 0;
+        const uint32_t depthLogicalIndex = DeferredTargets(targetSet).depth;
         const bool exactMainDepth =
-            IsMainDepthShaderResourceView(depthSRV.Get());
+            IsMainDepthShaderResourceView(depthSRV.Get(), depthLogicalIndex);
         const bool hasDepthExtent =
             GetDepthExtent(depthSRV.Get(), depthWidth, depthHeight);
         const bool validStereoDepthExtent =
@@ -3145,7 +3364,7 @@ namespace CloudShadows
             !validStereoDepthExtent ||
             viewports[0].TopLeftX + viewports[0].Width > static_cast<float>(depthWidth) + 0.5f ||
             viewports[0].TopLeftY + viewports[0].Height > static_cast<float>(depthHeight) + 0.5f) {
-            LogMainDepthRejection(depthSRV.Get(), viewports[0]);
+            LogMainDepthRejection(depthSRV.Get(), viewports[0], depthLogicalIndex);
             return RejectPrepass(PrepassRejectReason::kDepth);
         }
 
@@ -3217,6 +3436,11 @@ namespace CloudShadows
         if (!ConfirmWorldCloudOrigin(context, enginePerFrame.Get(),
                 enginePerFrameFirstConstant, stereoRuntime))
             return RejectPrepass(PrepassRejectReason::kCommittedField);
+#if FO4CS_ENABLE_DEVELOPER_TOOLS
+        LogViewDiagnostics(context, enginePerFrame.Get(),
+            enginePerFrameFirstConstant, enginePerCall.Get(),
+            enginePerCallFirstConstant, stereoRuntime);
+#endif
         std::array<WorldCloudLayerState, kMaxWorldCloudLayers> layers{};
         const uint32_t layerCount = CopyCommittedWorldCloudLayers(
             layers.data(), static_cast<uint32_t>(layers.size()));
@@ -3248,16 +3472,24 @@ namespace CloudShadows
             1.0f / static_cast<float>(outputWidth),
             1.0f / static_cast<float>(outputHeight)
         };
-        constants.OutputPixelToDepthUV = {
-            1.0f / static_cast<float>(depthWidth),
-            1.0f / static_cast<float>(depthHeight), 0.0f, 0.0f
+        // OG DFLight uses c0.xy for NDC and c27 to scale its depth fetch.
+        // AE uses c0.zw for NDC and has no c27; select the complete layout.
+        const bool legacyDepthLayout =
+            FO4CS::RuntimeAPI::GetSingleton().Target() ==
+            FO4CS::F4SECompat::RuntimeTarget::kLegacy;
+        // All runtimes retain the field's world origin. Only VR crossfades
+        // travel re-anchors; flat retains its confirmed gameplay origin.
+        XMFLOAT3 previousFieldOrigin{};
+        float previousFieldWeight = 0.0f;
+        if (FO4CS::RuntimeAPI::GetSingleton().Target() ==
+                FO4CS::F4SECompat::RuntimeTarget::kVR)
+            (void)GetWorldCloudCrossfade(previousFieldOrigin, previousFieldWeight);
+        constants.ProjectionParams = {
+            legacyDepthLayout ? 1.0f : 0.0f, previousFieldWeight, 0.0f, 0.0f
         };
-        const auto& viewport = viewports[0];
-        constants.OutputPixelToNDC = {
-            2.0f / viewport.Width,
-            -2.0f / viewport.Height,
-            -1.0f - (2.0f * viewport.TopLeftX / viewport.Width),
-            1.0f + (2.0f * viewport.TopLeftY / viewport.Height)
+        constants.PreviousFieldOrigin = {
+            previousFieldOrigin.x, previousFieldOrigin.y, previousFieldOrigin.z,
+            previousFieldWeight > 0.0f ? 1.0f : 0.0f
         };
         // Isolation is a capture-analysis diagnostic, never a production
         // coverage filter. Debug Off must always include every visible cloud.
@@ -3323,12 +3555,6 @@ namespace CloudShadows
         ID3D11ComputeShader* dispatchShader = useDiagnosticShader
             ? g_cloudShadowCS
             : g_cloudShadowProductionCS;
-        if (FO4CS::CloudComparison::EffectiveMethod() == FO4CS::CloudComparison::Method::SunMask) {
-            if (!GetCommittedSunMaskProjection(constants.SunProjection))
-                return RejectPrepass(PrepassRejectReason::kCommittedField);
-            dispatchShader = FO4CS::CloudComparison::SunShader(useDiagnosticShader);
-            if (!dispatchShader) return RejectPrepass(PrepassRejectReason::kResources);
-        }
         constants.ShadowParams = {
             g_settings.Opacity, 1.0f,
             screenMaskEvidenceRequestId != 0 ? 1.0f : 0.0f,
@@ -3357,10 +3583,8 @@ namespace CloudShadows
 			const auto& layer = layers[i];
 			if (layer.SliceIndex >= kMaxWorldCloudLayers)
 				continue;
-			const float shellHeight = constants.SunProjection.centerAndValid.w == 1.0f
-                ? constants.SunProjection.upAndHeight.w : g_settings.CloudHeight;
 			constants.LayerGeometry[i] = {
-				shellHeight, planetRadiusWorld,
+				g_settings.CloudHeight, planetRadiusWorld,
 				g_settings.WorldTileSize,
 				static_cast<float>(layer.SliceIndex)
 			};
@@ -3443,22 +3667,26 @@ namespace CloudShadows
             UINT engineConstantBufferCount{ 0 };
             bool hasConstantBufferRanges{ false };
         };
+        // Two verified keys per variant: the double-buffered committed field
+        // alternates between two SRVs, which previously forced a full
+        // readback verification on every sunlight draw.
+        constexpr uint32_t kKeysPerVariant = 2;
         thread_local uint64_t verifiedResourceGeneration = 0;
-        thread_local uint8_t verifiedBindingVariants = 0;
-        thread_local std::array<BindingVerificationKey, 8>
+        thread_local std::array<uint8_t, 8> verifiedKeyCount{};
+        thread_local std::array<uint8_t, 8> nextVerifiedKey{};
+        thread_local std::array<std::array<BindingVerificationKey, kKeysPerVariant>, 8>
             verifiedBindingKeys{};
         const uint64_t resourceGeneration =
             s_prepassBindingResourceGeneration.load(std::memory_order_acquire);
         if (verifiedResourceGeneration != resourceGeneration) {
             verifiedResourceGeneration = resourceGeneration;
-            verifiedBindingVariants = 0;
+            verifiedKeyCount = {};
+            nextVerifiedKey = {};
         }
         const uint32_t bindingVariant =
             (cloudTelemetryOutput ? 1u : 0u) |
             (receiverValidityOutput ? 2u : 0u) |
             (useDiagnosticShader ? 4u : 0u);
-        const uint8_t bindingVariantBit = static_cast<uint8_t>(
-            1u << bindingVariant);
         const BindingVerificationKey bindingKey{
             {
                 depthSRV.Get(), worldTiles,
@@ -3476,15 +3704,17 @@ namespace CloudShadows
             engineConstantBufferCount,
             hasConstantBufferRanges
         };
-        const auto& verifiedBindingKey = verifiedBindingKeys[bindingVariant];
-        const bool sameBindingKey =
-            (verifiedBindingVariants & bindingVariantBit) != 0u &&
-            verifiedBindingKey.objects == bindingKey.objects &&
-            verifiedBindingKey.ranges == bindingKey.ranges &&
-            verifiedBindingKey.engineConstantBufferCount ==
-                bindingKey.engineConstantBufferCount &&
-            verifiedBindingKey.hasConstantBufferRanges ==
-                bindingKey.hasConstantBufferRanges;
+        bool sameBindingKey = false;
+        for (uint32_t key = 0; key < verifiedKeyCount[bindingVariant] && !sameBindingKey; ++key) {
+            const auto& verifiedBindingKey = verifiedBindingKeys[bindingVariant][key];
+            sameBindingKey =
+                verifiedBindingKey.objects == bindingKey.objects &&
+                verifiedBindingKey.ranges == bindingKey.ranges &&
+                verifiedBindingKey.engineConstantBufferCount ==
+                    bindingKey.engineConstantBufferCount &&
+                verifiedBindingKey.hasConstantBufferRanges ==
+                    bindingKey.hasConstantBufferRanges;
+        }
         if (!sameBindingKey) {
             std::array<ComPtr<ID3D11ShaderResourceView>, 2> verifiedSRVs;
             std::array<ID3D11ShaderResourceView*, 2> rawVerifiedSRVs{};
@@ -3609,8 +3839,12 @@ namespace CloudShadows
                 }
                 return RejectPrepass(PrepassRejectReason::kBindingSet);
             }
-            verifiedBindingKeys[bindingVariant] = bindingKey;
-            verifiedBindingVariants |= bindingVariantBit;
+            auto& slot = nextVerifiedKey[bindingVariant];
+            verifiedBindingKeys[bindingVariant][slot] = bindingKey;
+            slot = static_cast<uint8_t>((slot + 1u) % kKeysPerVariant);
+            verifiedKeyCount[bindingVariant] = static_cast<uint8_t>((std::min)(
+                static_cast<uint32_t>(verifiedKeyCount[bindingVariant]) + 1u,
+                kKeysPerVariant));
         }
 
         cpuTiming.Set(FO4CS::CpuProfile::Stage::ProjectionDispatch);
@@ -3656,9 +3890,9 @@ namespace CloudShadows
         return true;
     }
 
-    void Initialize()
+    void Initialize() noexcept
     {
-        if (g_initialized)
+        if (g_initialized.load(std::memory_order_acquire))
             return;
 
         // BeginTechnique can fire tens of thousands of times while the renderer
@@ -3673,15 +3907,32 @@ namespace CloudShadows
         if (!device)
             return;  // called again from Present hook once device is ready
 
-        SPDLOG_INFO("[CloudShadows] Initializing...");
-        LoadSettings(false);
-        SetupResources();
-        InitializeDFLightPatcher();
+        bool worldManagerReady = false;
+        try {
+            // Settings are read once per process here; later changes arrive
+            // through the file poll. Re-reading on every retry reapplied the
+            // saved switches and cost file I/O on the render thread.
+            static bool settingsLoaded = false;
+            if (!std::exchange(settingsLoaded, true)) {
+                SPDLOG_INFO("[CloudShadows] Initializing...");
+                LoadSettings(false);
+            }
+            SetupResources();
+            worldManagerReady = CreateWorldCloudResources();
+            InitializeDFLightPatcher();
+        } catch (const std::exception& error) {
+            SPDLOG_ERROR("[CloudShadows] Initialization failed: {}", error.what());
+        } catch (...) {
+            SPDLOG_ERROR("[CloudShadows] Initialization failed with an unknown exception");
+        }
 
+        // The opacity field itself is created lazily by the first captured
+        // Sky; waiting for it here kept initialization retrying all session
+        // when shadows started disabled or the game stayed indoors.
         if (g_cloudShadowProductionCS && g_cloudShadowCS && g_cloudShadowCB &&
-            g_worldCloudReady.load(std::memory_order_acquire) &&
+            worldManagerReady &&
             g_dfLightPatcherInitialized.load(std::memory_order_acquire)) {
-            g_initialized = true;
+            g_initialized.store(true, std::memory_order_release);
             ResetInitializationRetryState();
             SPDLOG_INFO("[CloudShadows] Initialization complete");
         } else {
@@ -3689,12 +3940,14 @@ namespace CloudShadows
                 s_initializationRetry.consecutiveFailures);
             ++s_initializationRetry.consecutiveFailures;
             s_initializationRetry.nextAttempt = now + retryDelay;
-            SPDLOG_WARN("[CloudShadows] Initialization incomplete (productionCS={}, diagnosticCS={}, CB={}, world={}, patcher={}); retrying in {} ms",
-                (void*)g_cloudShadowProductionCS, (void*)g_cloudShadowCS,
-                (void*)g_cloudShadowCB,
-                g_worldCloudReady.load(std::memory_order_relaxed),
-                g_dfLightPatcherInitialized.load(std::memory_order_relaxed),
-                retryDelay.count());
+            // Log the first failure and then at the backoff ceiling only.
+            if (s_initializationRetry.consecutiveFailures <= 4) {
+                SPDLOG_WARN("[CloudShadows] Initialization incomplete (productionCS={}, diagnosticCS={}, CB={}, world={}, patcher={}); retrying in {} ms",
+                    (void*)g_cloudShadowProductionCS, (void*)g_cloudShadowCS,
+                    (void*)g_cloudShadowCB, worldManagerReady,
+                    g_dfLightPatcherInitialized.load(std::memory_order_relaxed),
+                    retryDelay.count());
+            }
         }
     }
 }

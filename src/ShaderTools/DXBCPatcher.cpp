@@ -27,6 +27,91 @@ namespace SIE
 
 	namespace
 	{
+		// Advances past one SM4/SM5 operand (token, extension tokens, index
+		// representations). False when the operand is malformed or truncated.
+		bool SkipOperand(const uint32_t* instruction, uint32_t length,
+			uint32_t& position, uint32_t depth = 0)
+		{
+			if (position >= length || depth > 8)
+				return false;
+			const uint32_t token = instruction[position++];
+			uint32_t extension = token;
+			while ((extension >> 31) != 0) {
+				if (position >= length)
+					return false;
+				extension = instruction[position++];
+			}
+			const uint32_t type = (token >> 12) & 0xFF;
+			if (type == 4 || type == 5) { // immediate32 / immediate64
+				const uint32_t components = token & 0x3;
+				uint32_t values = components == 1 ? 1u : components == 2 ? 4u : 0u;
+				if (values == 0)
+					return false;
+				if (type == 5)
+					values *= 2;
+				if (values > length - position)
+					return false;
+				position += values;
+				return true;
+			}
+			const uint32_t dimensions = (token >> 20) & 0x3;
+			for (uint32_t dimension = 0; dimension < dimensions; ++dimension) {
+				switch ((token >> (22 + 3 * dimension)) & 0x7) {
+				case 0: // immediate32
+					position += 1;
+					break;
+				case 1: // immediate64
+					position += 2;
+					break;
+				case 2: // relative
+					if (!SkipOperand(instruction, length, position, depth + 1))
+						return false;
+					break;
+				case 3: // immediate32 + relative
+					position += 1;
+					if (!SkipOperand(instruction, length, position, depth + 1))
+						return false;
+					break;
+				case 4: // immediate64 + relative
+					position += 2;
+					if (!SkipOperand(instruction, length, position, depth + 1))
+						return false;
+					break;
+				default:
+					return false;
+				}
+				if (position > length)
+					return false;
+			}
+			return true;
+		}
+
+		// imul, sincos, udiv, umul, uaddc, usubb and swapc write two
+		// destinations. True when the second one is an output register (or
+		// the instruction cannot be parsed, which is treated the same).
+		bool WritesOutputInSecondDestination(
+			const uint32_t* instruction, uint32_t length, uint32_t opcode)
+		{
+			switch (opcode) {
+			case 0x26: case 0x4D: case 0x4E: case 0x51:
+			case 0x84: case 0x85: case 0x8E:
+				break;
+			default:
+				return false;
+			}
+			// Extended opcode tokens chain through bit 31 after the opcode token.
+			uint32_t position = 1;
+			uint32_t opcodeToken = instruction[0];
+			while ((opcodeToken >> 31) != 0) {
+				if (position >= length)
+					return true;
+				opcodeToken = instruction[position++];
+			}
+			if (!SkipOperand(instruction, length, position) || position >= length)
+				return true;
+			return ((instruction[position] >> 12) & 0xFF) == 2;
+		}
+
 		struct MD5State
 		{
 			uint32_t a, b, c, d;
@@ -671,6 +756,7 @@ namespace SIE
 				if (out.maxInputRegister == 0xFFFFFFFF || regIdx > out.maxInputRegister)
 					out.maxInputRegister = regIdx;
 				out.declaredInputRegisters.insert(regIdx);
+				out.inputRegisterMasks[regIdx] |= (out.instrStream[pos + 1] >> 4) & 0xF;
 
 				// Detect SV_Position: dcl_input_ps_siv vN.xyzw, position
 				// System value is in the last DWORD of the instruction. System value 1 = SV_Position.
@@ -682,6 +768,7 @@ namespace SIE
 							return false;
 						}
 						out.svPositionRegister = regIdx;
+						out.svPositionMask |= (out.instrStream[pos + 1] >> 4) & 0xF;
 					}
 				}
 			}
@@ -689,6 +776,8 @@ namespace SIE
 			if (opcode == DXBCOpcodes::RET) {
 				out.retOffsets.push_back(pos);
 			}
+			if (opcode == DXBCOpcodes::RETC)
+				out.hasConditionalReturn = true;
 
 			if (inDecls && !IsDeclaration(opcode)) {
 				out.declEndOffset = pos;
@@ -822,6 +911,26 @@ namespace SIE
 		return PatchShaderInternal(vanillaBlob, patch, false, 0, nullptr);
 	}
 
+	bool DXBCPatcher::IsSunShadowCandidate(const void* data, size_t size) noexcept
+	{
+		try {
+			if (!data || size == 0 || size > std::numeric_limits<uint32_t>::max())
+				return false;
+			ParsedDXBC parsed;
+			if (!Parse(static_cast<const uint8_t*>(data), static_cast<uint32_t>(size), parsed))
+				return false;
+			if (parsed.shex.svPositionRegister != 0xFFFFFFFF &&
+				((parsed.isgnSvPositionRegister != 0xFFFFFFFF &&
+				  parsed.shex.svPositionRegister != parsed.isgnSvPositionRegister) ||
+				 (parsed.shex.svPositionMask & 0x3u) != 0x3u))
+				return false;
+			SunShadowSite site;
+			return FindSunShadowSite(parsed.shex, site);
+		} catch (...) {
+			return false;
+		}
+	}
+
 	ID3DBlob* DXBCPatcher::PatchSunShadowShader(
 		ID3DBlob* vanillaBlob,
 		const DXBCPatch& patch,
@@ -857,6 +966,16 @@ namespace SIE
 			parsed.shex.svPositionRegister != parsed.isgnSvPositionRegister) {
 			return nullptr;
 		}
+		// The payload reads SV_Position.xy. An existing declaration that omits
+		// either component cannot be reused; fail closed before classifying.
+		if (parsed.shex.svPositionRegister != 0xFFFFFFFF &&
+			(parsed.shex.svPositionMask & 0x3u) != 0x3u) {
+			return nullptr;
+		}
+		// Legacy callers insert before `ret` only; a conditional return would
+		// skip the payload on that path, so such shaders are refused.
+		if (!strictSunShadow && parsed.shex.hasConditionalReturn)
+			return nullptr;
 
 		SunShadowSite sunSite;
 		if (strictSunShadow) {
@@ -924,6 +1043,13 @@ namespace SIE
 				}
 				uint32_t regIdx = parsed.isgnSvPositionRegister;
 				if (parsed.shex.declaredInputRegisters.count(regIdx)) {
+					const auto mask = parsed.shex.inputRegisterMasks.find(regIdx);
+					if (mask == parsed.shex.inputRegisterMasks.end() ||
+						(mask->second & 0x3u) != 0x3u) {
+						// Declared without .xy: reusing it would read undeclared
+						// components, and a second declaration would conflict.
+						return nullptr;
+					}
 					// Register v{regIdx} is already declared in SHEX (as dcl_input_ps for
 					// texcoord or similar). Don't add a conflicting dcl_input_ps_siv — the
 					// register is already readable. Just set the fixup target.
@@ -1118,6 +1244,12 @@ namespace SIE
 					return nullptr;
 				sunPayloadInserted = true;
 			}
+
+			// Instructions with two destinations can write an output through
+			// their second operand, which the redirect below never inspects.
+			// Refuse such shaders rather than leave an output unredirected.
+			if (!redirectMap.empty() && WritesOutputInSecondDestination(src + pos, len, opcode))
+				return nullptr;
 
 			// Redirect output register writes to temp registers.
 			if (!redirectMap.empty() && len >= 2 && !IsDeclaration(opcode) &&

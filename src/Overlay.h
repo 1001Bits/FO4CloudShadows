@@ -31,4 +31,8 @@ namespace Overlay
 
 	// Current visibility (F11 toggles it inside Draw()).
 	bool IsVisible();
+
+	// Render thread: hides (and saves) an open menu when the Development Menu
+	// switch turns off, since F11 can no longer reach it.
+	void CloseForDisabledHotkeys() noexcept;
 }

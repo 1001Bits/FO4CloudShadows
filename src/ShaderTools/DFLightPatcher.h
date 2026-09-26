@@ -9,12 +9,14 @@
 
 #include <d3d11.h>
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -33,11 +35,15 @@ namespace SIE
 	public:
 		~DFLightPatcher();
 
-		/// Load the runtime-specific VanillaDXBC corpus
-		/// (DFLight/PS for flat/AE, DFLightVR/PS for VR), apply the patch, and
-		/// create ID3D11PixelShader objects. Call once after the D3D device is
-		/// available.
-		void Initialize(ID3D11Device* device);
+		/// Build the payload for `device` and start a background pass that
+		/// patches every captured sunlight candidate plus the optional loose
+		/// VanillaDXBC corpus (DFLight/PS flat, DFLightVR/PS VR). The calling
+		/// render thread never waits for driver compiles; a shader requested
+		/// before the pass reaches it is patched on demand.
+		void Initialize(ID3D11Device* device) noexcept;
+
+		/// Blocks until the background pass started by Initialize() finishes.
+		void WaitForClassification() noexcept;
 
 		/// Look up a patched PS by DXBC bytecode hash. Returns one retained
 		/// reference which the caller must Release.
@@ -47,7 +53,7 @@ namespace SIE
 		/// replacement. Shader identity is stored as D3D private data rather than
 		/// in a raw-pointer registry, so destroyed/reused COM addresses cannot
 		/// select a stale replacement.
-		void RegisterVanillaPS(uint64_t hash, ID3D11PixelShader* vanillaPS);
+		void RegisterVanillaPS(uint64_t hash, ID3D11PixelShader* vanillaPS) noexcept;
 
 		/// Associate a successfully-bound DFLight descriptor with the exact
 		/// strictly-patched shader object. Returns one retained reference, or
@@ -55,7 +61,7 @@ namespace SIE
 		/// variant. The caller must Release a non-null result.
 		ID3D11PixelShader* RegisterDescriptor(
 			uint32_t pixelDescriptor,
-			ID3D11PixelShader* vanillaPS);
+			ID3D11PixelShader* vanillaPS) noexcept;
 
 		/// Acquire a retained replacement for an authenticated descriptor. The
 		/// caller owns one reference and must Release it. The AddRef occurs while
@@ -63,11 +69,11 @@ namespace SIE
 		/// Release().
 		ID3D11PixelShader* AcquireDescriptor(
 			uint32_t pixelDescriptor,
-			ID3D11PixelShader* vanillaPS);
+			ID3D11PixelShader* vanillaPS) noexcept;
 
 		/// Record the DXBC hash for every PS the game creates, so we can later
 		/// diagnose why a given bound PS wasn't matched to our patched pool.
-		void RecordPSHash(ID3D11PixelShader* vanillaPS, uint64_t hash);
+		void RecordPSHash(ID3D11PixelShader* vanillaPS, uint64_t hash) noexcept;
 
 		/// Reverse lookup — returns 0 if no hash was recorded for this PS.
 		uint64_t LookupPSHash(ID3D11PixelShader* vanillaPS) const;
@@ -99,9 +105,11 @@ namespace SIE
 		/// Compute FNV-1a hash of DXBC bytecode.
 		static uint64_t HashDXBC(const void* data, size_t size);
 
-		/// Record the raw bytecode for a pixel shader the game created, keyed
-		/// by hash, so strict runtime patching works without loose shader files.
-		void StoreBytecode(uint64_t hash, const void* bytes, size_t size);
+		/// Classify a pixel shader the game created from the caller's buffer.
+		/// Only exact sunlight candidates are copied (so strict patching works
+		/// without loose shader files); every other hash is remembered as
+		/// unsupported and never copied or re-examined.
+		void StoreBytecode(uint64_t hash, const void* bytes, size_t size) noexcept;
 
 		/// Release device-owned shader objects while retaining validated source
 		/// bytecode so Initialize() can recreate them on the next D3D device.
@@ -124,13 +132,19 @@ namespace SIE
 		/// temp by reference.
 		DXBCPatch BuildCloudShadowPatch(uint32_t& factorTempRegister);
 
-		/// Pre-patch the optional loose vanilla corpus. Runtime bytecode capture is
-		/// authoritative for standalone installs that do not ship this directory.
+		/// Feed the optional loose vanilla corpus into the captured bytecode,
+		/// hashing before any patch work so known hashes cost one read. Runtime
+		/// capture is authoritative for installs that do not ship this folder.
 		void ProcessDXBCDirectory(
-			ID3D11Device* device,
 			const std::filesystem::path& dir,
-			const DXBCPatch& patch,
-			uint32_t factorTempRegister);
+			const std::stop_token& stop);
+
+		/// Background pass started by Initialize().
+		void ClassifyInBackground(
+			const std::stop_token& stop,
+			const std::filesystem::path& corpus);
+		void StopClassification() noexcept;
+		bool EnsurePayload();
 
 		/// Strictly patch/create a runtime-captured shader if supported, or cache
 		/// the hash as unsupported. Never accepts a non-sunlight terminal layout.
@@ -142,6 +156,14 @@ namespace SIE
 		// vanilla DXBC hash → patched PS
 		std::unordered_map<uint64_t, ID3D11PixelShader*> patchedByHash;
 		std::unordered_set<uint64_t> unsupportedHashes;
+		// Transient creation failures (out of memory, device removal) back off
+		// per hash instead of repeating the whole pipeline on every draw.
+		struct RetryState
+		{
+			std::chrono::steady_clock::time_point retryAfter{};
+			uint32_t failures{};
+		};
+		std::unordered_map<uint64_t, RetryState> retryableFailures;
 		mutable std::shared_mutex patchedMapMutex;
 
 		// Raw DXBC bytecode for every PS the game creates, keyed by hash. Runtime
@@ -153,9 +175,16 @@ namespace SIE
 		mutable std::shared_mutex bytecodeMutex;
 		size_t capturedBytecodeBytes = 0;
 
+		// Device-independent payload, built once and immutable afterwards.
 		DXBCPatch cachedSunPatch;
 		uint32_t cachedFactorTempRegister = 0xFFFFFFFF;
+		std::mutex payloadMutex;
+		std::atomic<bool> payloadReady{ false };
+		bool payloadFailed = false;
 		ID3D11Device* patchDevice = nullptr;
+
+		std::mutex classifierMutex;
+		std::jthread classifier;
 
 		// Shader creation is rare and serialized. Recursive acquisition is needed
 		// because Initialize() performs the captured-bytecode rematch inline.

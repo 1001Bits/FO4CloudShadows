@@ -9,15 +9,8 @@ namespace CloudShadows { struct CloudShadowScreenCBData; }
 
 namespace FO4CS::CloudComparison
 {
-    enum class Method : unsigned { Cubemap, SunMask };
     enum class Preview : unsigned { Off, SkyOverlay, RawMask };
-    Method GetMethod() noexcept;
-    // The saved preference may name the Sun 2D method while its shaders are
-    // unavailable on this device; producers and the prepass use this value.
-    Method EffectiveMethod() noexcept;
     Preview GetPreview() noexcept;
-    const char* MethodName() noexcept;
-    void SetMethod(Method method) noexcept;
     void SetPreview(Preview preview) noexcept;
     void PollControls() noexcept;
     void ArmMeasurements() noexcept;
@@ -30,11 +23,15 @@ namespace FO4CS::CloudComparison
     bool HudVisible() noexcept;
     // Release on-screen feedback for F10: shows the HUD for a few seconds.
     void FlashStatus(std::string status, double seconds) noexcept;
-    bool SunMethodAvailable() noexcept;
 
+    // Records the authenticated screen-shader source for this device. The
+    // sky-preview variant compiles on first use (MaintainShaders), so players
+    // who never open it pay no startup compile.
     bool CompileShaders(ID3D11Device* device, const std::string& source,
         const std::string& name, bool vr);
-    ID3D11ComputeShader* SunShader(bool diagnostic) noexcept;
+    // Render thread, once per Present: compiles an active preview's shader
+    // the first time it is needed on a device.
+    void MaintainShaders(ID3D11Device* device) noexcept;
     // Uses the exact CS b1/b2/b3 bindings established by the accepted DFLight
     // prepass and the same completed cube as its ground-shadow lookup. Caller
     // restores CS state; no Present-time camera read or stall.

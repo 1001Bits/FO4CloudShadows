@@ -7,13 +7,8 @@ namespace FO4CS::GodrayCloudShader
     {
         return R"hlsl(
 cbuffer NativePass : register(b0) { float4 PassData[20]; };
-cbuffer CloudGodray : register(b13) { float4 CloudGeometry; float4 CloudOrigin; float4 ExpectedEye; float4 VisibleSunDirectionAndValidity;
-    float4 SunRight; float4 SunUp; float4 SunDirection; float4 SunCenter; };
-#if FO4CS_SUN_MASK
-Texture2D<float> CloudCube : register(t47);
-#else
+cbuffer CloudGodray : register(b13) { float4 CloudGeometry; float4 CloudOrigin; float4 ExpectedEye; float4 VisibleSunDirectionAndValidity; };
 TextureCube<float> CloudCube : register(t47);
-#endif
 SamplerState CloudSampler : register(s15);
 
 #define IS_FINITE(x) ((asuint(x) & 0x7F800000u) != 0x7F800000u)
@@ -35,17 +30,7 @@ float CloudT(float3 receiver, float3 rayToSun, float3 fieldOrigin)
     float3 cubeVector = relative + rayToSun * distanceToShell;
     float cubeLengthSquared = dot(cubeVector, cubeVector);
     float3 cubeDirection = cubeVector * rsqrt(max(cubeLengthSquared, 1.0e-8));
-#if FO4CS_SUN_MASK
-    float3 offset = cubeVector - SunCenter.xyz;
-    float2 uv = float2(dot(offset, SunRight.xyz), -dot(offset, SunUp.xyz)) /
-        max(2.0 * SunRight.w, 1.0e-7) + 0.5;
-    float2 edge = min(uv, 1.0 - uv);
-    bool inMap = SunCenter.w > 0.5 && all(IS_FINITE(uv)) && all(uv >= 0) && all(uv <= 1);
-    float opacity = inMap ? saturate(CloudCube.SampleLevel(CloudSampler, uv, 0)) *
-        saturate(min(edge.x, edge.y) * (512.0 / 8.0)) : 0;
-#else
     float opacity = saturate(CloudCube.SampleLevel(CloudSampler, cubeDirection, 0.0));
-#endif
     bool valid = CloudGeometry.w > 0.5 && height > 0.0 && radius > 0.0 &&
         CloudOrigin.w > 0.0 && rayToSun.z > 0.0 &&
         deficitNumerator > 0.0 && discriminant >= 0.0 &&
@@ -102,7 +87,7 @@ float3 IntegratedFactor(float3 eye, float3 endpoint)
 )hlsl";
     }
 
-    std::string PayloadSource(bool screenIntegral, bool sunMask)
+    std::string PayloadSource(bool screenIntegral)
     {
         const char* entry = screenIntegral
             ? R"hlsl(Texture2DMS<float> SceneDepth : register(t2);
@@ -127,6 +112,6 @@ float4 main(float4 nativeIntegral : CLOUD_BASE,
     return float4(nativeIntegral.xyz * factor, nativeIntegral.w);
 }
 )hlsl";
-        return std::string(sunMask ? "#define FO4CS_SUN_MASK 1\n" : "#define FO4CS_SUN_MASK 0\n") + CommonSource() + entry;
+        return std::string(CommonSource()) + entry;
     }
 }

@@ -20,17 +20,26 @@ namespace FO4CS::McmSettingsFile
         bool enabled = true;
         float opacity = 2.0f;
         float cloudHeight = 10000.0f;
-        // 0 = cubemap (six faces around the player), 1 = sun-oriented 2D map.
-        int captureMethod = 0;
         // F7/F8/F10/F11 are ignored while false (default for normal players).
         bool hotkeys = false;
+        // Development Menu options; they apply only while `hotkeys` is on.
+        // 0 off, 1 world checkerboard, 2 raw depth, 3 transmittance,
+        // 4 capture analysis.
+        int debugView = 0;
+        bool isolateCloud = false;
+        float isolationRadius = 12.0f;
         bool operator==(const Values&) const = default;
     };
 
     struct Changes
     {
-        bool enabled{}, opacity{}, cloudHeight{}, captureMethod{}, hotkeys{};
-        bool Any() const noexcept { return enabled || opacity || cloudHeight || captureMethod || hotkeys; }
+        bool enabled{}, opacity{}, cloudHeight{}, hotkeys{};
+        bool debugView{}, isolateCloud{}, isolationRadius{};
+        bool Any() const noexcept
+        {
+            return enabled || opacity || cloudHeight || hotkeys ||
+                debugView || isolateCloud || isolationRadius;
+        }
     };
 
     // Compare saved preferences, not the live F10/F11 values. An unchanged
@@ -41,8 +50,45 @@ namespace FO4CS::McmSettingsFile
         return { force || !previous || previous->enabled != next.enabled,
             force || !previous || previous->opacity != next.opacity,
             force || !previous || previous->cloudHeight != next.cloudHeight,
-            force || !previous || previous->captureMethod != next.captureMethod,
-            force || !previous || previous->hotkeys != next.hotkeys };
+            force || !previous || previous->hotkeys != next.hotkeys,
+            force || !previous || previous->debugView != next.debugView,
+            force || !previous || previous->isolateCloud != next.isolateCloud,
+            force || !previous || previous->isolationRadius != next.isolationRadius };
+    }
+
+    // F11 saves what the player changed in game since the file was last
+    // applied (`baseline`), and keeps every other field as currently saved,
+    // so an MCM or Menu Framework edit not yet polled is never overwritten.
+    inline Values Merge(const Values& file, const Values& live,
+        const std::optional<Values>& baseline) noexcept
+    {
+        if (!baseline)
+            return live;
+        Values merged = file;
+        if (live.enabled != baseline->enabled) merged.enabled = live.enabled;
+        if (live.opacity != baseline->opacity) merged.opacity = live.opacity;
+        if (live.cloudHeight != baseline->cloudHeight) merged.cloudHeight = live.cloudHeight;
+        if (live.hotkeys != baseline->hotkeys) merged.hotkeys = live.hotkeys;
+        if (live.debugView != baseline->debugView) merged.debugView = live.debugView;
+        if (live.isolateCloud != baseline->isolateCloud) merged.isolateCloud = live.isolateCloud;
+        if (live.isolationRadius != baseline->isolationRadius)
+            merged.isolationRadius = live.isolationRadius;
+        return merged;
+    }
+
+    // Values from a version-4 JSON worth carrying into a new user INI. The
+    // release package ships that JSON with default values: migrating it would
+    // pin every default into the INI, so future default changes never apply.
+    inline std::optional<Values> LegacyMigration(const Values& legacy) noexcept
+    {
+        Values migrated = legacy;
+        migrated.hotkeys = Values{}.hotkeys;
+        migrated.debugView = Values{}.debugView;
+        migrated.isolateCloud = Values{}.isolateCloud;
+        migrated.isolationRadius = Values{}.isolationRadius;
+        if (migrated == Values{})
+            return std::nullopt;
+        return migrated;
     }
 
     inline Values Validate(Values values) noexcept
@@ -51,7 +97,9 @@ namespace FO4CS::McmSettingsFile
             ? std::clamp(values.opacity, 0.0f, 4.0f) : Values{}.opacity;
         values.cloudHeight = std::isfinite(values.cloudHeight)
             ? std::clamp(values.cloudHeight, 10000.0f, 200000.0f) : Values{}.cloudHeight;
-        values.captureMethod = std::clamp(values.captureMethod, 0, 1);
+        values.debugView = std::clamp(values.debugView, 0, 4);
+        values.isolationRadius = std::isfinite(values.isolationRadius)
+            ? std::clamp(values.isolationRadius, 2.0f, 30.0f) : Values{}.isolationRadius;
         return values;
     }
 
@@ -99,10 +147,16 @@ namespace FO4CS::McmSettingsFile
             if (*hotkeys != 0.0f && *hotkeys != 1.0f) throw std::runtime_error("MCM hotkeys must be 0 or 1");
             values.hotkeys = *hotkeys == 1.0f;
         }
-        if (const auto method = read(L"iCaptureMethod")) {
-            if (*method != 0.0f && *method != 1.0f) throw std::runtime_error("MCM capture method must be 0 or 1");
-            values.captureMethod = static_cast<int>(*method);
+        if (const auto view = read(L"iDebugView")) {
+            if (*view != std::floor(*view) || *view < 0.0f || *view > 4.0f)
+                throw std::runtime_error("MCM debug view must be 0 to 4");
+            values.debugView = static_cast<int>(*view);
         }
+        if (const auto isolate = read(L"bIsolateCloud")) {
+            if (*isolate != 0.0f && *isolate != 1.0f) throw std::runtime_error("MCM cloud isolation must be 0 or 1");
+            values.isolateCloud = *isolate == 1.0f;
+        }
+        if (const auto radius = read(L"fIsolationRadius")) values.isolationRadius = *radius;
     }
 
     inline Values Read(const std::filesystem::path& defaults, const std::filesystem::path& user)
@@ -138,8 +192,12 @@ namespace FO4CS::McmSettingsFile
             };
             write(L"fOpacity", decimal(values.opacity).c_str());
             write(L"fCloudHeight", decimal(values.cloudHeight).c_str());
-            write(L"iCaptureMethod", values.captureMethod == 1 ? L"1" : L"0");
             write(L"bHotkeys", values.hotkeys ? L"1" : L"0");
+            write(L"iDebugView", std::to_wstring(values.debugView).c_str());
+            write(L"bIsolateCloud", values.isolateCloud ? L"1" : L"0");
+            write(L"fIsolationRadius", decimal(values.isolationRadius).c_str());
+            // The capture method is no longer selectable; drop its old key.
+            WritePrivateProfileStringW(L"CloudShadows", L"iCaptureMethod", nullptr, temporary.c_str());
             WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary.c_str());
             if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH |
                     (overwrite ? MOVEFILE_REPLACE_EXISTING : 0)))

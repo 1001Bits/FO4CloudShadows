@@ -31,32 +31,89 @@ int main(int argc, char** argv)
         const auto partial = Files::Read(defaults, user);
         Require(partial == Files::Values{ true, 1.25f, 10000.0f }, "MCM overrides inherit missing defaults");
         Require(WritePrivateProfileStringW(L"Future", L"Keep", L"123", user.c_str()), "add future key");
-        Files::Write(user, { false, 3.5f, 45000.0f, 1 });
+        Require(WritePrivateProfileStringW(L"CloudShadows", L"iCaptureMethod", L"1", user.c_str()), "write obsolete method key");
+        Files::Write(user, { false, 3.5f, 45000.0f });
         const auto saved = Files::Read(defaults, user);
-        Require(saved == Files::Values{ false, 3.5f, 45000.0f, 1 }, "F11 save round trip including capture method");
+        Require(saved == Files::Values{ false, 3.5f, 45000.0f }, "F11 save round trip");
+        Require(GetPrivateProfileIntW(L"CloudShadows", L"iCaptureMethod", -1, user.c_str()) == -1,
+            "saving drops the obsolete capture-method key");
         Require(GetPrivateProfileIntW(L"Future", L"Keep", 0, user.c_str()) == 123, "save preserves other sections");
         bool refused = false;
         try { Files::Write(user, {}, false); } catch (...) { refused = true; }
         Require(refused && Files::Read(defaults, user) == saved, "migration cannot overwrite an existing MCM preference");
+
+        {
+            // F11 save merges: fields changed in game win, others keep the
+            // file (an MCM/Menu Framework edit not yet polled survives).
+            const Files::Values baseline{ true, 2.0f, 10000.0f, false };
+            Files::Values live = baseline;
+            live.opacity = 3.0f;
+            Files::Values file = baseline;
+            file.enabled = false;
+            file.hotkeys = true;
+            const auto merged = Files::Merge(file, live, baseline);
+            Require(merged == Files::Values{ false, 3.0f, 10000.0f, true },
+                "F11 save keeps an unpolled external edit and its own change");
+            Require(Files::Merge(file, live, std::nullopt) == live,
+                "without an applied baseline the live values are saved whole");
+            // A pristine shipped JSON never becomes a user INI; real changes do.
+            Require(!Files::LegacyMigration(Files::Values{}).has_value(),
+                "default legacy JSON is not migrated");
+            Files::Values legacy;
+            legacy.opacity = 3.0f;
+            legacy.hotkeys = true;
+            const auto migrated = Files::LegacyMigration(legacy);
+            Require(migrated && migrated->opacity == 3.0f && !migrated->hotkeys,
+                "a changed legacy preference migrates; the development switch never does");
+            Files::Values development;
+            development.debugView = 1;
+            development.isolateCloud = true;
+            development.isolationRadius = 20.0f;
+            Require(!Files::LegacyMigration(development).has_value(),
+                "development options are never migrated from the legacy JSON");
+        }
+        {
+            // Development Menu options round-trip, are bounded, and a
+            // malformed debug view is rejected instead of half-applied.
+            const auto developmentFile = root / L"development.ini";
+            Files::Values development;
+            development.hotkeys = true;
+            development.debugView = 3;
+            development.isolateCloud = true;
+            development.isolationRadius = 18.5f;
+            Files::Write(developmentFile, development);
+            Require(Files::Read(defaults, developmentFile) == Files::Values{
+                    true, 2.0f, 10000.0f, true, 3, true, 18.5f },
+                "development options round trip");
+            Files::Values bounded = development;
+            bounded.debugView = 9;
+            bounded.isolationRadius = 90.0f;
+            Require(Files::Validate(bounded).debugView == 4 &&
+                    Files::Validate(bounded).isolationRadius == 30.0f,
+                "development options are bounded");
+            Require(WritePrivateProfileStringW(L"CloudShadows", L"iDebugView", L"7",
+                developmentFile.c_str()), "write invalid debug view");
+            bool rejectedView = false;
+            try { (void)Files::Read(defaults, developmentFile); } catch (...) { rejectedView = true; }
+            Require(rejectedView, "debug view must be 0 to 4");
+            auto viewChanged = development;
+            viewChanged.debugView = 1;
+            const auto viewOnly = Files::Difference(development, viewChanged, false);
+            Require(viewOnly.debugView && !viewOnly.hotkeys && !viewOnly.opacity &&
+                    !viewOnly.isolateCloud && !viewOnly.isolationRadius,
+                "a debug view change applies alone");
+            fs::remove(developmentFile);
+        }
 
         const auto unchanged = Files::Difference(saved, saved, false);
         Require(!unchanged.Any(), "polling unchanged preferences must preserve live F10/unsaved F11 state");
         auto changed = saved;
         changed.cloudHeight = 50000;
         const auto heightOnly = Files::Difference(saved, changed, false);
-        Require(heightOnly.cloudHeight && !heightOnly.enabled && !heightOnly.opacity && !heightOnly.captureMethod,
-            "height edit must not revert F10, opacity or method");
-        auto methodChanged = saved;
-        methodChanged.captureMethod = 0;
-        const auto methodOnly = Files::Difference(saved, methodChanged, false);
-        Require(methodOnly.captureMethod && !methodOnly.enabled && !methodOnly.opacity && !methodOnly.cloudHeight,
-            "method edit applies alone");
-        Require(WritePrivateProfileStringW(L"CloudShadows", L"iCaptureMethod", L"2", user.c_str()), "write invalid method");
-        {
-            bool rejectedMethod = false;
-            try { (void)Files::Read(defaults, user); } catch (...) { rejectedMethod = true; }
-            Require(rejectedMethod, "capture method must be 0 or 1");
-        }
+        Require(heightOnly.cloudHeight && !heightOnly.enabled && !heightOnly.opacity,
+            "height edit must not revert F10 or opacity");
+        Require(WritePrivateProfileStringW(L"CloudShadows", L"iCaptureMethod", L"2", user.c_str()), "write obsolete method key");
+        Require(Files::Read(defaults, user) == saved, "an old capture-method key is ignored");
         Files::Write(user, saved);
         Require(Files::Difference(saved, saved, true).enabled, "explicit reload restores saved master preference");
         Require(Files::Difference(std::nullopt, saved, false).enabled, "first load adopts preferences");
@@ -85,7 +142,7 @@ int main(int argc, char** argv)
         const auto legacy = nlohmann::json::parse(legacyInput);
         Require(legacy.at("Enabled") == canonical.enabled && legacy.at("Opacity") == canonical.opacity &&
             legacy.at("CloudHeight") == canonical.cloudHeight && legacy.at("GodrayCloudOcclusion") == false &&
-            legacy.at("CaptureMethod") == canonical.captureMethod &&
+            !legacy.contains("CaptureMethod") &&
             legacy.at("Hotkeys") == canonical.hotkeys,
             "legacy fallback agrees with release defaults");
         std::ifstream menuInput(project / "config/MCM/FO4CloudShadows/config.json");
@@ -95,10 +152,28 @@ int main(int argc, char** argv)
         for (const auto& row : menu.at("content")) if (row.contains("id")) {
             Require(controls.insert(row.at("id").get<std::string>()).second, "unique MCM setting ids");
         }
-        Require(controls == std::set<std::string>{ "bEnabled:CloudShadows", "fOpacity:CloudShadows",
-            "iCaptureMethod:CloudShadows", "bHotkeys:CloudShadows" },
-            "MCM exposes only the four release controls (cloud height is not user-adjustable)");
+        const std::set<std::string> developmentControls{ "bHotkeys:CloudShadows",
+            "iDebugView:CloudShadows", "bIsolateCloud:CloudShadows",
+            "fIsolationRadius:CloudShadows" };
+        std::set<std::string> expectedControls{ "bEnabled:CloudShadows", "fOpacity:CloudShadows" };
+        expectedControls.insert(developmentControls.begin(), developmentControls.end());
+        Require(controls == expectedControls,
+            "MCM exposes the player controls and the Development Menu options "
+            "(cloud height is not user-adjustable)");
         Require(canonical.hotkeys == false, "hotkeys are off by default");
+        // Development options stay hidden until their controlling switch is on.
+        for (const auto& row : menu.at("content")) {
+            if (row.contains("id")) {
+                const auto id = row.at("id").get<std::string>();
+                const bool development = developmentControls.contains(id);
+                if (id == "bHotkeys:CloudShadows")
+                    Require(row.value("groupControl", 0) == 1,
+                        "the Development Menu switch controls its options' visibility");
+                else if (development)
+                    Require(row.value("groupCondition", 0) == 1,
+                        "development options are hidden until the Development Menu is on");
+            }
+        }
         FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(true);
         Require(!FO4CS::GodraysIntegration::IsCloudOcclusionEnabled(), "release refuses godray enable even from an old preference");
         Require(!FO4CS::GodraysIntegration::TryInstall(FO4CS::F4SECompat::RuntimeTarget::kLegacy), "release does not install a godray hook");
@@ -123,11 +198,15 @@ int main(int argc, char** argv)
             Require(!Enb::CloudShadowsActiveAtStartup(writeIni(L"enb-case.ini",
                 "[GLOBAL]\r\nUseEffect=TRUE\r\n[EFFECT]\r\nEnableCloudShadows=False\r\n")),
                 "ENB booleans are case-insensitive");
-            Require(Enb::CloudShadowsActiveAtStartup(writeIni(L"enb-missing-key.ini",
-                "[GLOBAL]\r\nUseEffect=true\r\n[EFFECT]\r\nEnableBloom=false\r\n")),
-                "a missing EnableCloudShadows follows ENB's stock preset (on)");
-            Require(Enb::CloudShadowsActiveAtStartup(root / L"no-such-enbseries.ini"),
-                "a missing enbseries.ini follows ENB's stock preset (on)");
+            const auto missingKey = writeIni(L"enb-missing-key.ini",
+                "[GLOBAL]\r\nUseEffect=true\r\n[EFFECT]\r\nEnableBloom=false\r\n");
+            Require(!Enb::CloudShadowsActiveAtStartup(missingKey) &&
+                !Enb::CloudShadowsSettingPresent(missingKey),
+                "a preset without EnableCloudShadows does not make this mod inert");
+            Require(!Enb::CloudShadowsActiveAtStartup(root / L"no-such-enbseries.ini"),
+                "a missing enbseries.ini does not make this mod inert");
+            Require(Enb::CloudShadowsSettingPresent(root / L"enb-off.ini"),
+                "an explicit EnableCloudShadows=false is recognised");
             Require(!Enb::Detect().present, "ENB is not loaded in the test process");
             Require(Enb::VersionText(501) == "0.501" && Enb::VersionText(1025) == "1.025",
                 "ENB version formatting");

@@ -1,7 +1,5 @@
 #include "PCH.h"
 #include "AcceptanceRunner.h"
-#include "CloudMotionResolver.h"
-#include "CloudGeometryCapture.h"
 #include "Overlay.h"
 #include "McmSettings.h"
 #include "EngineAPI.h"
@@ -9,8 +7,8 @@
 #include "CloudCubePreview.h"
 #include "CloudShadows.h"
 #include "GodraysIntegration.h"
-#include "NativeSkyCube.h"
 #include "RuntimeAPI.h"
+#include "Utf8Path.h"
 
 #include <imgui.h>
 #include <imgui_impl_dx11.h>
@@ -49,7 +47,13 @@ namespace Overlay
 		std::atomic<bool> g_externalHostActive{ false };
 		std::atomic<bool> g_inited{ false };
 		bool g_failed = false;
+		// A transient window-hook refusal retries after this tick instead of
+		// disabling the standalone menu for the rest of the session.
+		ULONGLONG g_initRetryAfter = 0;
 		std::atomic<bool> g_visible{ false };
+		// Set when the menu is hidden off the render thread (window close) or
+		// by a late host claim; the next render-thread Draw/Shutdown saves.
+		std::atomic<bool> g_pendingSave{ false };
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
 		bool g_showCapturePreview = false;
 #endif
@@ -238,11 +242,19 @@ namespace Overlay
 			case WM_XBUTTONUP:
 			case WM_MOUSEWHEEL:
 			case WM_MOUSEHWHEEL:
-			case WM_INPUT:
 				return true;
 			default:
 				return false;
 			}
+		}
+
+		bool IsRawMouseInput(LPARAM lParam) noexcept
+		{
+			RAWINPUTHEADER header{};
+			UINT size = sizeof(header);
+			return GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_HEADER,
+				       &header, &size, sizeof(RAWINPUTHEADER)) == sizeof(header) &&
+				header.dwType == RIM_TYPEMOUSE;
 		}
 
 		bool IsMouseButtonDownMessage(UINT msg) noexcept
@@ -308,6 +320,9 @@ namespace Overlay
 				ReleaseOwnedMouseCapture();
 				FO4CS::EngineAPI::ShowGameCursorMenu(false);
 				g_visible.store(false, std::memory_order_release);
+				// Saving is render-thread work; the next Draw or Shutdown
+				// persists the edits made before the window closed.
+				g_pendingSave.store(true, std::memory_order_release);
 			}
 			if (focusLost)
 				ReleaseOwnedMouseCapture();
@@ -335,6 +350,7 @@ namespace Overlay
 					if (visibleAtEntry && !windowClosing) {
 						const ImGuiIO& io = ImGui::GetIO();
 						if (handled || IsMouseMessage(msg) ||
+							(msg == WM_INPUT && IsRawMouseInput(lParam)) ||
 							(io.WantCaptureKeyboard && IsKeyboardMessage(msg))) {
 							consume = true;
 						}
@@ -355,6 +371,10 @@ namespace Overlay
 				}
 			}
 
+			// Consumed raw input is withheld from the game but still passed to
+			// DefWindowProc, which releases the system's raw-input buffer.
+			if (consume && msg == WM_INPUT)
+				return DefWindowProcW(hwnd, msg, wParam, lParam);
 			const LRESULT result = consume ? 1 :
 				(originalWndProc
 					? CallWindowProcW(originalWndProc, hwnd, msg, wParam, lParam)
@@ -557,12 +577,12 @@ namespace Overlay
 						fs::path(relativePath), resolvedPath)) {
 					return nullptr;
 				}
-				try {
-					const std::string nativePath = resolvedPath.string();
-					return io.Fonts->AddFontFromFileTTF(nativePath.c_str(), size);
-				} catch (...) {
+				// ImGui opens font files from UTF-8 paths on Windows; the ANSI
+				// conversion failed (or threw) for non-ANSI install folders.
+				const std::string utf8Path = FO4CS::Utf8Path(resolvedPath);
+				if (utf8Path.empty())
 					return nullptr;
-				}
+				return io.Fonts->AddFontFromFileTTF(utf8Path.c_str(), size);
 			};
 
 			for (const char* path : regularPaths) {
@@ -739,7 +759,7 @@ void main(uint3 id : SV_DispatchThreadID)
 			std::scoped_lock imguiLock(g_imguiLifetimeMutex);
 			if (g_inited.load(std::memory_order_acquire))
 				return true;
-			if (g_failed)
+			if (g_failed || GetTickCount64() < g_initRetryAfter)
 				return false;
 
 			g_dev = CloudShadows::g_capturedDevice;
@@ -752,10 +772,14 @@ void main(uint3 id : SV_DispatchThreadID)
 				!IsWindow(scd.OutputWindow)) {
 				// Window recreation can briefly leave the retiring swap chain
 				// without a usable HWND. This is transient: a later Present on the
-				// replacement chain must be allowed to initialize.
-				SPDLOG_WARN(
-					"[CloudShadows][Menu] swap chain has no live output window; "
-					"deferring standalone menu initialization");
+				// replacement chain must be allowed to initialize. Logged once
+				// per episode, not on every Present while it lasts.
+				static bool loggedMissingWindow = false;
+				if (!std::exchange(loggedMissingWindow, true)) {
+					SPDLOG_WARN(
+						"[CloudShadows][Menu] swap chain has no live output window; "
+						"deferring standalone menu initialization");
+				}
 				return false;
 			}
 			if (g_windowRetired && scd.OutputWindow == g_retiredHwnd)
@@ -793,8 +817,10 @@ void main(uint3 id : SV_DispatchThreadID)
 				g_dx11BackendInited = false;
 				g_win32BackendInited = false;
 				ImGui::DestroyContext();
-				g_failed = true;
-				SPDLOG_ERROR("[CloudShadows][Menu] ImGui backend/input initialization failed");
+				// A window hook can be refused transiently (window recreation in
+				// progress); retry later rather than disabling the menu for good.
+				g_initRetryAfter = GetTickCount64() + 5000;
+				SPDLOG_WARN("[CloudShadows][Menu] input hook unavailable; retrying in 5 s");
 				return false;
 			}
 
@@ -815,10 +841,6 @@ void main(uint3 id : SV_DispatchThreadID)
 			ImGui::TextWrapped("F8 cycles the sky views; F7 clears the preview.");
 			if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_relaxed)) {
 				ImGui::TextWrapped("Enable Cloud Shadows to view the capture.");
-				return;
-			}
-			if (FO4CS::CloudComparison::EffectiveMethod() != FO4CS::CloudComparison::Method::Cubemap) {
-				ImGui::TextWrapped("Select the cubemap method to view its six faces.");
 				return;
 			}
 			auto* cube = CloudShadows::GetCommittedWorldCloudTiles();
@@ -894,52 +916,17 @@ void main(uint3 id : SV_DispatchThreadID)
             }
 
 #endif
-			ImGui::SliderFloat("Shadow opacity", &g_settings.Opacity, 0.0f, 4.0f, "%.2f");
+			ImGui::SliderFloat("Shadow opacity", &g_settings.Opacity, 0.0f, 4.0f, "%.2f",
+				ImGuiSliderFlags_AlwaysClamp);
             ImGui::TextWrapped("Controls how strongly clouds dim direct sunlight. Default: 2.0.");
 
-#if !FO4CS_ENABLE_DEVELOPER_TOOLS
-            {
-                int method = FO4CS::CloudComparison::GetMethod() ==
-                    FO4CS::CloudComparison::Method::SunMask ? 1 : 0;
-                const char* methods[]{ "Cubemap", "Sun-oriented 2D map" };
-                const bool sunAvailable = FO4CS::CloudComparison::SunMethodAvailable() &&
-                    FO4CS::CloudGeometryCapture::SunCaptureAvailable();
-                // Only block picking the unavailable option; a saved Sun 2D
-                // selection must always be able to return to Cubemap.
-                ImGui::BeginDisabled(!sunAvailable && method == 0);
-                if (ImGui::Combo("Cloud shadow method", &method, methods, IM_ARRAYSIZE(methods)))
-                    FO4CS::CloudComparison::SetMethod(method == 1
-                        ? FO4CS::CloudComparison::Method::SunMask
-                        : FO4CS::CloudComparison::Method::Cubemap);
-                ImGui::EndDisabled();
-                if (!sunAvailable)
-                    ImGui::TextDisabled(method == 1
-                        ? "The 2D map is unavailable in this session; the cubemap is used instead (see the log)."
-                        : "The 2D map is unavailable in this session (see the log).");
-                else if (method == 1)
-                    ImGui::TextWrapped("Sun-oriented 2D map: a single cloud map facing the sun. "
-                        "Cheaper, but its coverage is finite and fades near its edge. "
-                        "The sky preview (F8) and the cubemap view are unavailable in this mode.");
-                else
-                    ImGui::TextWrapped("Cubemap: six cloud faces around the player. Default; "
-                        "supports the sky preview (F8) and the cubemap view.");
-            }
-#endif
-
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
-            int captureMethod = static_cast<int>(FO4CS::CloudComparison::GetMethod());
-            const char* captureMethods[]{ "Cubemap", "Sun-oriented 2D (experimental)" };
-            if (ImGui::Combo("Capture method (F6)", &captureMethod, captureMethods, 2))
-                FO4CS::CloudComparison::SetMethod(static_cast<FO4CS::CloudComparison::Method>(captureMethod));
-            ImGui::TextWrapped("F6 switches capture methods. F10 toggles shadows and starts timing. "
+            ImGui::TextWrapped("F10 toggles shadows and starts timing. "
                 "Keep the camera fixed and close this menu for 13 seconds. F8 previews the cubemap; "
                 "preview frames are excluded from timing. F7 stops measurement and hides the HUD. "
                 "Test selections reset at the next launch.");
             if (FO4CS::CloudComparison::HudVisible() && ImGui::Button("Stop comparison HUD (F7)"))
                 FO4CS::CloudComparison::StopMeasurements();
-            if (captureMethod == 1)
-                ImGui::TextWrapped("The 2D map has finite coverage and fades at its boundary. "
-                    "Check near and distant ground before comparing its performance.");
 
 #endif
 
@@ -998,7 +985,6 @@ void main(uint3 id : SV_DispatchThreadID)
 					g_shadowsEnabled.load(std::memory_order_relaxed);
 				g_settings = Settings{};
 				FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(false);
-				FO4CS::CloudComparison::SetMethod(FO4CS::CloudComparison::Method::Cubemap);
 				g_shadowsEnabled.store(true, std::memory_order_relaxed);
 				if (!wasEnabled)
 					InvalidateWorldCloudCaptureForToggle();
@@ -1036,7 +1022,6 @@ void main(uint3 id : SV_DispatchThreadID)
 			const float anchorX = g_projectionAnchorX.load(std::memory_order_relaxed);
 			const float anchorY = g_projectionAnchorY.load(std::memory_order_relaxed);
 			const float anchorZ = g_projectionAnchorZ.load(std::memory_order_relaxed);
-			const auto nativeCapture = FO4CS::NativeSkyCube::GetDiagnostics();
 			const auto godrays = FO4CS::GodraysIntegration::GetDiagnostics();
             const bool passiveCaptureProven = ready && layers != 0 &&
                 g_worldCloudCommittedEpoch.load(std::memory_order_acquire) != 0;
@@ -1097,14 +1082,6 @@ void main(uint3 id : SV_DispatchThreadID)
                 static_cast<unsigned long long>(g_geometryCapturePublished.load(std::memory_order_relaxed)),
                 static_cast<unsigned long long>(g_geometryCaptureRejected.load(std::memory_order_relaxed)));
             ImGui::TextUnformatted("Capture: 256px cube, live surface blending, no UV-map cache");
-            if (ImGui::TreeNode("Optional water-reflection observations")) {
-                ImGui::Text("Updates: %llu; sky / sky-less cube clicks: %llu / %llu",
-                    static_cast<unsigned long long>(nativeCapture.reflectionUpdateCount),
-                    static_cast<unsigned long long>(nativeCapture.skyBearingClickCount),
-                    static_cast<unsigned long long>(nativeCapture.skylessClickCount));
-                ImGui::TextWrapped("These observations do not gate cloud shadows.");
-                ImGui::TreePop();
-            }
 
 			const char* godrayCapability = !godrays.nativeConsumerSupported
 				? "unsupported by native runtime"
@@ -1371,10 +1348,34 @@ void main(uint3 id : SV_DispatchThreadID)
 			g_visible.load(std::memory_order_acquire);
 	}
 
+	namespace
+	{
+		void FlushPendingSave() noexcept
+		{
+			if (!g_pendingSave.exchange(false, std::memory_order_acq_rel))
+				return;
+			try {
+				CloudShadows::SaveSettings();
+			} catch (...) {
+				SPDLOG_ERROR("[CloudShadows][Menu] Could not save settings after the menu closed");
+			}
+		}
+	}
+
+	void CloseForDisabledHotkeys() noexcept
+	{
+		std::scoped_lock imguiLock(g_imguiLifetimeMutex);
+		if (g_visible.load(std::memory_order_acquire)) {
+			SetVisible(false);
+			SPDLOG_INFO("[CloudShadows][Menu] hidden (Development Menu turned off)");
+		}
+	}
+
 	void Shutdown() noexcept
 	{
 		std::scoped_lock imguiLock(g_imguiLifetimeMutex);
 		SetVisible(false);
+		FlushPendingSave();
 		// Cover teardown reached after a focus/window transition that already
 		// cleared visibility but still has transient capture state.
 		FO4CS::EngineAPI::ShowGameCursorMenu(false);
@@ -1447,13 +1448,25 @@ void main(uint3 id : SV_DispatchThreadID)
 				FO4CS::EngineAPI::ShowGameCursorMenu(false);
 				ReleaseOwnedMouseCapture();
 				g_visible.store(false, std::memory_order_release);
+				g_pendingSave.store(true, std::memory_order_release);
 			}
 			if (g_inited.load(std::memory_order_acquire) ||
 				g_visible.load(std::memory_order_acquire)) {
 				Shutdown();
 			}
+			FlushPendingSave();
 			return;
 		}
+		FlushPendingSave();
+
+		// With the Development Menu off and no HUD or preview showing there is
+		// nothing to draw or poll: never create ImGui, hook the window or read
+		// the swap chain for every player who never uses the menu.
+		if (!CloudShadows::g_hotkeysEnabled.load(std::memory_order_relaxed) &&
+			!g_visible.load(std::memory_order_acquire) &&
+			!FO4CS::CloudComparison::HudVisible() &&
+			FO4CS::CloudComparison::GetPreview() == FO4CS::CloudComparison::Preview::Off)
+			return;
 
 		// Present can reach us below RenderDoc's swap-chain wrapper, while the
 		// captured renderer device/context and preview SRVs are above it. Use
@@ -1527,7 +1540,7 @@ void main(uint3 id : SV_DispatchThreadID)
 			SPDLOG_INFO("[CloudShadows][Menu] hidden (hotkeys disabled in settings)");
 		}
 		const bool f11Down = hotkeys && (GetAsyncKeyState(VK_F11) & 0x8000) != 0;
-		if (IsFalloutForeground() && f11Down && !s_f11Was) {
+		if (f11Down && !s_f11Was && IsFalloutForeground()) {
 			const bool show = !g_visible.load(std::memory_order_acquire);
 			SetVisible(show);
 			SPDLOG_INFO("[CloudShadows][Menu] {}", show ? "shown" : "hidden");
@@ -1571,7 +1584,7 @@ void main(uint3 id : SV_DispatchThreadID)
                     if (gpu.frames)
                         ImGui::Text("GPU capture %.3f ms | projection %.3f ms | %.0f capture draws/frame",
                             gpu.captureMs, gpu.projectionMs, gpu.draws);
-                    ImGui::TextDisabled("F6: method | F10: on/off + timing | F8: sky alignment | F7: stop | F11: settings");
+                    ImGui::TextDisabled("F10: on/off + timing | F8: sky alignment | F7: stop | F11: settings");
 #else
                     ImGui::TextDisabled("F10: toggle | F8: sky preview | F7: hide | F11: settings");
 #endif

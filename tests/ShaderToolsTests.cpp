@@ -790,6 +790,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 		patcher.StoreBytecode(hash, fixture.data(), fixture.size());
 		patcher.Release();
 		patcher.Initialize(device);
+		patcher.WaitForClassification();
 		ComPtr<ID3D11PixelShader> firstGeneration;
 		firstGeneration.Attach(patcher.GetPatchedPSByHash(hash));
 		tests.Require(patcher.IsInitialized() && patcher.IsReady() &&
@@ -825,6 +826,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 		tests.Require(!patcher.IsInitialized() && !patcher.IsReady(),
 			"device Release clears device state");
 		patcher.Initialize(device);
+		patcher.WaitForClassification();
 		ComPtr<ID3D11PixelShader> secondGeneration;
 		secondGeneration.Attach(patcher.GetPatchedPSByHash(hash));
 		tests.Require(patcher.IsReady() && secondGeneration != nullptr,
@@ -833,6 +835,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 		secondGeneration.Reset();
 		patcher.Reset();
 		patcher.Initialize(device);
+		patcher.WaitForClassification();
 		ComPtr<ID3D11PixelShader> afterReset;
 		afterReset.Attach(patcher.GetPatchedPSByHash(hash));
 		tests.Require(patcher.IsInitialized() && !patcher.IsReady() &&

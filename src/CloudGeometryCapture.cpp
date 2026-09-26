@@ -4,6 +4,7 @@
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
+#include <wrl/client.h>
 #include <array>
 #include <cstring>
 #include <spdlog/spdlog.h>
@@ -13,7 +14,6 @@ namespace FO4CS::CloudGeometryCapture
     namespace
     {
         using Microsoft::WRL::ComPtr;
-        namespace Motion = CloudMotionResolver;
 
         // The reviewed stock VS uses World for the camera-relative POSITION0
         // output, TexCoordOff for UV animation, and BlendColor0.w*(color.w+1e-6)
@@ -23,11 +23,7 @@ namespace FO4CS::CloudGeometryCapture
         // Preserve mesh UV/alpha before animation: baking a zero initial blend
         // permanently loses a layer that becomes visible in a later frame.
         constexpr char kShader[] = R"(
-cbuffer Face : register(b0) { float4 Right; float4 Up; float4 Forward;
-#if SUN_MASK
-float4 Center;
-#endif
-};
+cbuffer Face : register(b0) { float4 Right; float4 Up; float4 Forward; };
 cbuffer Sky : register(b2) {
 #if VR
     float4 prefix[8];
@@ -42,49 +38,21 @@ cbuffer Sky : register(b2) {
 #endif
 };
 struct Input { float3 p : POSITION0; float2 uv : TEXCOORD0; float4 c : COLOR0; };
-// SV_ClipDistance is rejected by Proton/Wine's vkd3d d3dcompiler (E5013), so
-// the horizon clip is carried as an interpolator and applied with clip() in
-// the pixel shader. Per-pixel results match the clip-distance path.
-struct Output { float4 p : SV_Position; float2 uv : TEXCOORD0; float alpha : TEXCOORD1;
-    float horizon : TEXCOORD2; };
+struct Output { float4 p : SV_Position; float2 uv : TEXCOORD0; float alpha : TEXCOORD1; };
 Output VS(Input i, uint instanceIndex : SV_InstanceID) {
     Output o;
     float3 direction = mul(World, float4(i.p, 1));
-#if SUN_MASK
-    float lengthSquared = dot(direction, direction);
-    float3 ray = direction * rsqrt(max(lengthSquared, 1.0e-12));
-    float height = Up.w;
-    float radius = Forward.w;
-    float deficit = height * (2.0 * radius + height);
-    float b = radius * ray.z;
-    float root = sqrt(b * b + deficit);
-    float distanceToShell = b >= 0 ? deficit / max(b + root, 1.0e-7) : root - b;
-    // Preserve projective UV interpolation as the native dome is mapped onto
-    // the cloud shell. This becomes the exact ray/plane homography locally.
-    float w = sqrt(max(lengthSquared, 1.0e-12)) / max(distanceToShell, 1.0e-7);
-    float3 offset = direction - Center.xyz * w;
-    o.p = float4(dot(Right.xyz, offset) / Right.w,
-        dot(Up.xyz, offset) / Right.w, 0.5 * w, w);
-    o.horizon = direction.z;
-#else
-    o.horizon = 1.0;
     float forward = dot(Forward.xyz, direction);
     o.p = float4(dot(Right.xyz, direction), dot(Up.xyz, direction), forward, forward);
-#endif
-    o.uv = i.uv;
-    o.alpha = i.c.w + 0.000001;
-#if OPACITY
-    o.uv += TexCoordOff;
-    o.alpha *= BlendColor[0].w;
+    o.uv = i.uv + TexCoordOff;
+    o.alpha = (i.c.w + 0.000001) * BlendColor[0].w;
 #if VR
     // Native VR submits the same dome for both eyes. The directional cube
     // has one camera, so duplicate stereo instances must not double opacity.
     if (instanceIndex != 0) o.p = float4(0, 0, -1, 1);
 #endif
-#endif
     return o;
 }
-float4 PS(Output i) : SV_Target0 { clip(i.horizon); return float4(i.uv, i.alpha, 1); }
 )";
 
         constexpr char kOpacityPS[] = R"(
@@ -93,15 +61,13 @@ Texture2D<float4> Cloud0 : register(t0);
 Texture2D<float4> Cloud1 : register(t1);
 SamplerState Sampler0 : register(s0);
 SamplerState Sampler1 : register(s1);
-struct Input { float4 p : SV_Position; float2 uv : TEXCOORD0; float alpha : TEXCOORD1;
-    float horizon : TEXCOORD2; };
+struct Input { float4 p : SV_Position; float2 uv : TEXCOORD0; float alpha : TEXCOORD1; };
 // Portable finite test. Proton/Wine's vkd3d-based d3dcompiler lacks the
 // isfinite intrinsic, and fxc may fold NaN comparisons; the exponent bit test
 // is exact IEEE-754 on both compilers. A macro, not overloads: vkd3d cannot
 // prioritize between compatible overloads (E5017).
 #define IS_FINITE(x) ((asuint(x) & 0x7F800000u) != 0x7F800000u)
 float4 PS(Input i) : SV_Target0 {
-    clip(i.horizon);
     float alpha = Cloud0.Sample(Sampler0, i.uv).a;
 #if TECHNIQUE == 6
     alpha = lerp(alpha, Cloud1.Sample(Sampler1, i.uv).a, Parameter.x);
@@ -124,98 +90,95 @@ float4 PS(Input i) : SV_Target0 {
             {{1,0,0,0}, {0,1,0,0}, {0,0,1,0}},
             {{-1,0,0,0}, {0,1,0,0}, {0,0,-1,0}}
         }};
+        static_assert(kCapturedCubeFaceCount <= kFaces.size());
+
+        // Compiles are deterministic for a device: a failure is retried with
+        // exponential backoff and logged once per failure streak, never on
+        // every authenticated cloud draw.
+        struct CompileLatch
+        {
+            ULONGLONG retryAfter{};
+            std::uint32_t failures{};
+
+            [[nodiscard]] bool Blocked() const noexcept
+            {
+                return failures != 0 && GetTickCount64() < retryAfter;
+            }
+
+            bool Fail() noexcept
+            {
+                ++failures;
+                retryAfter = GetTickCount64() +
+                    (std::min)(300000ull, 5000ull << (std::min)(failures, 6u));
+                return failures == 1;
+            }
+        };
 
         struct Resources
         {
             ComPtr<ID3D11Device> device;
-            std::array<ComPtr<ID3D11VertexShader>, 2> vs;
+            bool baseReady{};
+            CompileLatch baseLatch;
             std::array<ComPtr<ID3D11VertexShader>, 2> opacityVS;
-            std::array<ComPtr<ID3D11VertexShader>, 2> sunOpacityVS;
-            bool sunVsFailed{};
-            ComPtr<ID3D11Buffer> sunProjectionCB;
-            SunMaskProjection sunProjection{};
-            bool sunProjectionValid{};
+            std::array<CompileLatch, 2> opacityLatch;
             std::array<ComPtr<ID3D11PixelShader>, 3> opacityPS;
             ComPtr<ID3D11BlendState> opacityBlend;
             std::array<ComPtr<ID3D11RasterizerState>, 6> opacityRasterizers;
-            ComPtr<ID3D11PixelShader> ps;
             std::array<ComPtr<ID3D11Buffer>, 6> faces;
-            ComPtr<ID3D11BlendState> blend;
             ComPtr<ID3D11DepthStencilState> depth;
-            ComPtr<ID3D11RasterizerState> rasterizer;
         };
-        Resources s_resources;
+        // Never destroyed: D3D objects must not be released from a DLL
+        // static destructor under the loader lock at process exit.
+        Resources& s_resources = *new Resources();
 
-        bool EnsureResourcesUncached(ID3D11Device* device);
-
-        // A persistent compile failure must not re-run D3DCompile for every
-        // authenticated cloud draw; retry at most every few seconds.
-        bool EnsureResources(ID3D11Device* device)
+        [[nodiscard]] bool CompileVertexShader(ID3D11Device* device,
+            const D3D_SHADER_MACRO* macros, const char* name,
+            ComPtr<ID3D11VertexShader>& shader, CompileLatch& latch)
         {
-            static ID3D11Device* s_failedDevice = nullptr;
-            static ULONGLONG s_failedTick = 0;
-            if (s_resources.device.Get() == device && s_resources.ps)
+            if (shader)
                 return true;
-            if (s_failedDevice == device && GetTickCount64() - s_failedTick < 5000)
+            if (latch.Blocked())
                 return false;
-            if (EnsureResourcesUncached(device)) {
-                s_failedDevice = nullptr;
+            ComPtr<ID3DBlob> code, errors;
+            if (SUCCEEDED(D3DCompile(kShader, sizeof(kShader) - 1, name, macros,
+                    nullptr, "VS", "vs_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0,
+                    &code, &errors)) &&
+                SUCCEEDED(device->CreateVertexShader(code->GetBufferPointer(),
+                    code->GetBufferSize(), nullptr, &shader))) {
+                latch = {};
                 return true;
             }
-            s_failedDevice = device;
-            s_failedTick = GetTickCount64();
+            shader.Reset();
+            if (latch.Fail()) {
+                SPDLOG_ERROR("[CloudShadows] {} failed: {}", name, errors
+                    ? static_cast<const char*>(errors->GetBufferPointer())
+                    : "compile/create failed");
+            }
             return false;
         }
 
-        bool EnsureResourcesUncached(ID3D11Device* device)
+        // Pixel shaders, face bases and fixed-function states shared by both
+        // layouts.
+        [[nodiscard]] bool EnsureBaseResources(ID3D11Device* device)
         {
-            if (s_resources.device.Get() == device && s_resources.ps)
+            if (s_resources.device.Get() != device) {
+                s_resources = {};
+                s_resources.device = device;
+            }
+            if (s_resources.baseReady)
                 return true;
+            if (s_resources.baseLatch.Blocked())
+                return false;
             Resources next;
             next.device = device;
-            for (std::size_t layout = 0; layout < next.vs.size(); ++layout) {
-                const D3D_SHADER_MACRO macros[]{ {"VR", layout ? "1" : "0"}, {} };
-                ComPtr<ID3DBlob> code, errors;
-                if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1,
-                        "CloudGeometryCapture", macros, nullptr, "VS", "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)) ||
-                    FAILED(device->CreateVertexShader(code->GetBufferPointer(),
-                        code->GetBufferSize(), nullptr, &next.vs[layout]))) {
-                    if (errors) SPDLOG_ERROR("Cloud mapping VS: {}",
-                        static_cast<const char*>(errors->GetBufferPointer()));
-                    return false;
+            const auto fail = [&](const char* what, ID3DBlob* errors) {
+                if (s_resources.baseLatch.Fail()) {
+                    SPDLOG_ERROR("[CloudShadows] Cloud capture {} failed: {}", what,
+                        errors ? static_cast<const char*>(errors->GetBufferPointer())
+                               : "creation failed");
                 }
-                const D3D_SHADER_MACRO opacityMacros[]{
-                    {"VR", layout ? "1" : "0"}, {"OPACITY", "1"}, {} };
-                if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1,
-                        "CloudOpacityCapture", opacityMacros, nullptr, "VS", "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)) ||
-                    FAILED(device->CreateVertexShader(code->GetBufferPointer(),
-                        code->GetBufferSize(), nullptr, &next.opacityVS[layout]))) {
-                    if (errors) SPDLOG_ERROR("Cloud opacity VS: {}",
-                        static_cast<const char*>(errors->GetBufferPointer()));
-                    return false;
-                }
-                const D3D_SHADER_MACRO sunMacros[]{
-                    {"VR", layout ? "1" : "0"}, {"OPACITY", "1"},
-                    {"SUN_MASK", "1"}, {} };
-                // The sun-oriented capture is optional: its failure must never
-                // disable the cubemap producer (observed on Proton 1.0.1/1.0.2).
-                if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1,
-                        "SunOpacityCapture", sunMacros, nullptr, "VS", "vs_5_0",
-                        D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)) ||
-                    FAILED(device->CreateVertexShader(code->GetBufferPointer(),
-                        code->GetBufferSize(), nullptr, &next.sunOpacityVS[layout]))) {
-                    static bool loggedSunFailure = false;
-                    if (!loggedSunFailure) {
-                        loggedSunFailure = true;
-                        SPDLOG_WARN("Sun opacity VS unavailable; the Sun 2D method falls back to the cubemap: {}",
-                            errors ? static_cast<const char*>(errors->GetBufferPointer()) : "compile/create failed");
-                    }
-                    next.sunOpacityVS[layout].Reset();
-                    next.sunVsFailed = true;
-                }
-            }
+                return false;
+            };
             constexpr const char* techniques[]{ "5", "6", "7" };
             for (std::size_t index = 0; index < next.opacityPS.size(); ++index) {
                 ComPtr<ID3DBlob> code, errors;
@@ -224,20 +187,9 @@ float4 PS(Input i) : SV_Target0 {
                         "CloudOpacityCapture", macros, nullptr, "PS", "ps_5_0",
                         D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)) ||
                     FAILED(device->CreatePixelShader(code->GetBufferPointer(),
-                        code->GetBufferSize(), nullptr, &next.opacityPS[index]))) {
-                    if (errors) SPDLOG_ERROR("Cloud opacity PS: {}",
-                        static_cast<const char*>(errors->GetBufferPointer()));
-                    return false;
-                }
+                        code->GetBufferSize(), nullptr, &next.opacityPS[index])))
+                    return fail("opacity PS", errors.Get());
             }
-            ComPtr<ID3DBlob> code, errors;
-            const D3D_SHADER_MACRO macros[]{ {"VR", "0"}, {} };
-            if (FAILED(D3DCompile(kShader, sizeof(kShader) - 1,
-                    "CloudGeometryCapture", macros, nullptr, "PS", "ps_5_0",
-                    D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &code, &errors)) ||
-                FAILED(device->CreatePixelShader(code->GetBufferPointer(),
-                    code->GetBufferSize(), nullptr, &next.ps)))
-                return false;
             D3D11_BUFFER_DESC buffer{};
             buffer.ByteWidth = sizeof(FaceBasis);
             buffer.Usage = D3D11_USAGE_IMMUTABLE;
@@ -249,24 +201,10 @@ float4 PS(Input i) : SV_Target0 {
                 D3D11_SUBRESOURCE_DATA initial{};
                 initial.pSysMem = &kFaces[face];
                 if (FAILED(device->CreateBuffer(&buffer, &initial, &next.faces[face])))
-                    return false;
+                    return fail("face basis", nullptr);
             }
-            buffer.ByteWidth = sizeof(SunMaskProjection);
-            buffer.Usage = D3D11_USAGE_DYNAMIC;
-            buffer.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-            if (FAILED(device->CreateBuffer(&buffer, nullptr, &next.sunProjectionCB)))
-                return false;
             D3D11_BLEND_DESC blend{};
             blend.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
-            D3D11_DEPTH_STENCIL_DESC depth{};
-            D3D11_RASTERIZER_DESC rasterizer{};
-            rasterizer.FillMode = D3D11_FILL_SOLID;
-            rasterizer.CullMode = D3D11_CULL_NONE;
-            rasterizer.DepthClipEnable = TRUE;
-            if (FAILED(device->CreateBlendState(&blend, &next.blend)) ||
-                FAILED(device->CreateDepthStencilState(&depth, &next.depth)) ||
-                FAILED(device->CreateRasterizerState(&rasterizer, &next.rasterizer)))
-                return false;
             blend.RenderTarget[0].BlendEnable = TRUE;
             blend.RenderTarget[0].SrcBlend = D3D11_BLEND_ONE;
             blend.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
@@ -274,18 +212,36 @@ float4 PS(Input i) : SV_Target0 {
             blend.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
             blend.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_INV_SRC_ALPHA;
             blend.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-            if (FAILED(device->CreateBlendState(&blend, &next.opacityBlend)))
-                return false;
+            D3D11_DEPTH_STENCIL_DESC depth{};
+            if (FAILED(device->CreateBlendState(&blend, &next.opacityBlend)) ||
+                FAILED(device->CreateDepthStencilState(&depth, &next.depth)))
+                return fail("blend/depth state", nullptr);
+            D3D11_RASTERIZER_DESC rasterizer{};
+            rasterizer.FillMode = D3D11_FILL_SOLID;
+            rasterizer.DepthClipEnable = TRUE;
             for (UINT index = 0; index < next.opacityRasterizers.size(); ++index) {
                 rasterizer.CullMode = static_cast<D3D11_CULL_MODE>(index / 2 + 1);
                 rasterizer.FrontCounterClockwise = (index & 1) != 0;
                 if (FAILED(device->CreateRasterizerState(
                         &rasterizer, &next.opacityRasterizers[index])))
-                    return false;
+                    return fail("rasterizer state", nullptr);
             }
+            next.baseReady = true;
             s_resources = std::move(next);
-            SPDLOG_INFO("[CloudShadows] Main-Sky geometry mapping shaders ready (flat/VR)");
+            SPDLOG_INFO("[CloudShadows] Cloud opacity capture resources ready");
             return true;
+        }
+
+        [[nodiscard]] ID3D11VertexShader* EnsureVertexShader(
+            ID3D11Device* device, SkyConstantLayout layout)
+        {
+            if (!EnsureBaseResources(device))
+                return nullptr;
+            const std::size_t index = layout == SkyConstantLayout::kVr ? 1 : 0;
+            const D3D_SHADER_MACRO macros[]{ {"VR", index ? "1" : "0"}, {} };
+            return CompileVertexShader(device, macros, "Cloud opacity capture VS",
+                       s_resources.opacityVS[index], s_resources.opacityLatch[index])
+                ? s_resources.opacityVS[index].Get() : nullptr;
         }
 
         class SavedState
@@ -294,8 +250,8 @@ float4 PS(Input i) : SV_Target0 {
             explicit SavedState(ID3D11DeviceContext* context) : context_(context)
             {
                 FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureSave);
-                context_->VSGetShader(&vs_, nullptr, nullptr);
-                context_->PSGetShader(&ps_, nullptr, nullptr);
+                context_->VSGetShader(&vs_, nullptr, &vsClasses_);
+                context_->PSGetShader(&ps_, nullptr, &psClasses_);
                 (void)context_->QueryInterface(IID_PPV_ARGS(&context1_));
                 if (context1_)
                     context1_->VSGetConstantBuffers1(0, 1, &cb_, &first_, &count_);
@@ -333,11 +289,22 @@ float4 PS(Input i) : SV_Target0 {
             }
             SavedState(const SavedState&) = delete;
             SavedState& operator=(const SavedState&) = delete;
+
+            // The stock pair was fetched once here; validation reuses it.
+            [[nodiscard]] bool HasStaticShaders() const noexcept
+            {
+                return vs_ && ps_ && vsClasses_ == 0 && psClasses_ == 0;
+            }
+            [[nodiscard]] ID3D11RasterizerState* Rasterizer() const noexcept
+            {
+                return rasterizer_.Get();
+            }
         private:
             ID3D11DeviceContext* context_;
             ComPtr<ID3D11DeviceContext1> context1_;
             ComPtr<ID3D11VertexShader> vs_;
             ComPtr<ID3D11PixelShader> ps_;
+            UINT vsClasses_{}, psClasses_{};
             ComPtr<ID3D11Buffer> cb_;
             UINT first_{}, count_{};
             std::array<ID3D11RenderTargetView*, 8> targets_{};
@@ -354,14 +321,17 @@ float4 PS(Input i) : SV_Target0 {
             BOOL predicateValue_{};
         };
 
-        bool SupportedPipeline(ID3D11DeviceContext* context)
+        // Stages the replay cannot preserve. VS/PS were already fetched by
+        // SavedState, so only the remaining pipeline slots are queried here.
+        [[nodiscard]] RejectReason CheckPipeline(
+            ID3D11DeviceContext* context, const SavedState& saved)
         {
-                FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureValidation);
+            FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureValidation);
             D3D11_PRIMITIVE_TOPOLOGY topology{};
             context->IAGetPrimitiveTopology(&topology);
             if (topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST &&
                 topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP)
-                return false;
+                return RejectReason::kTopology;
             ComPtr<ID3D11GeometryShader> gs;
             ComPtr<ID3D11HullShader> hs;
             ComPtr<ID3D11DomainShader> ds;
@@ -369,139 +339,83 @@ float4 PS(Input i) : SV_Target0 {
             context->HSGetShader(&hs, nullptr, nullptr);
             context->DSGetShader(&ds, nullptr, nullptr);
             if (gs || hs || ds)
-                return false;
-            ComPtr<ID3D11VertexShader> vs;
-            ComPtr<ID3D11PixelShader> ps;
-            UINT vsClasses = 0, psClasses = 0;
-            context->VSGetShader(&vs, nullptr, &vsClasses);
-            context->PSGetShader(&ps, nullptr, &psClasses);
-            if (!vs || !ps || vsClasses != 0 || psClasses != 0)
-                return false;
+                return RejectReason::kExtraShaderStage;
+            if (!saved.HasStaticShaders())
+                return RejectReason::kClassLinkage;
             std::array<ID3D11Buffer*, D3D11_SO_BUFFER_SLOT_COUNT> outputs{};
             context->SOGetTargets(static_cast<UINT>(outputs.size()), outputs.data());
-            bool supported = true;
+            bool streamOutput = false;
             for (auto* output : outputs) {
                 if (output) {
-                    supported = false;
+                    streamOutput = true;
                     output->Release();
                 }
             }
+            if (streamOutput)
+                return RejectReason::kStreamOutput;
             // OMSetRenderTargets would otherwise silently disturb an owner's
             // pixel UAV bindings. Stock Sky has none.
             std::array<ID3D11UnorderedAccessView*, D3D11_PS_CS_UAV_REGISTER_COUNT> uavs{};
             context->OMGetRenderTargetsAndUnorderedAccessViews(
                 0, nullptr, nullptr, 0, static_cast<UINT>(uavs.size()), uavs.data());
+            bool pixelUav = false;
             for (auto* uav : uavs) {
                 if (uav) {
-                    supported = false;
+                    pixelUav = true;
                     uav->Release();
                 }
             }
-            return supported;
+            return pixelUav ? RejectReason::kPixelUav : RejectReason::kNone;
         }
-    }
-
-    bool CaptureLayer(ID3D11DeviceContext* context,
-        Motion::SkyConstantLayout layout, std::uint64_t stableLayerId,
-        Motion::CloudTechnique technique, std::uint32_t faceSize,
-        SubmitDraw submit, void* user) noexcept
-    {
-        try {
-            if (!context || !submit || !stableLayerId || !faceSize ||
-                context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
-                (layout != Motion::SkyConstantLayout::kFlat &&
-                 layout != Motion::SkyConstantLayout::kVr) ||
-                !SupportedPipeline(context))
-                return false;
-            ComPtr<ID3D11Device> device;
-            context->GetDevice(&device);
-            if (!EnsureResources(device.Get()))
-                return false;
-            SavedState saved(context);
-            context->VSSetShader(s_resources.vs[
-                layout == Motion::SkyConstantLayout::kVr ? 1 : 0].Get(), nullptr, 0);
-            context->PSSetShader(s_resources.ps.Get(), nullptr, 0);
-            context->OMSetBlendState(s_resources.blend.Get(), nullptr, UINT(-1));
-            context->OMSetDepthStencilState(s_resources.depth.Get(), 0);
-            context->RSSetState(s_resources.rasterizer.Get());
-            context->SetPredication(nullptr, FALSE);
-            const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(faceSize),
-                static_cast<float>(faceSize), 0, 1};
-            context->RSSetViewports(1, &viewport);
-            for (std::uint32_t face = 0; face < 6; ++face) {
-                Motion::CaptureLayerFace layer{
-                    stableLayerId, face, technique, true };
-                Motion::CaptureFaceTarget destination;
-                if (!Motion::AcquireLayerMappingTarget(context, layer, destination))
-                    return false;
-                auto* target = destination.mappingRtv.Get();
-                context->OMSetRenderTargets(1, &target, nullptr);
-                auto* faceCB = s_resources.faces[face].Get();
-                context->VSSetConstantBuffers(0, 1, &faceCB);
-                submit(user);
-                if (!Motion::CompleteLayerMapping(layer, true))
-                    return false;
-            }
-            return true;
-        } catch (...) {
-            return false;
-        }
-    }
-
-    bool SunCaptureAvailable() noexcept
-    {
-        return !s_resources.sunVsFailed;
     }
 
     void ReleaseDeviceResources() noexcept { s_resources = {}; }
 
-    static bool Accumulate(ID3D11DeviceContext* context,
-        Motion::SkyConstantLayout layout, Motion::CloudTechnique technique,
-        std::uint32_t faceSize,
-        const std::array<ID3D11RenderTargetView*, 6>& targets,
-        SubmitDraw submit, void* user, const SunMaskProjection* sun) noexcept
+    bool AccumulateOpacity(ID3D11DeviceContext* context,
+        SkyConstantLayout layout, CloudTechnique technique,
+        std::uint32_t faceSize, const std::array<ID3D11RenderTargetView*, 6>& targets,
+        SubmitDraw submit, void* user, RejectReason* reason) noexcept
     {
         FO4CS::CpuProfile::Scope cpuTotal(FO4CS::CpuProfile::Stage::CaptureTotal);
+        RejectReason unused{};
+        auto& result = reason ? *reason : unused;
+        result = RejectReason::kNone;
         try {
             FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureValidation);
             const auto techniqueIndex = static_cast<std::uint32_t>(technique) - 5u;
             if (!context || !submit || !faceSize || techniqueIndex >= 3 ||
                 context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE ||
-                (layout != Motion::SkyConstantLayout::kFlat &&
-                 layout != Motion::SkyConstantLayout::kVr) ||
-                !SupportedPipeline(context))
+                (layout != SkyConstantLayout::kFlat &&
+                 layout != SkyConstantLayout::kVr)) {
+                result = RejectReason::kInvalidRequest;
                 return false;
-            const std::uint32_t faceCount = sun ? 1u : 6u;
-            for (std::uint32_t face = 0; face < faceCount; ++face)
-                if (!targets[face]) return false;
-            if (sun && (sun->centerAndValid.w != 1.0f ||
-                    sun->rightAndHalfWidth.w <= 0.0f))
-                return false;
+            }
+            for (std::uint32_t face = 0; face < kCapturedCubeFaceCount; ++face) {
+                if (!targets[face]) {
+                    result = RejectReason::kInvalidRequest;
+                    return false;
+                }
+            }
             ComPtr<ID3D11Device> device;
             context->GetDevice(&device);
-            if (!EnsureResources(device.Get()))
+            auto* vertexShader = EnsureVertexShader(device.Get(), layout);
+            if (!vertexShader) {
+                result = RejectReason::kResources;
                 return false;
-            cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureBuffer);
-            if (sun && (!s_resources.sunProjectionValid ||
-                    std::memcmp(sun, &s_resources.sunProjection, sizeof(*sun)) != 0)) {
-                D3D11_MAPPED_SUBRESOURCE mapped{};
-                if (FAILED(context->Map(s_resources.sunProjectionCB.Get(), 0,
-                        D3D11_MAP_WRITE_DISCARD, 0, &mapped)) || !mapped.pData)
-                    return false;
-                std::memcpy(mapped.pData, sun, sizeof(*sun));
-                context->Unmap(s_resources.sunProjectionCB.Get(), 0);
-                s_resources.sunProjection = *sun;
-                s_resources.sunProjectionValid = true;
             }
-            cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureValidation);
-            ComPtr<ID3D11RasterizerState> nativeRasterizer;
-            context->RSGetState(&nativeRasterizer);
+            SavedState saved(context);
+            result = CheckPipeline(context, saved);
+            if (result != RejectReason::kNone)
+                return false;
             D3D11_RASTERIZER_DESC rasterizer{};
             rasterizer.CullMode = D3D11_CULL_BACK;
-            if (nativeRasterizer) nativeRasterizer->GetDesc(&rasterizer);
+            if (auto* nativeRasterizer = saved.Rasterizer())
+                nativeRasterizer->GetDesc(&rasterizer);
             if (rasterizer.CullMode < D3D11_CULL_NONE ||
-                rasterizer.CullMode > D3D11_CULL_BACK)
+                rasterizer.CullMode > D3D11_CULL_BACK) {
+                result = RejectReason::kRasterizer;
                 return false;
+            }
             // Native Ni-world -> view projection reverses handedness; the
             // D3D cube-face bases above do not. Preserve the same physical
             // front faces by reversing the screen-space winding convention.
@@ -509,12 +423,8 @@ float4 PS(Input i) : SV_Target0 {
             // these same front-facing triangles have negative cube-face area.
             const auto rasterizerIndex = (rasterizer.CullMode - 1u) * 2u +
                 (rasterizer.FrontCounterClockwise ? 0u : 1u);
-            SavedState saved(context);
             cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureBind);
-            if (sun && s_resources.sunVsFailed)
-                return false;
-            context->VSSetShader((sun ? s_resources.sunOpacityVS : s_resources.opacityVS)[
-                layout == Motion::SkyConstantLayout::kVr ? 1 : 0].Get(), nullptr, 0);
+            context->VSSetShader(vertexShader, nullptr, 0);
             context->PSSetShader(s_resources.opacityPS[techniqueIndex].Get(), nullptr, 0);
             context->OMSetBlendState(s_resources.opacityBlend.Get(), nullptr, UINT(-1));
             context->OMSetDepthStencilState(s_resources.depth.Get(), 0);
@@ -523,37 +433,24 @@ float4 PS(Input i) : SV_Target0 {
             const D3D11_VIEWPORT viewport{0, 0, static_cast<float>(faceSize),
                 static_cast<float>(faceSize), 0, 1};
             context->RSSetViewports(1, &viewport);
-            for (std::uint32_t face = 0; face < faceCount; ++face) {
+            for (std::uint32_t face = 0; face < kCapturedCubeFaceCount; ++face) {
                 cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureBind);
                 auto* target = targets[face];
                 context->OMSetRenderTargets(1, &target, nullptr);
-                auto* faceCB = sun ? s_resources.sunProjectionCB.Get() : s_resources.faces[face].Get();
+                auto* faceCB = s_resources.faces[face].Get();
                 context->VSSetConstantBuffers(0, 1, &faceCB);
                 cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureDraw);
                 submit(user);
             }
             cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureValidation);
-            return SUCCEEDED(device->GetDeviceRemovedReason());
+            if (FAILED(device->GetDeviceRemovedReason())) {
+                result = RejectReason::kDeviceRemoved;
+                return false;
+            }
+            return true;
         } catch (...) {
+            result = RejectReason::kException;
             return false;
         }
-    }
-
-    bool AccumulateOpacity(ID3D11DeviceContext* context,
-        Motion::SkyConstantLayout layout, Motion::CloudTechnique technique,
-        std::uint32_t faceSize, const std::array<ID3D11RenderTargetView*, 6>& targets,
-        SubmitDraw submit, void* user) noexcept
-    {
-        return Accumulate(context, layout, technique, faceSize, targets, submit, user, nullptr);
-    }
-
-    bool AccumulateSunOpacity(ID3D11DeviceContext* context,
-        Motion::SkyConstantLayout layout, Motion::CloudTechnique technique,
-        ID3D11RenderTargetView* target, const SunMaskProjection& projection,
-        SubmitDraw submit, void* user) noexcept
-    {
-        const std::array<ID3D11RenderTargetView*, 6> targets{ target };
-        return Accumulate(context, layout, technique, SunMaskProjection::kResolution,
-            targets, submit, user, &projection);
     }
 }

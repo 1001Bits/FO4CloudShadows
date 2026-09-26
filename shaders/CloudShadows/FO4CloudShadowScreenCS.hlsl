@@ -25,16 +25,9 @@
 #ifndef FO4CS_SHADER_VR
 #define FO4CS_SHADER_VR 0
 #endif
-#ifndef FO4CS_SUN_MASK
-#define FO4CS_SUN_MASK 0
-#endif
 
 Texture2D<float> DepthTexture : register(t0);
-#if FO4CS_SUN_MASK
-Texture2D<float> WorldCloudTiles : register(t1);
-#else
 TextureCube<float> WorldCloudTiles : register(t1);
-#endif
 SamplerState WorldCloudSampler : register(s0);
 SamplerState EngineDepthSampler : register(s1);
 RWTexture2D<float> OutputTexture : register(u0);
@@ -59,10 +52,14 @@ cbuffer CloudShadowScreenCB : register(b0)
 
 	// xy = writable output extent; zw = reciprocal extent.
 	float4 OutputSizeAndInvSize : packoffset(c4);
-	// depthUV = outputPixelCentre * xy + zw.
-	float4 OutputPixelToDepthUV : packoffset(c5);
-	// ndc = outputPixelCentre * xy + zw (including the Y inversion).
-	float4 OutputPixelToNDC : packoffset(c6);
+	// x = 1 when DFLight b2 c27 carries the dynamic-resolution depth-UV scale
+	// (OG 1.10.163, NDC scale c0.xy); 0 on 1.11.240, whose DFLight binds 25
+	// per-call registers, samples depth unscaled and uses c0.zw for NDC.
+	// y = weight of PreviousFieldOrigin during a
+	// travel re-anchor crossfade (0 = none). zw reserved.
+	float4 ProjectionParams : packoffset(c5);
+	// xyz = previous world-fixed cloud-field origin while crossfading.
+	float4 PreviousFieldOrigin : packoffset(c6);
 
 	// xyz is the optional single-cloud diagnostic selector direction; w is the
 	// sun angular semi-diameter in radians (about 0.00465 for the real sun).
@@ -83,10 +80,6 @@ cbuffer CloudShadowScreenCB : register(b0)
 	float4 DiagnosticReceiverAndRadius : packoffset(c42);
     // Visible solar disc direction; w=1 valid, -1 invalid, 0 engine-basis test.
     float4 VisibleSunDirectionAndValidity : packoffset(c43);
-    float4 SunMaskRightAndHalfWidth : packoffset(c44);
-    float4 SunMaskUpAndHeight : packoffset(c45);
-    float4 SunMaskDirectionAndPlanet : packoffset(c46);
-    float4 SunMaskCenterAndValid : packoffset(c47);
 };
 
 #if !FO4CS_SHADER_VR
@@ -124,14 +117,26 @@ cbuffer EnginePerCall : register(b2)
 };
 #else
 // Exact native VR DFLight b12/b2 layout observed in vanilla VR DFLight DXBC:
-//   * c32-c39 = far inverse reprojection for eye 0/1
-//   * c40-c47 = near inverse reprojection for eye 0/1
+//   * c12-c19 = per-eye ViewProj (eye-relative Ni world -> clip), eye 0/1
+//   * c32-c39 = far inverse projection for eye 0/1 (clip -> eye view space)
+//   * c40-c47 = near inverse projection for eye 0/1
 //   * c59/c60 = absolute per-eye Ni-world positions
-//   * c1/c2   = per-eye sun direction in that same Ni-world basis
+//   * c1/c2   = per-eye sun direction in that eye's view space
 //   * c45.xy  = additional stereo depth-UV scale
+// A GPU readback while turning the headset (24 Sep 2026) showed c32-c35
+// constant and c12-c15 rotating: VR DFLight lights in view space.
 cbuffer EnginePerFrame : register(b1)
 {
-	float4 EnginePerFrame_pad_0_31[32] : packoffset(c0);
+	float4 EnginePerFrame_pad_0_11[12] : packoffset(c0);
+	float4 ViewProjEye0_row0 : packoffset(c12);
+	float4 ViewProjEye0_row1 : packoffset(c13);
+	float4 ViewProjEye0_row2 : packoffset(c14);
+	float4 ViewProjEye0_row3 : packoffset(c15);
+	float4 ViewProjEye1_row0 : packoffset(c16);
+	float4 ViewProjEye1_row1 : packoffset(c17);
+	float4 ViewProjEye1_row2 : packoffset(c18);
+	float4 ViewProjEye1_row3 : packoffset(c19);
+	float4 EnginePerFrame_pad_20_31[12] : packoffset(c20);
 	float4 FarReprojectionEye0_row0 : packoffset(c32);
 	float4 FarReprojectionEye0_row1 : packoffset(c33);
 	float4 FarReprojectionEye0_row2 : packoffset(c34);
@@ -156,8 +161,8 @@ cbuffer EnginePerFrame : register(b1)
 cbuffer EnginePerCall : register(b2)
 {
 	float4 EngineScreenSize : packoffset(c0);
-	float4 EngineSunDirectionWorldEye0 : packoffset(c1);
-	float4 EngineSunDirectionWorldEye1 : packoffset(c2);
+	float4 EngineSunDirectionViewEye0 : packoffset(c1);
+	float4 EngineSunDirectionViewEye1 : packoffset(c2);
 	float4 EnginePerCall_pad_3_44[42] : packoffset(c3);
 	float4 EngineDepthUVScaleStereo : packoffset(c45);
 };
@@ -173,6 +178,31 @@ cbuffer EngineStereoParams : register(b3)
 // is exact IEEE-754 on both compilers. A macro, not overloads: vkd3d cannot
 // prioritize between compatible overloads (E5017).
 #define IS_FINITE(x) ((asuint(x) & 0x7F800000u) != 0x7F800000u)
+
+#if FO4CS_SHADER_VR
+// The eye's world->view rotation, rows right/up/forward: its far inverse
+// projection times its ViewProj. mul(viewVector, result) returns a view-space
+// vector to eye-relative Ni-world axes.
+float3x3 GetWorldToViewVR(uint eyeIndex)
+{
+	const bool right = eyeIndex != 0u;
+	const float4 m0 = right ? ViewProjEye1_row0 : ViewProjEye0_row0;
+	const float4 m1 = right ? ViewProjEye1_row1 : ViewProjEye0_row1;
+	const float4 m2 = right ? ViewProjEye1_row2 : ViewProjEye0_row2;
+	const float4 m3 = right ? ViewProjEye1_row3 : ViewProjEye0_row3;
+	const float4 q0 = right ? FarReprojectionEye1_row0 : FarReprojectionEye0_row0;
+	const float4 q1 = right ? FarReprojectionEye1_row1 : FarReprojectionEye0_row1;
+	const float4 q2 = right ? FarReprojectionEye1_row2 : FarReprojectionEye0_row2;
+	const float4 q3 = right ? FarReprojectionEye1_row3 : FarReprojectionEye0_row3;
+	const float4 v0 = q0.x * m0 + q0.y * m1 + q0.z * m2 + q0.w * m3;
+	const float4 v1 = q1.x * m0 + q1.y * m1 + q1.z * m2 + q1.w * m3;
+	const float4 v2 = q2.x * m0 + q2.y * m1 + q2.z * m2 + q2.w * m3;
+	const float4 v3 = q3.x * m0 + q3.y * m1 + q3.z * m2 + q3.w * m3;
+	const float scale = abs(v3.w) > 1.0e-7 ? 1.0 / v3.w : 0.0;
+	return float3x3(v0.xyz, v1.xyz, v2.xyz) * scale;
+}
+#endif
+
 bool GetNormalizedSunDirection(uint eyeIndex, out float3 sunDirection)
 {
     if (VisibleSunDirectionAndValidity.w < -0.5) {
@@ -180,9 +210,9 @@ bool GetNormalizedSunDirection(uint eyeIndex, out float3 sunDirection)
         return false;
     }
 #if FO4CS_SHADER_VR
-	sunDirection = eyeIndex != 0u ?
-		EngineSunDirectionWorldEye1.xyz :
-		EngineSunDirectionWorldEye0.xyz;
+	sunDirection = mul(eyeIndex != 0u ?
+		EngineSunDirectionViewEye1.xyz :
+		EngineSunDirectionViewEye0.xyz, GetWorldToViewVR(eyeIndex));
 #else
 	// DFLight SetupGeometry maps world sunlight through this draw's view
 	// matrix. Undo that exact transform with the paired GPU inverse view.
@@ -202,14 +232,6 @@ bool GetNormalizedSunDirection(uint eyeIndex, out float3 sunDirection)
 	return all(IS_FINITE(sunDirection));
 }
 
-float3 GetCloudFieldOrigin()
-{
-	// The producer confirms this origin from the first valid player lighting
-	// view, and retains it until a world/load transition. Recentring the shell
-	// on EngineCameraPosition makes every terrain shadow slide with the player.
-	return LayerOptics[0].xyz;
-}
-
 float3 GetRenderCameraOrigin()
 {
 #if FO4CS_SHADER_VR
@@ -217,6 +239,14 @@ float3 GetRenderCameraOrigin()
 #else
 	return EngineCameraPosition.xyz;
 #endif
+}
+
+float3 GetCloudFieldOrigin()
+{
+	// The producer confirms a world origin from the main lighting GPU camera.
+	// Retain that origin when the camera moves: centring the shell on the
+	// current draw's camera makes terrain shadows slide with the player.
+	return LayerOptics[0].xyz;
 }
 
 float4 MultiplyRows(
@@ -275,6 +305,20 @@ float4 MultiplyNearReprojectionVR(uint eyeIndex, float4 value)
 			value);
 }
 #endif
+
+float2 GetScreenUV(float2 pixelCentre)
+{
+#if FO4CS_SHADER_VR
+	return pixelCentre * EngineScreenSize.xy;
+#else
+	// AE DFLight (22B52EADED1D71CB) multiplies SV_Position.xyxy by c0.xyzw:
+	// xy addresses the depth allocation; zw describes the rendered viewport.
+	// They differ under upscaling. Using xy for AE NDC makes reconstructed
+	// terrain shift with camera translation, rotation and attack animation.
+	return pixelCentre * (ProjectionParams.x > 0.5 ?
+		EngineScreenSize.xy : EngineScreenSize.zw);
+#endif
+}
 
 // Matches native DFLight's split depth encoding exactly:
 //   encoded <= 0.01 : nearDepth = encoded * 100
@@ -339,31 +383,31 @@ bool ReconstructWorldPosition(
 		world = 0.0;
 		return false;
 	}
-	// c32/c40 are inverse ViewProj, not inverse projection. Vanilla VR VS
-	// proves the basis: it maps eye-relative world through c12[12+eye*4],
-	// maps that clip position back through c12[32+eye*4], then adds
-	// c12[59+eye].z for absolute fog height. Therefore rotating this value by
-	// the Ni camera again would double-rotate it.
+	// c32/c40 are the eye's inverse projection, so this is a view-space
+	// position. Rotate it to eye-relative Ni-world axes, then add the eye.
+	// Without the rotation every receiver turns with the headset.
 	const float3 eyePosition = eyeIndex != 0u ?
 		EngineEyePosition1.xyz : EngineEyePosition0.xyz;
-	world = relativeWorldH.xyz / relativeWorldH.w + eyePosition;
+	world = mul(relativeWorldH.xyz / relativeWorldH.w,
+		GetWorldToViewVR(eyeIndex)) + eyePosition;
 	return all(IS_FINITE(world));
 #else
 	eyeIndex = 0u;
 	// Exact stock 1.10.163 DFLight sequence:
 	//   depthUV = SV_Position.xy * b2.c27.xy * b2.c0.xy
 	//   screenUV = SV_Position.xy * b2.c0.xy
-	// c0.zw are not the NDC scale.
+	// OG does not use c0.zw for NDC; AE does (see GetScreenUV).
 	// 1.11.240's DFLight per-call buffer has 25 registers and its depth
-	// fetch uses SV_Position.xy * c0.xy only (no dynamic-resolution scale);
-	// c27 lies outside that bound buffer and reads as zero. A zero or
-	// non-finite scale is never legitimate, so it selects the unscaled fetch
-	// (verified 10 Sep 2026: AE masks were uniformly neutral with zero valid
-	// receivers before this guard; OG behaviour is unchanged).
-	float2 depthUVScale = (all(IS_FINITE(EngineDepthUVScale.xy)) &&
+	// fetch uses SV_Position.xy * c0.xy only (no dynamic-resolution scale).
+	// The engine's shared b2 can still be larger, so c27 there holds another
+	// technique's leftovers: the CPU selects the layout explicitly. A zero or
+	// non-finite OG scale is never legitimate and also selects the unscaled
+	// fetch.
+	float2 depthUVScale = (ProjectionParams.x > 0.5 &&
+		all(IS_FINITE(EngineDepthUVScale.xy)) &&
 		all(EngineDepthUVScale.xy > 0.0)) ? EngineDepthUVScale.xy : float2(1.0, 1.0);
-	float2 screenUV = outputPixelCentre * EngineScreenSize.xy;
-	float2 depthUV = screenUV * depthUVScale;
+	float2 screenUV = GetScreenUV(outputPixelCentre);
+	float2 depthUV = outputPixelCentre * EngineScreenSize.xy * depthUVScale;
 	if (any(depthUV < 0.0) || any(depthUV >= 1.0)) {
 		rawDepth = 1.0;
 		world = 0.0;
@@ -421,7 +465,7 @@ bool ReconstructWorldPosition(
 // without consulting a CPU camera, terrain receiver, sun, or field origin.
 bool GetCameraRay(uint2 pixel, out float3 ray)
 {
-    float2 screenUV = (float2(pixel) + 0.5) * EngineScreenSize.xy;
+    float2 screenUV = GetScreenUV(float2(pixel) + 0.5);
     float2 ndc = screenUV * float2(2, -2) + float2(-1, 1);
     float4 a, b;
 #if FO4CS_SHADER_VR
@@ -440,7 +484,9 @@ bool GetCameraRay(uint2 pixel, out float3 ray)
     if (!all(IS_FINITE(a)) || !all(IS_FINITE(b)) || abs(a.w) < 1.0e-7 || abs(b.w) < 1.0e-7)
         return false;
     float3 delta = b.xyz / b.w - a.xyz / a.w;
-#if !FO4CS_SHADER_VR
+#if FO4CS_SHADER_VR
+    delta = mul(delta, GetWorldToViewVR(eye));
+#else
     delta = float3(dot(EngineViewToWorld_row0.xyz, delta),
         dot(EngineViewToWorld_row1.xyz, delta), dot(EngineViewToWorld_row2.xyz, delta));
 #endif
@@ -450,7 +496,6 @@ bool GetCameraRay(uint2 pixel, out float3 ray)
     return true;
 }
 
-#if !FO4CS_SUN_MASK
 RWTexture2D<float4> SkyPreviewOutput : register(u0);
 [numthreads(8, 8, 1)]
 void mainSkyPreview(uint3 id : SV_DispatchThreadID)
@@ -473,22 +518,10 @@ void mainSkyPreview(uint3 id : SV_DispatchThreadID)
             IS_FINITE(rawDepth) && rawDepth >= 1.0 ? opacity * 0.65 : 0);
     }
 }
-#endif
 
 float SampleCapturedCloudPoint(float3 cloudPoint, float mip)
 {
-#if FO4CS_SUN_MASK
-    if (SunMaskCenterAndValid.w < 0.5 || SunMaskRightAndHalfWidth.w <= 0) return 0;
-    float3 relative = cloudPoint - SunMaskCenterAndValid.xyz;
-    float2 uv = float2(dot(relative, SunMaskRightAndHalfWidth.xyz),
-        -dot(relative, SunMaskUpAndHeight.xyz)) / (2 * SunMaskRightAndHalfWidth.w) + 0.5;
-    if (!all(IS_FINITE(uv)) || any(uv < 0) || any(uv > 1)) return 0;
-    float2 edge = min(uv, 1 - uv);
-    float fade = saturate(min(edge.x, edge.y) * (512.0 / 8.0));
-    return saturate(WorldCloudTiles.SampleLevel(WorldCloudSampler, uv, 0)) * fade;
-#else
     return saturate(WorldCloudTiles.SampleLevel(WorldCloudSampler, normalize(cloudPoint), mip));
-#endif
 }
 
 bool GetCloudShadowSamplePoint(
@@ -546,6 +579,44 @@ bool GetCloudShadowSamplePoint(
 	return all(IS_FINITE(samplePoint));
 }
 
+// Opacity where this receiver's ray toward the sun meets the shell of a field
+// anchored at `origin`. False when the ray misses the shell.
+bool SampleShellAtOrigin(float3 receiverAbsolute, float3 rayToSun,
+	float4 geometry, float3 origin, out float3 samplePoint, out float opacity)
+{
+	opacity = 0.0;
+	if (!GetCloudShadowSamplePoint(
+		receiverAbsolute, rayToSun, geometry.x, geometry.y, origin, samplePoint))
+		return false;
+	float directionLengthSquared = dot(samplePoint, samplePoint);
+	if (!IS_FINITE(directionLengthSquared) || directionLengthSquared <= 1.0e-8)
+		return false;
+	opacity = SampleCapturedCloudPoint(samplePoint, 0.0);
+	return true;
+}
+
+// VR travel re-anchoring moves the world-fixed origin; for a few seconds the
+// field is also projected from the previous origin and blended out, so the
+// ground pattern dissolves into its new position instead of jumping. Flat
+// retains its confirmed world origin until a world/load reset.
+float BlendPreviousOrigin(float3 receiverAbsolute, float3 rayToSun,
+	float4 geometry, float opacity)
+{
+#if !FO4CS_SHADER_VR
+	return opacity;
+#else
+	float previousWeight = saturate(ProjectionParams.y);
+	if (previousWeight <= 0.0)
+		return opacity;
+	float3 previousPoint;
+	float previousOpacity;
+	if (!SampleShellAtOrigin(receiverAbsolute, rayToSun, geometry,
+			PreviousFieldOrigin.xyz, previousPoint, previousOpacity))
+		previousOpacity = 0.0;
+	return lerp(opacity, previousOpacity, previousWeight);
+#endif
+}
+
 float SampleCloudCoverage(
 	float3 receiverAbsolute, float3 rayToSun, uint layer,
 	bool applyIsolation,
@@ -561,21 +632,14 @@ float SampleCloudCoverage(
 	if (geometry.w < 0.0 || optics.w <= 0.0)
 		return 0.0;
 	float3 samplePoint;
-	if (!GetCloudShadowSamplePoint(
-		receiverAbsolute, rayToSun, geometry.x, geometry.y, GetCloudFieldOrigin(),
-		samplePoint))
+	float raw;
+	if (!SampleShellAtOrigin(receiverAbsolute, rayToSun, geometry,
+			GetCloudFieldOrigin(), samplePoint, raw))
 		return 0.0;
 	sampleValid = true;
 
 	float active = saturate(optics.w);
-	float directionLengthSquared = dot(samplePoint, samplePoint);
-	if (!IS_FINITE(directionLengthSquared) ||
-		directionLengthSquared <= 1.0e-8) {
-		sampleValid = false;
-		return 0.0;
-	}
-	float3 sampleDirection = samplePoint * rsqrt(directionLengthSquared);
-	float raw = SampleCapturedCloudPoint(samplePoint, 0.0);
+	raw = BlendPreviousOrigin(receiverAbsolute, rayToSun, geometry, raw);
 	rawCoverage = raw * active;
 	// The coarse face-wide sample exists only in the explicit three-panel
 	// capture-analysis view. Production performs exactly the one LOD-zero
@@ -896,18 +960,12 @@ float SampleProductionCloudCoverage(
 		return 0.0;
 
 	float3 samplePoint;
-	if (!GetCloudShadowSamplePoint(
-		receiverAbsolute, rayToSun, geometry.x, geometry.y, GetCloudFieldOrigin(),
-			samplePoint))
+	float capturedOpacity;
+	if (!SampleShellAtOrigin(receiverAbsolute, rayToSun, geometry,
+			GetCloudFieldOrigin(), samplePoint, capturedOpacity))
 		return 0.0;
-
-	float directionLengthSquared = dot(samplePoint, samplePoint);
-	if (!IS_FINITE(directionLengthSquared) ||
-		directionLengthSquared <= 1.0e-8)
-		return 0.0;
-
-	float3 sampleDirection = samplePoint * rsqrt(directionLengthSquared);
-	float capturedOpacity = SampleCapturedCloudPoint(samplePoint, 0.0);
+	capturedOpacity = BlendPreviousOrigin(
+		receiverAbsolute, rayToSun, geometry, capturedOpacity);
 	return capturedOpacity * saturate(optics.w);
 }
 

@@ -61,13 +61,15 @@ namespace FO4CS
         }
 
         [[nodiscard]] PresentResult CompletePresent(
-            bool worldReady, bool companionWindow) noexcept
+            bool worldReady, bool mainViewRendered) noexcept
         {
-            // VR's companion can present repeatedly without a new rendered
-            // Sky. An unchanged valid world keeps its completed field. A new
-            // (including cloudless) Sky, rejected capture, reset, or world
+            // A Present with no main-view render since the previous one (VR
+            // companion windows, frame-generation proxies, overlays presenting
+            // again) shows no new scene, so an unchanged valid world keeps its
+            // completed field. A new (including cloudless) Sky, a main view
+            // rendered without a Sky, a rejected capture, a reset or a world
             // transition still goes through the normal publication contract.
-            if (companionWindow && worldReady && !active_ && published_ != 0)
+            if (!mainViewRendered && worldReady && !active_ && published_ != 0)
                 return PresentResult::Retained;
             return Present(worldReady) ? PresentResult::Published :
                                          PresentResult::Withdrawn;

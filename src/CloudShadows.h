@@ -21,7 +21,6 @@
 #include <spdlog/sinks/basic_file_sink.h>
 
 #include "EngineAPI.h"
-#include "SunMaskProjection.h"
 #include "ShaderTools/DFLightPatcher.h"
 
 namespace fs = std::filesystem;
@@ -124,51 +123,11 @@ namespace CloudShadows
         uint32_t skyTechnique{ 0 };
         CloudDrawAuthentication authentication{
             CloudDrawAuthentication::kUnauthenticated };
-        uint64_t captureEpoch{ 0 };
-        uint64_t stableLayerId{ 0 };
     };
 
     using CloudDrawReissue = void (*)(ID3D11DeviceContext*, const CloudDrawCommand&);
 
-    // Skyrim-style native cubemap piggyback contract. Fallout's reflection
-    // producer continues to render its own colour target and cloud geometry;
-    // the hook appends this fixed MRT slot and the authenticated cloud shader
-    // writes scalar visible-cloud opacity into it. The authenticated reflection
-    // contract owns RT0 only; the hook must fail closed if RT1 is occupied.
-    inline constexpr uint32_t kNativeWorldCloudOpacityTargetSlot = 1;
     inline constexpr uint32_t kWorldCloudCubeFaceCount = 6;
-    inline constexpr uint32_t kCompleteWorldCloudCubeFaceMask =
-        (1u << kWorldCloudCubeFaceCount) - 1u;
-
-    // Starts one or more native cubemap faces. A non-null referenceFaceRTV
-    // supplies the actual extent/sample contract for exactly its requested
-    // FirstArraySlice on OG, AE, or VR; after that contract is learned,
-    // lifecycle begin callbacks may pass null. Every requested staging face is
-    // cleared to exact zero before Fallout renders it.
-    bool PrepareNativeWorldCloudCaptureFaces(
-        ID3D11DeviceContext* context,
-        ID3D11RenderTargetView* referenceFaceRTV,
-        uint32_t faceMask,
-        uint64_t sourceEpoch) noexcept;
-    // Borrowed pointers, valid until device-resource release/recreation.
-    ID3D11RenderTargetView* GetNativeWorldCloudCaptureFaceRTV(
-        uint32_t faceIndex) noexcept;
-    // Returns a state which preserves the effective stock blend contract for
-    // every existing MRT and source-over composites scalar opacity at slot 1.
-    ID3D11BlendState* GetNativeWorldCloudCaptureBlendState(
-        ID3D11BlendState* stockBlendState) noexcept;
-    // Mark faces only after ClickCubeMap/native face rendering has returned.
-    // A complete authenticated 0x3F generation is atomically published; an
-    // unauthenticated completion invalidates the field fail-neutral.
-    [[nodiscard]] bool CompleteNativeWorldCloudCaptureFaces(
-        ID3D11DeviceContext* context,
-        uint32_t faceMask,
-        uint64_t sourceEpoch,
-        bool capturePathAuthenticated) noexcept;
-    void AbortNativeWorldCloudCapture(
-        ID3D11DeviceContext* context,
-        uint64_t sourceEpoch) noexcept;
-    uint32_t GetNativeWorldCloudStagingFaceMask() noexcept;
 
     struct WorldCloudLayerState
     {
@@ -183,16 +142,18 @@ namespace CloudShadows
         uint32_t SliceIndex{ 0 };
     };
 
-    // Legacy main-view draw ABI. Native cubemap MRT capture is the only
-    // producer; this remains a fail-safe pass-through so Fallout stays solely
-    // responsible for the visible player sky.
+    // Called for every exact main-Sky draw (the caller has proven the view).
+    // Submits the visible draw exactly once through `reissue`, then replays
+    // authenticated cloud layers into the private opacity field. Returns
+    // false only when the draw was not submitted, so the caller submits it.
     bool ProcessWorldCloudDraw(
         ID3D11DeviceContext* context,
         const CloudDrawCommand& command,
         CloudDrawReissue reissue) noexcept;
-    // Legacy rejection ABI. It never suppresses Fallout's visible clouds.
-    bool HandleUncapturedWorldCloudDraw(
-        ID3D11DeviceContext* context, uint64_t captureEpoch) noexcept;
+    // False when nothing the capture could produce is visible: the sun is
+    // below the horizon, opacity is zero or the lighting patch is not ready,
+    // and no explicit diagnostic consumer is active.
+    bool CloudShadowsCanBeVisible() noexcept;
 
     // Exact kMain render-target/subresource plus contained-viewport gate for
     // DFLight/prepass work. Sky has a separate kMainTemp contract below.
@@ -225,13 +186,15 @@ namespace CloudShadows
         WorldCloudLayerState* destination,
         uint32_t capacity) noexcept;
     ID3D11ShaderResourceView* GetCommittedWorldCloudTiles() noexcept;
-    bool GetCommittedSunMaskProjection(FO4CS::SunMaskProjection& destination) noexcept;
     ID3D11SamplerState* GetWorldCloudSampler() noexcept;
     // Called only after authenticating the main DFLight targets/viewport.
     // The first valid gameplay origin is retained until a world/load reset.
     bool ConfirmWorldCloudOrigin(ID3D11DeviceContext* context,
         ID3D11Buffer* enginePerFrame, UINT firstConstant, bool vr) noexcept;
     bool GetCommittedWorldCloudOrigin(XMFLOAT3& destination) noexcept;
+    // During a travel re-anchor crossfade: the previous origin and its weight
+    // (one at the switch, falling to zero). False when no crossfade is active.
+    bool GetWorldCloudCrossfade(XMFLOAT3& previousOrigin, float& previousWeight) noexcept;
 
     // Compute shader constant buffer — keep in exact sync with
     // FO4CloudShadowScreenCS.hlsl's CloudShadowScreenCB.  DFLight's actual b12
@@ -244,8 +207,12 @@ namespace CloudShadows
         // inverse ViewProj plus its exact b12 c59/c60 eye positions.
         XMFLOAT4X4 ViewToWorld;               // c0-c3
         XMFLOAT4 OutputSizeAndInvSize;         // c4
-        XMFLOAT4 OutputPixelToDepthUV;         // c5: scale.xy, bias.xy
-        XMFLOAT4 OutputPixelToNDC;             // c6: scale.xy, bias.xy
+        // x: 1 when DFLight b2 c27 carries the dynamic-resolution depth-UV
+        // scale (OG 1.10.163); 0 on 1.11.240, whose DFLight binds only 25
+        // per-call registers and samples depth unscaled. y: weight of the
+        // previous origin during a re-anchor crossfade. zw: reserved.
+        XMFLOAT4 ProjectionParams;             // c5
+        XMFLOAT4 PreviousFieldOrigin;          // c6: xyz previous origin
         XMFLOAT4 SunDirectionAndAngularRadius; // c7: xyz test selector; w sun radius
         // z is one only for the dispatch satisfying an explicit screen-mask
         // evidence request; it gates the diagnostic ReceiverValidity UAV.
@@ -258,37 +225,12 @@ namespace CloudShadows
         // the horizontal diagnostic disk around it.
         XMFLOAT4 DiagnosticReceiverAndRadius;         // c42
         XMFLOAT4 VisibleSunDirectionAndValidity;       // c43: world direction; w=1 valid/-1 invalid
-        FO4CS::SunMaskProjection SunProjection;       // c44-c47: committed 2D capture transform
     };
-    static_assert(sizeof(CloudShadowScreenCBData) == 48 * 16);
+    static_assert(sizeof(CloudShadowScreenCBData) == 44 * 16);
 
-    struct alignas(16) WorldCloudTileCBData
-    {
-        XMFLOAT4 FaceRight;
-        XMFLOAT4 FaceUp;
-        XMFLOAT4 FaceForward;
-        XMFLOAT4 CaptureParams;
-    };
-    static_assert(sizeof(WorldCloudTileCBData) == 64);
-
-    struct alignas(16) WorldCloudSkyCBData
-    {
-        // x cloud height, y planet radius, z cube index, w active blend.
-        XMFLOAT4 ShellGeometry;
-        XMFLOAT4 CaptureOrigin;
-        XMFLOAT4 CameraPosition;
-        XMFLOAT4 PreviousCameraPosition;
-    };
-    static_assert(sizeof(WorldCloudSkyCBData) == 64);
-
-    // Draw-hook watchdog (defined in Plugin.cpp): checks that our thunks are
-    // still in the context vtable draw slots, logs + re-heals if overwritten.
-    void VerifyDrawHookIntegrity() noexcept;
-    // Cheap per-Present identity check for all five D3D entry points required
-    // by the native opacity-only transaction. A driver-vtable generation is
-    // never allowed to capture until both draw suppression and primary-clear
-    // preservation are routed through our permanent Detours trampolines.
-    [[nodiscard]] bool NativeCaptureRoutesCurrent() noexcept;
+    // Draw-hook watchdog (defined in Plugin.cpp): installs a detour for any
+    // new driver draw entry and reports whether every entry is routed.
+    bool VerifyDrawHookIntegrity() noexcept;
 
     // Captured by the D3D11CreateDeviceAndSwapChain detour when the game creates
     // its D3D device. RuntimeAPI selects the reviewed OG, AE, or VR bindings;
@@ -467,8 +409,10 @@ namespace CloudShadows
 
     // DFLight PS patcher — fail-closed matching patches only stock directional
     // sunlight variants and modulates their cascade visibility before the final
-    // direct-light MADs. Ambient/environment terms remain unchanged.
-    inline SIE::DFLightPatcher g_dfLightPatcher;
+    // direct-light MADs. Ambient/environment terms remain unchanged. Never
+    // destroyed: releasing its shaders from a DLL static destructor would run
+    // under the loader lock at process exit.
+    inline SIE::DFLightPatcher& g_dfLightPatcher = *new SIE::DFLightPatcher();
     inline std::atomic<bool> g_dfLightPatcherInitialized{false};
 
     // Per-attempt validity consumed immediately by BeginSwap. Every Prepass
@@ -499,7 +443,9 @@ namespace CloudShadows
         std::string& source) noexcept;
 
     inline Settings g_settings;
-    inline bool g_initialized = false;
+    // Written under the lifecycle lock on the immediate-context thread; read
+    // from Present and BeginTechnique on any renderer thread.
+    inline std::atomic<bool> g_initialized{ false };
 
     // Shared by the F10 A/B hotkey and the ImGui menu. Kept separate from
     // Opacity so disabling the feature does not discard the configured value.
@@ -516,6 +462,10 @@ namespace CloudShadows
     inline std::atomic<float> g_singleCloudSelectorZ{ 1.0f };
     inline std::atomic<float> g_singleCloudRadiusDegrees{ 12.0f };
     bool LockSingleCloudToCurrentView() noexcept;
+    // MCM cannot tell when its menu closes: lock the single-cloud selector to
+    // the view direction a moment later, on the render thread.
+    void RequestSingleCloudLock(uint32_t delayMilliseconds) noexcept;
+    void CancelSingleCloudLock() noexcept;
 
     // Device/context come from the D3D11CreateDeviceAndSwapChain detour —
     // cross-runtime safe.
@@ -546,8 +496,9 @@ namespace CloudShadows
     // Require the same mip/array subresource as its authoritative RTV.
     bool IsMainSkyRenderTargetView(ID3D11RenderTargetView* view) noexcept;
 
-    // Lifecycle
-    void Initialize();
+    // Lifecycle. Callers hold the plugin's lifecycle lock on the thread that
+    // owns the immediate context. Never throws; a failure schedules a retry.
+    void Initialize() noexcept;
     // Poll F10 once per authoritative frame so the disabled draw-hook path can
     // remain a true pass-through while still allowing the feature to turn on.
     void PollShadowToggle() noexcept;
