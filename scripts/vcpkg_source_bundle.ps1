@@ -23,6 +23,7 @@ function Get-FO4CSVcpkgSourceBundleInputs {
     $resolvedDownloads = (Resolve-Path -LiteralPath $VcpkgDownloadsRoot).Path
     $resolvedLock = (Resolve-Path -LiteralPath $SourceLockPath).Path
     $resolvedGitForBundle = (Resolve-Path -LiteralPath $GitExecutable).Path
+    $gitBundleArgs = @('-c', "safe.directory=$($resolvedVcpkg.Replace('\', '/'))")
     $lock = [IO.File]::ReadAllText($resolvedLock) | ConvertFrom-Json
 
     if ($lock.SchemaVersion -ne 1) {
@@ -35,7 +36,7 @@ function Get-FO4CSVcpkgSourceBundleInputs {
         throw "The vcpkg source lock targets '$($lock.Triplet)', not '$VcpkgTriplet'."
     }
 
-    $vcpkgHead = (& $resolvedGitForBundle -C $resolvedVcpkg rev-parse --verify HEAD 2>$null |
+    $vcpkgHead = (& $resolvedGitForBundle @gitBundleArgs -C $resolvedVcpkg rev-parse --verify HEAD 2>$null |
         Out-String).Trim()
     if ($LASTEXITCODE -ne 0 -or $vcpkgHead -ne $lock.VcpkgBaseline) {
         throw "vcpkg HEAD '$vcpkgHead' does not match source lock baseline '$($lock.VcpkgBaseline)'."
@@ -53,11 +54,11 @@ function Get-FO4CSVcpkgSourceBundleInputs {
     $tripletRelative = "triplets/$VcpkgTriplet.cmake"
     $gitInputPaths = @($tripletRelative)
     $gitInputPaths += @($packageNames | ForEach-Object { "ports/$_" })
-    & $resolvedGitForBundle -C $resolvedVcpkg diff --quiet HEAD -- @gitInputPaths
+    & $resolvedGitForBundle @gitBundleArgs -C $resolvedVcpkg diff --quiet HEAD -- @gitInputPaths
     if ($LASTEXITCODE -ne 0) {
         throw "The vcpkg port/triplet recipes used by this build contain tracked modifications."
     }
-    $untrackedInputs = @(& $resolvedGitForBundle -C $resolvedVcpkg ls-files `
+    $untrackedInputs = @(& $resolvedGitForBundle @gitBundleArgs -C $resolvedVcpkg ls-files `
         --others --exclude-standard -- @gitInputPaths)
     if ($LASTEXITCODE -ne 0 -or $untrackedInputs.Count -ne 0) {
         throw "The vcpkg port/triplet recipes used by this build contain untracked inputs."
