@@ -1,4 +1,36 @@
-# Build 372f3a9044377c14 — 27 September 2026
+# Build f202d70ed7dbb9b1 — 27 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`B9A01BD3315CB905F246DEF2BA37159C74A3F2E99E1DC556132B6C7E1ED2C1E0`.
+Use the runtime and matching source archives bearing build ID
+`f202d70ed7dbb9b1` for the release without Address Library.
+
+## Changes
+
+- Remove the Address Library requirement on OG and AE by including the exact
+  reviewed addresses for 1.10.163.0 and 1.11.240.0. VR 1.2.72.0 continues to use
+  its existing built-in addresses. F4SE/F4SEVR is still required.
+- Remove database loading and clear the F4SE metadata flags that previously
+  required a database before the plugin could load. Retain the exact supported
+  executable-version list, ASLR handling and memory validation.
+- Add package verification of the actual exported F4SE metadata and additional
+  unsupported-version regressions. The renderer, shaders, default settings and
+  earlier rendering-state fix are retained.
+
+## Validation and limits
+
+All 12 core checks pass, including the renderer fixtures, binary metadata and
+release-feature contracts. Each of the 12 OG and 12 AE addresses matches its
+original database lookup. All 34 active OG/AE/VR entries pass checks against
+the local executables for exact versions, image bounds and expected PE sections.
+The new binary check correctly rejects the previous DLL's Address Library
+flags and accepts this DLL. See [address verification](RUNTIME_ADDRESSES.md).
+
+This build has not been launched in-game without Address Library. Full visual,
+compatibility, long-session and performance acceptance remains outstanding;
+the gameplay and hardware observations below apply to their recorded builds.
+
+# Previous build 372f3a9044377c14 — 27 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `6092986C47E514E7D68323C5BEDDE0A21716894B2B49632D4C1C66C68F463E1F`.

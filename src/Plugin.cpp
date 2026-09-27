@@ -3676,8 +3676,8 @@ namespace
 			}
 			return;
 		}
-        // Reviewed OG/AE Address Library IDs plus the exact VR RVA all resolve
-        // through the project-owned runtime bridge.
+        // Exact-version built-in RVAs resolve through the project-owned
+        // runtime bridge on OG, AE and VR.
         auto addr = FO4CS::EngineAPI::GetBeginTechniqueAddress();
         if (!addr) {
             SetHookAvailable(
@@ -4090,6 +4090,7 @@ extern "C" DLLEXPORT bool FO4CS_F4SEAPI F4SEPlugin_Load(
         host.f4seVersion.patch, host.f4seVersion.build);
 
     SPDLOG_INFO("[CloudShadows] {}", FO4CS::BuildFeatures::kMarker);
+    SPDLOG_INFO("[CloudShadows] Built-in runtime addresses selected; Address Library is not required");
     FO4CS::McmSettings::Initialize();
 
     // MUTUAL EXCLUSION: CommunityShaders.dll and DynamicReflections.dll are
@@ -4201,8 +4202,10 @@ F4SEPlugin_Version = []() constexpr {
     v.SetPluginName("FO4CloudShadows");
     v.SetPluginVersion({ 1, 0, 0, 0 });
     v.UsesSignatureScanning(false);
-    v.UsesAddressLibraryNG(true);
-    v.UsesAddressLibraryAE(true);
+    // F4SE checks for an installed database when these bits are set, before
+    // calling Load. Built-in addresses use the explicit version list below.
+    v.UsesAddressLibraryNG(false);
+    v.UsesAddressLibraryAE(false);
     v.HasNoStructureUse(false);
     v.IsLayoutDependentNG(true);
     v.IsLayoutDependentAE(true);

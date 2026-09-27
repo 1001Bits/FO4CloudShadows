@@ -7,7 +7,6 @@
 #include <filesystem>
 #include <mutex>
 #include <string>
-#include <vector>
 
 namespace FO4CS
 {
@@ -19,9 +18,8 @@ namespace FO4CS
         kExecutable
     };
 
-    // A zero entry means that runtime has no reviewed fallback and must fail
-    // closed.  This is deliberately explicit at every call site: an OG RVA is
-    // never reused merely because an Address Library ID is missing on AE/VR.
+    // A zero entry means that runtime has no reviewed address and must fail
+    // closed. An address is never borrowed from another runtime's column.
     struct RuntimeRVA
     {
         std::uintptr_t legacy{};
@@ -58,8 +56,8 @@ namespace FO4CS
     };
 
     // Project-local runtime boundary for one physical DLL.  The declarations
-    // and Address Library formats are derived from the public F4SE plugin ABI
-    // and GPL-3.0 CommonLibF4 implementations (alandtse/CommonLibF4 and
+    // are derived from the public F4SE plugin ABI and GPL-3.0 CommonLibF4
+    // implementations (alandtse/CommonLibF4 and
     // Dear-Modding-FO4/commonlibf4); this project is distributed under GPL-3.0.
     // No CommonLib type crosses this interface.
     class RuntimeAPI
@@ -73,8 +71,7 @@ namespace FO4CS
         [[nodiscard]] static RuntimeAPI& GetSingleton() noexcept;
 
         // Safe for F4SEPlugin_Query: validates the actual main executable and
-        // normalized interface without retaining the loader's pointer or
-        // opening an Address Library database.
+        // normalized interface without retaining the loader's pointer.
         [[nodiscard]] static bool ProbeHost(
             const void* rawF4SEInterface,
             RuntimeHost& host,
@@ -90,13 +87,6 @@ namespace FO4CS
         [[nodiscard]] F4SECompat::RuntimeTarget Target() const noexcept;
         [[nodiscard]] F4SECompat::Interface F4SE() const noexcept;
         [[nodiscard]] F4SECompat::MessagingInterface Messaging() const noexcept;
-
-        // Resolves an exact ID from the runtime's version-N-N-N-N.bin (flat)
-        // or .csv (VR) database.  ID equality and the resulting PE address are
-        // both checked; lookup never falls through to the next sorted ID.
-        [[nodiscard]] std::uintptr_t ResolveID(
-            std::uint64_t id,
-            AddressKind kind = AddressKind::kImage) noexcept;
 
         // Selects only the RVA explicitly supplied for the active runtime and
         // validates it against the loaded main image and page protection.
@@ -124,30 +114,11 @@ namespace FO4CS
         // roughly a hundred working-set queries.
         static void AdvanceValidationEpoch() noexcept;
 
-        [[nodiscard]] std::filesystem::path AddressDatabasePath() const;
         [[nodiscard]] std::string LastError() const;
 
     private:
-        struct Mapping
-        {
-            std::uint64_t id{};
-            std::uint64_t offset{};
-
-            [[nodiscard]] constexpr bool operator<(
-                const Mapping& right) const noexcept
-            {
-                return id < right.id;
-            }
-        };
-        static_assert(sizeof(Mapping) == 16);
-
         RuntimeAPI() noexcept = default;
 
-        [[nodiscard]] bool LoadAddressDatabaseLocked() noexcept;
-        [[nodiscard]] bool LoadFlatDatabaseLocked(
-            const std::filesystem::path& path) noexcept;
-        [[nodiscard]] bool LoadVRDatabaseLocked(
-            const std::filesystem::path& path) noexcept;
         void SetErrorLocked(std::string value) noexcept;
 
         mutable std::mutex mutex_{};
@@ -156,9 +127,6 @@ namespace FO4CS
         // Initialize() publishes the immutable host/interface payload exactly
         // once. Readers acquire this flag before accessing either object.
         std::atomic<bool> initialized_{ false };
-        bool addressDatabaseAttempted_{};
-        std::filesystem::path addressDatabasePath_{};
-        std::vector<Mapping> mappings_{};
         std::string lastError_{};
     };
 }

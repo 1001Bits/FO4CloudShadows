@@ -1,7 +1,7 @@
 #include "WaterReflectionGuard.h"
 
 #include "PCH.h"
-#include "RuntimeAPI.h"
+#include "RuntimeAddresses.h"
 
 #include <atomic>
 #include <mutex>
@@ -9,17 +9,7 @@
 namespace
 {
     using FO4CS::AddressKind;
-    using FO4CS::F4SECompat::RuntimeTarget;
     using FO4CS::RuntimeAPI;
-    using FO4CS::RuntimeRVA;
-
-    // Flat IDs are exact Address Library entries; the VR RVA comes from the
-    // 1.2.72 PDB/binary correspondence and is selected only after RuntimeAPI
-    // has proved that the loaded image is Fallout4VR.exe 1.2.72.
-    constexpr std::uint64_t kUpdateLegacyID = 907876;
-    constexpr std::uint64_t kUpdateAEID = 2213919;
-    constexpr std::uintptr_t kUpdateVRRva = 0x07CA020;
-
     using UpdateFn = std::uint8_t (*)(void* reflections);
 
     UpdateFn g_originalUpdate = nullptr;
@@ -30,18 +20,9 @@ namespace
 
     [[nodiscard]] std::uintptr_t ResolveUpdate() noexcept
     {
-        auto& runtime = RuntimeAPI::GetSingleton();
-        switch (runtime.Target()) {
-        case RuntimeTarget::kLegacy:
-            return runtime.ResolveID(kUpdateLegacyID, AddressKind::kExecutable);
-        case RuntimeTarget::kAE:
-            return runtime.ResolveID(kUpdateAEID, AddressKind::kExecutable);
-        case RuntimeTarget::kVR:
-            return runtime.ResolveRVA(
-                RuntimeRVA{ 0, 0, kUpdateVRRva }, AddressKind::kExecutable);
-        default:
-            return 0;
-        }
+        return RuntimeAPI::GetSingleton().ResolveRVA(
+            FO4CS::RuntimeAddresses::kWaterReflectionUpdateSymbol,
+            AddressKind::kExecutable);
     }
 
     [[nodiscard]] bool IsUnpatchedFunctionEntry(std::uintptr_t address) noexcept

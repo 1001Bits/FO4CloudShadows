@@ -1,4 +1,5 @@
 #include "EngineAPI.h"
+#include "RuntimeAddresses.h"
 
 #include <limits>
 #include <cmath>
@@ -11,52 +12,8 @@ namespace
     using FO4CS::F4SECompat::RuntimeTarget;
     using FO4CS::RuntimeAPI;
     using FO4CS::RuntimeRVA;
+    using namespace FO4CS::RuntimeAddresses;
 
-    struct ReviewedSymbol
-    {
-        std::uint64_t legacyID{};
-        std::uint64_t aeID{};
-        std::uintptr_t vrRva{};
-    };
-
-    constexpr ReviewedSymbol kRendererDataSymbol{
-        1235449, 2704429, 0x60F3CE8
-    };
-    constexpr ReviewedSymbol kGraphicsStateSymbol{
-        600795, 2704621, 0x65A2AB0
-    };
-    constexpr ReviewedSymbol kRenderTargetManagerSymbol{
-        1508457, 2666735, 0x38AC010
-    };
-    constexpr ReviewedSymbol kSkySingletonFunctionSymbol{
-        484694, 2192448, 0x012FB50
-    };
-    constexpr ReviewedSymbol kWorldRootCameraFunctionSymbol{
-        384264, 2228956, 0x0D87550
-    };
-    constexpr ReviewedSymbol kPlayerSingletonSymbol{
-        // Dear CommonLib's three-runtime VariantID is
-        // { OG, 1.10.980 NG, 1.11.x AE }.  The middle ID is absent from the
-        // installed 1.11.240 database; 4798212 is the exact AE singleton ID.
-        412034, 4798212, 0x5A38518
-    };
-    constexpr ReviewedSymbol kTESSingletonSymbol{
-        1194835, 2698044, 0x5B042C0
-    };
-    constexpr ReviewedSymbol kBeginTechniqueSymbol{
-        1041640, 2318876, 0x2814BE0
-    };
-    // Fallout4VR 1.2.72 BSGraphics::SetShaders. Both BeginTechnique and the
-    // cached render batches (0x28AA8D0/0x28AAF00) submit their wrappers here.
-    // No corresponding flat hook is needed or attested.
-    constexpr ReviewedSymbol kVRSetShadersSymbol{ 0, 0, 0x1D92C00 };
-    // Vanilla cursor mode for the F11 menu. CommonLibF4 VariantIDs
-    // (OG, 1.11.x): UIMessageQueue::Singleton {82123, ..., 4796377},
-    // UIMessageQueue::AddMessage {1182019, 2284929},
-    // BSStringPool::GetEntry_char {507142, 2268729}. No reviewed VR RVAs.
-    constexpr ReviewedSymbol kUIMessageQueueSingletonSymbol{ 82123, 4796377, 0 };
-    constexpr ReviewedSymbol kUIMessageQueueAddMessageSymbol{ 1182019, 2284929, 0 };
-    constexpr ReviewedSymbol kStringPoolGetEntrySymbol{ 507142, 2268729, 0 };
     struct UIMessageQueueObject { std::byte opaque[0x10]{}; };
 
     constexpr std::size_t kFlatCameraStateOffset = 0x160;
@@ -72,37 +29,13 @@ namespace
     // its depth map ends at +0x1640 (native manager at VR RVA 0x1DB93D0).
     constexpr std::size_t kRenderTargetManagerReadableSpan = 0xFB4;
 
-    [[nodiscard]] std::uintptr_t ResolveReviewedSymbol(
-        const ReviewedSymbol& symbol,
-        AddressKind kind) noexcept
-    {
-        auto& runtime = RuntimeAPI::GetSingleton();
-        switch (runtime.Target()) {
-        case RuntimeTarget::kLegacy:
-            return symbol.legacyID != 0 ?
-                runtime.ResolveID(symbol.legacyID, kind) : 0;
-        case RuntimeTarget::kAE:
-            return symbol.aeID != 0 ?
-                runtime.ResolveID(symbol.aeID, kind) : 0;
-        case RuntimeTarget::kVR:
-            return symbol.vrRva != 0 ?
-                runtime.ResolveRVA(
-                    RuntimeRVA{ 0, 0, symbol.vrRva }, kind) :
-                0;
-        default:
-            return 0;
-        }
-    }
-
-    // A failed exact-ID/RVA resolution is deterministic for the loaded
-    // image: remember it instead of re-taking the database lock and building
-    // an error string on every per-frame accessor call.
+    // Invalid addresses are deterministic for the exact loaded image.
     constexpr std::uintptr_t kResolutionFailed =
         (std::numeric_limits<std::uintptr_t>::max)();
 
     [[nodiscard]] std::uintptr_t ResolveCachedAddress(
         std::atomic<std::uintptr_t>& cache,
-        const ReviewedSymbol& symbol,
+        const RuntimeRVA& symbol,
         AddressKind kind) noexcept
     {
         auto address = cache.load(std::memory_order_acquire);
@@ -110,7 +43,7 @@ namespace
             return 0;
         if (address != 0)
             return address;
-        address = ResolveReviewedSymbol(symbol, kind);
+        address = RuntimeAPI::GetSingleton().ResolveRVA(symbol, kind);
         if (address != 0)
             cache.store(address, std::memory_order_release);
         else if (RuntimeAPI::GetSingleton().IsInitialized())
@@ -121,7 +54,7 @@ namespace
     template <class TObject>
     [[nodiscard]] TObject* ResolveDirectObject(
         std::atomic<std::uintptr_t>& cache,
-        const ReviewedSymbol& symbol,
+        const RuntimeRVA& symbol,
         AddressKind kind = AddressKind::kReadable) noexcept
     {
         const auto address = ResolveCachedAddress(cache, symbol, kind);
@@ -135,7 +68,7 @@ namespace
 
     [[nodiscard]] std::byte* ResolveDirectSpan(
         std::atomic<std::uintptr_t>& cache,
-        const ReviewedSymbol& symbol,
+        const RuntimeRVA& symbol,
         std::size_t readableSpan) noexcept
     {
         const auto address = ResolveCachedAddress(
@@ -150,7 +83,7 @@ namespace
     template <class TObject>
     [[nodiscard]] TObject* ResolveIndirectObject(
         std::atomic<std::uintptr_t>& cache,
-        const ReviewedSymbol& symbol,
+        const RuntimeRVA& symbol,
         std::size_t readableSpan = sizeof(TObject)) noexcept
     {
         const auto storage = ResolveCachedAddress(
@@ -201,7 +134,7 @@ namespace
     template <class TFunction>
     [[nodiscard]] TFunction ResolveFunction(
         std::atomic<std::uintptr_t>& cache,
-        const ReviewedSymbol& symbol) noexcept
+        const RuntimeRVA& symbol) noexcept
     {
         const auto address = ResolveCachedAddress(
             cache, symbol, AddressKind::kExecutable);

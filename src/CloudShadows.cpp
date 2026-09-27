@@ -601,7 +601,7 @@ namespace CloudShadows
 
         std::byte* GetRenderTargetManagerAddress() noexcept
         {
-            // Reviewed OG/AE Address Library IDs and the exact VR RVA resolve
+            // Reviewed exact-version OG/AE/VR addresses resolve
             // the same RenderTargetManager singleton object. The downstream
             // logical->physical map checks remain the fail-closed authority.
             return FO4CS::EngineAPI::GetRenderTargetManager();

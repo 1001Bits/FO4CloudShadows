@@ -69,6 +69,55 @@ if ($exportDifference.Count -ne 0) {
     throw "Unexpected export contract. Found: $($exports -join ', ')."
 }
 
+# Inspect the exported record itself: F4SE reads these flags before Load and
+# requires an installed Address Library when either database bit is set.
+$versionExport = [regex]::Match($exportsText,
+    '(?m)^\s*\d+\s+[0-9A-F]+\s+([0-9A-F]+)\s+F4SEPlugin_Version(?:\s+=.*)?\s*$')
+if (-not $versionExport.Success) { throw 'Cannot locate F4SEPlugin_Version RVA.' }
+$versionRva = [Convert]::ToUInt32($versionExport.Groups[1].Value, 16)
+$imageBytes = [IO.File]::ReadAllBytes($resolvedBinary)
+$ntOffset = [BitConverter]::ToInt32($imageBytes, 0x3C)
+if ($ntOffset -lt 0 -or $ntOffset + 24 -gt $imageBytes.Length -or
+    [BitConverter]::ToUInt32($imageBytes, $ntOffset) -ne 0x4550) {
+    throw 'Invalid PE header while reading F4SE metadata.'
+}
+$sectionCount = [BitConverter]::ToUInt16($imageBytes, $ntOffset + 6)
+$optionalSize = [BitConverter]::ToUInt16($imageBytes, $ntOffset + 20)
+$sectionTable = $ntOffset + 24 + $optionalSize
+$versionOffset = -1L
+for ($index = 0; $index -lt $sectionCount; ++$index) {
+    $sectionOffset = $sectionTable + 40 * $index
+    if ($sectionOffset + 40 -gt $imageBytes.Length) { throw 'Truncated PE section table.' }
+    $sectionRva = [BitConverter]::ToUInt32($imageBytes, $sectionOffset + 12)
+    $rawSize = [BitConverter]::ToUInt32($imageBytes, $sectionOffset + 16)
+    $rawOffset = [BitConverter]::ToUInt32($imageBytes, $sectionOffset + 20)
+    $relative = [long]$versionRva - $sectionRva
+    if ($relative -ge 0 -and $relative + 1116 -le $rawSize) {
+        $versionOffset = [long]$rawOffset + $relative
+        break
+    }
+}
+if ($versionOffset -lt 0 -or $versionOffset + 1116 -gt $imageBytes.Length) {
+    throw 'F4SE metadata is not fully backed by the DLL file.'
+}
+if ([BitConverter]::ToUInt32($imageBytes, $versionOffset) -ne 1) {
+    throw 'Unexpected F4SE metadata schema.'
+}
+$addressFlags = [BitConverter]::ToUInt32($imageBytes, $versionOffset + 520)
+if ($addressFlags -ne 0) {
+    throw "F4SE metadata must use exact versions with no Address Library flags; found $addressFlags."
+}
+# Packed F4SE versions: OG 1.10.163, AE 1.11.240, VR 1.2.72, VR's 1.10.138 proxy.
+$compatibleVersions = @(0x010A0A30, 0x010B0F00, 0x01020480, 0x010A08A0)
+for ($index = 0; $index -lt 16; ++$index) {
+    $actualVersion = [BitConverter]::ToUInt32($imageBytes, $versionOffset + 528 + 4 * $index)
+    $expectedRuntime = if ($index -lt $compatibleVersions.Count) { $compatibleVersions[$index] } else { 0 }
+    if ($actualVersion -ne $expectedRuntime) {
+        throw "Unexpected F4SE compatible version at index $index."
+    }
+}
+Write-Host 'Verified F4SE metadata: exact supported versions, no Address Library requirement.'
+
 $headersText = (& $resolvedDumpbin /nologo /headers $resolvedBinary 2>&1 | Out-String)
 if ($LASTEXITCODE -ne 0) { throw "dumpbin /headers failed ($LASTEXITCODE)." }
 foreach ($requirement in @(

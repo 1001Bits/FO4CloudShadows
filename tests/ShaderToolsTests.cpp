@@ -178,6 +178,20 @@ namespace
 			ClassifyHost(editor, L"Fallout4.exe", kAERuntime) ==
 				RuntimeTarget::kUnsupported,
 			"editor hosts are rejected");
+
+		// Built-in addresses must never be selected for a nearby/new runtime,
+		// even when the extender and executable agree about that version.
+		for (const Version unsupported : {
+				Version{ 1, 10, 980, 0 }, Version{ 1, 10, 984, 0 },
+				Version{ 1, 11, 221, 0 }, Version{ 1, 11, 241, 0 },
+				Version{ 1, 10, 163, 1 }, Version{ 1, 11, 240, 1 } }) {
+			flat.prefix = MakeInterfacePrefix(kF4SEWithPluginInfo, unsupported);
+			Interface unknown;
+			tests.Require(unknown.Normalize(&flat) &&
+				ClassifyHost(unknown, L"Fallout4.exe", unsupported) ==
+					RuntimeTarget::kUnsupported,
+				"unlisted desktop versions cannot select built-in addresses");
+		}
 	}
 
 	uint32_t ReadU32(const std::vector<uint8_t>& bytes, size_t offset)

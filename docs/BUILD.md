@@ -17,11 +17,17 @@ cmake --build out/build/validation --config Release --target release-package
 ```
 
 The package target runs the core tests, verifies the DLL's exports, version,
-release feature flags and runtime assets, and creates matching runtime/source
+F4SE metadata (including no Address Library requirement), release feature flags
+and runtime assets, and creates matching runtime/source
 ZIPs plus checksums under `out/build/validation`. It requires the pinned vcpkg
 checkout, installed package metadata and cached source archives listed in
 `config/vcpkg-source-lock.json`. No game installation is needed for the core
 tests, which use generated GPU fixtures and D3D11 WARP.
+
+Address Library is not a build or installation dependency. The optional
+developer check in [RUNTIME_ADDRESSES.md](RUNTIME_ADDRESSES.md) compares the
+built-in addresses with locally supplied game images and migration databases;
+these private files are not needed by the core tests or included in packages.
 
 For an additional hardware renderer check, run:
 
