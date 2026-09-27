@@ -1,4 +1,28 @@
-# Build 3824b403d0b12757 — 28 September 2026
+# Build 6cbead4449ed1249 � 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`4CB99CE14F420714E4EB9A0C6630CB0E87C6DB69B3D2AC7C508A9B29C40904B7`.
+
+- Fix missing cloud shadows when a graphics wrapper replaces the native swap
+  chain after its Present hook was installed. Install the renderer-selected
+  object's actual Present method with its own immutable trampoline.
+- Keep one shared nesting guard across wrapper, overlay and native routes.
+  Publish each main frame once; keep auxiliary and TEST presents excluded.
+- Notice later changes to the selected chain's Present vtable entry during
+  normal renderer maintenance. Failed attachments leave that boundary inactive
+  and retry with backoff, without replacing established trampolines.
+- Remove the assumption that any existing native Present hook makes a newly
+  selected wrapper ready. No weather, shader or saved-setting changes are needed.
+
+All 14 core checks pass. Real WARP/Detours integration tests cover native-first
+and wrapper-first installation, 120 successive wrapped frames, nested wrappers,
+a later overlay, auxiliary windows, TEST calls, receiver replacement, original
+HRESULT propagation and failed-attachment recovery. The reporter's exact mod
+setup and an in-game visual matrix have not been rerun for this build.
+Release developer-tools/private-profiling flags remain off. Runtime support
+and Address Library requirements are unchanged from the preceding build.
+
+# Previous build 3824b403d0b12757 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `EC7CB38C31AFA31636CD7E2CFC1B605F5B98CF0303A54036A88340F16AFA5E33`.

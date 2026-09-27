@@ -17,6 +17,7 @@
 #include "ShaderTools/DFLightDescriptor.h"
 #include "WaterReflectionGuard.h"
 #include "DetourTransaction.h"
+#include "PresentDetours.h"
 #include "WideFileSink.h"
 
 #include <array>
@@ -169,84 +170,7 @@ namespace
     // context is invalid.  Runtime driver-entry rebinding can happen after
     // worker/overlay threads exist, so enlisting only the render thread is not
     // safe when an old prologue may be executing elsewhere.
-    class DetourThreadEnlistment
-    {
-    public:
-        ~DetourThreadEnlistment()
-        {
-            for (HANDLE thread : threads_)
-                CloseHandle(thread);
-        }
-
-        DetourThreadEnlistment(const DetourThreadEnlistment&) = delete;
-        DetourThreadEnlistment& operator=(const DetourThreadEnlistment&) = delete;
-        DetourThreadEnlistment() = default;
-
-        LONG EnlistProcessThreads() noexcept
-        {
-            LONG error = DetourUpdateThread(GetCurrentThread());
-            if (error != NO_ERROR)
-                return error;
-
-            HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if (snapshot == INVALID_HANDLE_VALUE)
-                return static_cast<LONG>(GetLastError());
-
-            THREADENTRY32 entry{};
-            entry.dwSize = sizeof(entry);
-            if (!Thread32First(snapshot, &entry)) {
-                error = static_cast<LONG>(GetLastError());
-                CloseHandle(snapshot);
-                return error;
-            }
-
-            const DWORD processId = GetCurrentProcessId();
-            const DWORD currentThreadId = GetCurrentThreadId();
-            do {
-                if (entry.th32OwnerProcessID != processId ||
-                    entry.th32ThreadID == currentThreadId) {
-                    continue;
-                }
-
-                HANDLE thread = OpenThread(
-                    THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT |
-                        THREAD_SET_CONTEXT | THREAD_QUERY_INFORMATION,
-                    FALSE, entry.th32ThreadID);
-                if (!thread) {
-                    const DWORD openError = GetLastError();
-                    // A thread can legitimately exit after the snapshot.
-                    if (openError == ERROR_INVALID_PARAMETER)
-                        continue;
-                    error = static_cast<LONG>(openError);
-                    break;
-                }
-
-                // Collect every handle before suspending anything. This keeps
-                // vector growth and snapshot enumeration out of the suspended
-                // interval.
-                threads_.push_back(thread);
-            } while (Thread32Next(snapshot, &entry));
-
-            if (error == NO_ERROR) {
-                const DWORD enumerationError = GetLastError();
-                if (enumerationError != ERROR_NO_MORE_FILES)
-                    error = static_cast<LONG>(enumerationError);
-            }
-            CloseHandle(snapshot);
-            if (error != NO_ERROR)
-                return error;
-
-            for (HANDLE thread : threads_) {
-                error = DetourUpdateThread(thread);
-                if (error != NO_ERROR)
-                    return error;
-            }
-            return error;
-        }
-
-    private:
-        std::vector<HANDLE> threads_;
-    };
+    using FO4CS::DetourThreadEnlistment;
 
     struct IDXGISwapChain_Present;
     struct ID3D11Device_CreateVertexShader;
@@ -267,27 +191,11 @@ namespace
         ID3D11Device*, const void*, SIZE_T, ID3D11ClassLinkage*,
         ID3D11PixelShader**);
     std::mutex g_comHookMutex;
-    std::unordered_map<std::uintptr_t*, PresentFn> g_presentOriginals;
     std::unordered_map<std::uintptr_t*, CreateVertexShaderFn> g_createVSOriginals;
     std::unordered_map<std::uintptr_t*, CreatePixelShaderFn> g_createPSOriginals;
-    std::unordered_set<std::uintptr_t*> g_presentOuterHooksObserved;
-    // Present is intercepted with an inline Detours hook on the stock dxgi.dll
-    // implementation rather than a vtable slot write. Steam's overlay
-    // (gameoverlayrenderer64) re-hooks the swap-chain vtable after plugins and
-    // records the previous slot as its "next" while also inline-patching the
-    // dxgi function; a vtable thunk whose downstream is that function then
-    // loops overlay -> thunk -> overlay until the stack overflows (observed on
-    // 1.11.240 launched under Steam, 1083 nested frames). A code detour has a
-    // private trampoline into the real body, so no ordering can form a cycle.
-    PresentFn g_presentDetourOriginal = nullptr;     // Detours trampoline
-    std::atomic<std::uintptr_t> g_presentDetourTarget{ 0 }; // stock dxgi Present
     std::unordered_set<std::uintptr_t*> g_createVSOuterHooksObserved;
     std::unordered_set<std::uintptr_t*> g_createPSOuterHooksObserved;
 
-    constexpr GUID kPresentRouteMarker{
-        0x4f5f1c91, 0xa3de, 0x47a2,
-        { 0xb0, 0x5d, 0x53, 0x89, 0xcb, 0x38, 0x12, 0x45 }
-    };
     constexpr GUID kCreatePSRouteMarker{
         0xd10c70a4, 0x6b45, 0x4bf1,
         { 0x8c, 0x14, 0xe9, 0xa4, 0x3f, 0x72, 0x90, 0x63 }
@@ -974,31 +882,15 @@ namespace
             }
         }
 
-        static HRESULT WINAPI thunk(IDXGISwapChain* This, UINT SyncInterval, UINT Flags)
+        static HRESULT Invoke(PresentFn original, IDXGISwapChain* This,
+            UINT SyncInterval, UINT Flags)
         {
             FO4CS::RendererLifetime::Scope rendererLifetime;
-            // The Detours trampoline is the only valid continuation: the vtable
-            // slot and the object's route pointer now both lead back to this
-            // detour through the patched function entry.
-            PresentFn original = g_presentDetourOriginal;
             if (!original)
                 return DXGI_ERROR_INVALID_CALL;
-            // Nested arrival on the same thread (another interceptor calling
-            // Present from inside Present) is forwarded without frame work.
-            static thread_local unsigned depth = 0;
-            struct DepthGuard {
-                unsigned& value; explicit DepthGuard(unsigned& v) : value(v) { ++value; }
-                ~DepthGuard() { --value; }
-            } depthGuard(depth);
-            if (depth > 1)
-                return original(This, SyncInterval, Flags);
-
-            // DXGI vtables are shared by multiple swap-chain instances.  Only
-            // the renderer's authoritative chain defines the main frame
-            // boundary, and a TEST present explicitly does not present a frame.
-            if (!This || This != g_publishedRendererSwapChain.load(
-                                     std::memory_order_acquire) ||
-                (Flags & DXGI_PRESENT_TEST) != 0)
+            FO4CS::PresentDetours::CallScope call(This,
+                g_publishedRendererSwapChain.load(std::memory_order_acquire), Flags);
+            if (!call.Accepted())
                 return original(This, SyncInterval, Flags);
 
             ScopedPresentBoundary boundary;
@@ -1018,248 +910,83 @@ namespace
         bool authoritativeRendererChain)
     {
         FO4CS::RendererLifetime::Scope rendererLifetime;
-        if (!swapChain) {
-            if (authoritativeRendererChain)
-                SetHookAvailable(
-                    FO4CloudShadowsMenuBridge::kPresentHookUnavailable,
-                    false);
-            return false;
-        }
-
-        // Hook every vtable so a later renderer-selected chain is already
-        // routed through our thunk, but never let an auxiliary/dummy chain
-        // steal the frame-boundary identity.  Before RendererData exists the
-        // first chain is only provisional; rendererWindow[0] replaces it as
-        // soon as the engine exposes the authoritative chain.
         bool selectChain = authoritativeRendererChain;
         {
             std::lock_guard bindingLock(g_rendererBindingMutex);
             selectChain = selectChain || !g_ownedRendererSwapChain;
         }
-        std::uintptr_t* vtable = nullptr;
-        if (!ReadValidatedComVTable(swapChain, 8, &vtable)) {
-            SPDLOG_ERROR("[CloudShadows] Present hook has no swap-chain vtable");
-            if (selectChain)
+        const auto unavailable = [&] {
+            if (selectChain) {
                 SetHookAvailable(
-                    FO4CloudShadowsMenuBridge::kPresentHookUnavailable,
-                    false);
+                    FO4CloudShadowsMenuBridge::kPresentHookUnavailable, false);
+                // A replaced renderer must not keep using the old chain as a
+                // substitute boundary while its actual Present is unavailable.
+                if (authoritativeRendererChain)
+                    g_publishedRendererSwapChain.store(nullptr, std::memory_order_release);
+            }
             return false;
-        }
+        };
+        std::uintptr_t* vtable = nullptr;
+        if (!ReadValidatedComVTable(swapChain, 8, &vtable))
+            return unavailable();
+        const auto entry = vtable[8];
+        // RendererData supplies the authoritative COM object's actual Present
+        // method, including graphics wrappers/overlays. During provisional
+        // creation retain the narrower native/known-proxy module check.
+        if (!authoritativeRendererChain &&
+            !IsExecutableAddressInModule(entry, L"dxgi.dll"))
+            return unavailable();
 
-        const auto thunk = reinterpret_cast<std::uintptr_t>(&IDXGISwapChain_Present::thunk);
-        const std::uintptr_t current = vtable[8];
-        PresentFn downstream = ReadComRoute<PresentFn>(
-            swapChain, kPresentRouteMarker, thunk, L"dxgi.dll");
-        bool objectRouteReady = downstream != nullptr;
-        bool routeDataFailed = false;
-        bool installThunk = false;
-        bool newerOuterHook = false;
-        bool unsupportedInterceptor = false;
-        bool hookReady = false;
-        std::uintptr_t expectedCurrent = 0;
-        HMODULE unsupportedOwner = nullptr;
-        {
-            std::lock_guard lock(g_comHookMutex);
-            if (!downstream) {
-                if (current == thunk || g_presentDetourTarget.load(std::memory_order_acquire) != 0) {
-                    // Another object may already have installed our thunk on
-                    // this shared table. Only then is its immutable native
-                    // route safe to inherit.
-                    if (const auto vtableRoute = g_presentOriginals.find(vtable);
-                        vtableRoute != g_presentOriginals.end() &&
-                        IsExecutableAddressInModule(
-                            reinterpret_cast<std::uintptr_t>(vtableRoute->second),
-                            L"dxgi.dll")) {
-                        downstream = vtableRoute->second;
-                    }
-                } else if (current && IsExecutableAddressInModule(
-                               current, L"dxgi.dll", &unsupportedOwner)) {
-                    // An unmarked object with a non-thunk slot is a fresh COM
-                    // identity. Discard any stale map entry at a reused vtable
-                    // address and learn only a validated presentation implementation.
-                    downstream = reinterpret_cast<PresentFn>(current);
-                    g_presentOriginals.erase(vtable);
-                    g_presentOriginals.emplace(vtable, downstream);
-                } else {
-                    unsupportedInterceptor =
-                        g_presentOuterHooksObserved.insert(vtable).second;
-                }
+        // Inline detours retain private, per-method trampolines. Never write a
+        // vtable slot: Steam may replace that slot and chain to its previous
+        // value while also patching DXGI, which caused a recursion in the old
+        // vtable implementation. A wrapper needs its own route even when a
+        // native DXGI detour is already installed.
+        const auto route = FO4CS::PresentDetours::Ensure(
+            entry, &IDXGISwapChain_Present::Invoke);
+        if (!route.ready) {
+            if (route.attempted || route.error != ERROR_RETRY) {
+                static std::atomic<std::uintptr_t> lastFailedEntry{};
+                if (route.attempted || lastFailedEntry.exchange(entry) != entry)
+                    SPDLOG_ERROR("[CloudShadows] Present route unavailable: "
+                        "error={} entry={} swap={}; renderer maintenance will retry",
+                        route.error, reinterpret_cast<void*>(entry), (void*)swapChain);
             }
-
-            if (downstream) {
-                // Object private data is the authoritative immutable route for
-                // cloned vtables. Refreshing this native-only cache also heals
-                // a stale vtable address reused by the runtime.
-                g_presentOriginals.insert_or_assign(vtable, downstream);
-
-                if (!objectRouteReady) {
-                    objectRouteReady = SetComRoute(
-                        swapChain, kPresentRouteMarker, downstream,
-                        thunk, L"dxgi.dll");
-                    routeDataFailed = !objectRouteReady;
-                }
-
-                if (objectRouteReady && current != thunk) {
-                    const auto permanentDownstream =
-                        reinterpret_cast<std::uintptr_t>(downstream);
-                    if (current == permanentDownstream) {
-                        // Every route belongs to DXGI or a recognized proxy.
-                        installThunk = true;
-                        expectedCurrent = current;
-                    } else {
-                        // A later hook may already chain to our thunk. Keep it
-                        // outermost and retain the permanent downstream route.
-                        newerOuterHook =
-                            g_presentOuterHooksObserved.insert(vtable).second;
-                    }
-                }
-                hookReady = objectRouteReady &&
-                    g_presentDetourTarget.load(std::memory_order_acquire) ==
-                        reinterpret_cast<std::uintptr_t>(downstream);
+            return unavailable();
+        }
+        if (route.installed) {
+            HMODULE module = nullptr;
+            wchar_t path[512]{};
+            char utf8[1536]{};
+            if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(entry), &module)) {
+                GetModuleFileNameW(module, path, 512);
+                WideCharToMultiByte(CP_UTF8, 0, path, -1, utf8,
+                    static_cast<int>(sizeof(utf8)), nullptr, nullptr);
             }
-        }
-        (void)expectedCurrent;
-        (void)installThunk;
-        // A chain whose vtable is owned by an overlay (Discord/OBS/RTSS) still
-        // reaches the detoured dxgi implementation, so it is a valid boundary
-        // once that detour exists; its private route cannot be learned.
-        if (!downstream &&
-            g_presentDetourTarget.load(std::memory_order_acquire) != 0) {
-            unsupportedInterceptor = false;
-            hookReady = true;
-        }
-        if (downstream) {
-            const auto target = reinterpret_cast<std::uintptr_t>(downstream);
-            const auto active = g_presentDetourTarget.load(std::memory_order_acquire);
-            static std::atomic<std::uintptr_t> loggedForeignTarget{ 0 };
-            const auto rejectForeignTarget = [&](std::uintptr_t established) noexcept {
-                // A second distinct dxgi Present implementation is not
-                // expected; keep the single established detour.
-                hookReady = false;
-                if (loggedForeignTarget.exchange(target) != target) {
-                    SPDLOG_WARN(
-                        "[CloudShadows] Present detour already targets {}; ignoring {} on swap={}",
-                        reinterpret_cast<const void*>(established),
-                        reinterpret_cast<const void*>(target), (void*)swapChain);
-                }
-            };
-            static ULONGLONG retryAfter = 0;
-            static uint32_t failures = 0;
-            if (active == target) {
-                hookReady = true;
-            } else if (active != 0) {
-                rejectForeignTarget(active);
-            } else {
-                std::lock_guard lock(g_comHookMutex);
-                const auto established =
-                    g_presentDetourTarget.load(std::memory_order_acquire);
-                if (established == target) {
-                    hookReady = true;
-                } else if (established != 0) {
-                    // Another thread installed a different target between the
-                    // unlocked read and this lock; never overwrite its trampoline.
-                    rejectForeignTarget(established);
-                } else if (GetTickCount64() < retryAfter) {
-                    hookReady = false;
-                } else {
-                    g_presentDetourOriginal = downstream;
-                    std::lock_guard transactionLock(FO4CS::DetourTransaction::Mutex());
-                    // Attach before suspending threads: Detours allocates its
-                    // operation and trampoline while the heap lock is free.
-                    LONG err = DetourTransactionBegin();
-                    if (err == NO_ERROR)
-                        err = DetourAttach(
-                            reinterpret_cast<PVOID*>(&g_presentDetourOriginal),
-                            reinterpret_cast<PVOID>(thunk));
-                    DetourThreadEnlistment threads;
-                    if (err == NO_ERROR) err = threads.EnlistProcessThreads();
-                    if (err == NO_ERROR) err = DetourTransactionCommit();
-                    else DetourTransactionAbort();
-                    if (err == NO_ERROR) {
-                        failures = 0;
-                        retryAfter = 0;
-                        g_presentDetourTarget.store(target, std::memory_order_release);
-                        hookReady = true;
-                        HMODULE targetModule = nullptr;
-                        wchar_t targetPath[512]{};
-                        if (GetModuleHandleExW(
-                                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                                reinterpret_cast<LPCWSTR>(target), &targetModule))
-                            GetModuleFileNameW(targetModule, targetPath, 512);
-                        // UTF-8 without exceptions: fs::path::string() converts via the
-                        // ANSI code page and throws for unrepresentable characters.
-                        char targetUtf8[1024]{};
-                        if (!WideCharToMultiByte(CP_UTF8, 0, targetPath, -1, targetUtf8,
-                                static_cast<int>(sizeof(targetUtf8)), nullptr, nullptr))
-                            targetUtf8[0] = 0;
-                        SPDLOG_INFO(
-                            "[CloudShadows] Present inline detour installed via {} on Present {} in {} "
-                            "(trampoline={}) for swap={}; vtable slot untouched (current={})",
-                            source, reinterpret_cast<const void*>(target),
-                            targetUtf8,
-                            reinterpret_cast<const void*>(g_presentDetourOriginal),
-                            (void*)swapChain, reinterpret_cast<const void*>(current));
-                    } else {
-                        g_presentDetourOriginal = nullptr;
-                        hookReady = false;
-                        ++failures;
-                        const ULONGLONG backoff = (std::min)(
-                            60000ull, 1000ull << (std::min)(failures, 6u));
-                        retryAfter = GetTickCount64() + backoff;
-                        if (failures <= 3 || (failures & (failures - 1)) == 0) {
-                            SPDLOG_ERROR(
-                                "[CloudShadows] Present inline detour failed ({}) on swap={}; "
-                                "retry in {} ms",
-                                err, (void*)swapChain, backoff);
-                        }
-                    }
-                }
-            }
-            if (newerOuterHook)
-                SPDLOG_INFO(
-                    "[CloudShadows] Another Present interceptor occupies the vtable slot on swap={}; "
-                    "the inline detour still receives every Present",
-                    (void*)swapChain);
-        }
-        if (routeDataFailed) {
-            hookReady = false;
-            static std::atomic<bool> loggedMarkerFailure{ false };
-            if (!loggedMarkerFailure.exchange(true)) {
-                SPDLOG_ERROR(
-                    "[CloudShadows] Swap-chain route data rejected; Present hook left unchanged");
-            }
-        }
-        if (unsupportedInterceptor) {
-            hookReady = false;
-            SPDLOG_ERROR(
-                "[CloudShadows] Unsupported pre-existing Present interceptor at {} "
-                "(owner={}); expected executable code in dxgi.dll; hook left unchanged",
-                reinterpret_cast<const void*>(current),
-                static_cast<void*>(unsupportedOwner));
+            SPDLOG_INFO("[CloudShadows] Present inline detour installed via {} "
+                "on Present {} in {} (route={} trampoline={}) for swap={}; vtable slot untouched",
+                source, reinterpret_cast<void*>(entry), utf8, route.route,
+                reinterpret_cast<void*>(route.original), (void*)swapChain);
         }
         if (selectChain) {
-            SetHookAvailable(
-                FO4CloudShadowsMenuBridge::kPresentHookUnavailable,
-                hookReady);
-            if (hookReady) {
-                std::lock_guard bindingLock(g_rendererBindingMutex);
-                if (g_ownedRendererSwapChain.Get() != swapChain) {
-                    SPDLOG_INFO(
-                        "[CloudShadows] {} Present chain selected via {}: {}",
-                        authoritativeRendererChain ? "Authoritative" : "Provisional",
-                        source, (void*)swapChain);
-                    if (g_ownedRendererSwapChain)
-                        FO4CS::RendererLifetime::Retire(
-                            g_ownedRendererSwapChain);
-                    g_ownedRendererSwapChain = swapChain;
-                    g_swapChain = g_ownedRendererSwapChain.Get();
-                    g_publishedRendererSwapChain.store(
-                        g_swapChain, std::memory_order_release);
-                }
+            std::lock_guard bindingLock(g_rendererBindingMutex);
+            if (g_ownedRendererSwapChain.Get() != swapChain) {
+                SPDLOG_INFO("[CloudShadows] {} Present chain selected via {}: {} (route={})",
+                    authoritativeRendererChain ? "Authoritative" : "Provisional",
+                    source, (void*)swapChain, route.route);
+                if (g_ownedRendererSwapChain)
+                    FO4CS::RendererLifetime::Retire(g_ownedRendererSwapChain);
+                g_ownedRendererSwapChain = swapChain;
             }
+            g_swapChain = g_ownedRendererSwapChain.Get();
+            // Republish even if a failed install temporarily withdrew this
+            // same receiver. Hook readiness is established for its own route.
+            g_publishedRendererSwapChain.store(g_swapChain, std::memory_order_release);
+            SetHookAvailable(FO4CloudShadowsMenuBridge::kPresentHookUnavailable, true);
         }
-        return hookReady;
+        return true;
     }
 
     struct ID3D11Device_CreateVertexShader
@@ -2092,6 +1819,7 @@ namespace
         IDXGISwapChain* swapChain{};
         std::uintptr_t createVertexShader{};
         std::uintptr_t createPixelShader{};
+        std::uintptr_t presentEntry{};
         std::array<std::uintptr_t, 4> drawEntries{};
 
         bool operator==(const RendererBindingSnapshot&) const = default;
@@ -2118,6 +1846,10 @@ namespace
         };
         snapshot.createVertexShader = slot(deviceVTable, 12);
         snapshot.createPixelShader = slot(deviceVTable, 15);
+        if (swapChain && swapChain == g_ownedRendererSwapChain.Get()) {
+            auto* swapVTable = *reinterpret_cast<std::uintptr_t**>(swapChain);
+            snapshot.presentEntry = slot(swapVTable, 8);
+        }
         snapshot.drawEntries = {
             slot(contextVTable, 12), slot(contextVTable, 13),
             slot(contextVTable, 20), slot(contextVTable, 21)
@@ -2146,6 +1878,7 @@ namespace
             CloudShadows::g_initialized.load(std::memory_order_acquire) &&
             device == g_ownedRendererDevice.Get() &&
             context == g_ownedRendererContext.Get() &&
+            swapChain == g_publishedRendererSwapChain.load(std::memory_order_acquire) &&
             ReadOwnedBindingSnapshot(device, context, swapChain) ==
                 g_verifiedRendererBindings) {
             return;

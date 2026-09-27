@@ -339,6 +339,24 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
     add_test(NAME runtime-lifecycle-contract
         COMMAND "$<TARGET_FILE:FO4CloudShadowsRuntimeLifecycleTests>")
     set_tests_properties(runtime-lifecycle-contract PROPERTIES LABELS core TIMEOUT 30)
+    add_executable(FO4CloudShadowsPresentRoutingTests EXCLUDE_FROM_ALL
+        tests/PresentRoutingTests.cpp)
+    target_compile_features(FO4CloudShadowsPresentRoutingTests PRIVATE cxx_std_23)
+    target_compile_definitions(FO4CloudShadowsPresentRoutingTests PRIVATE
+        NOMINMAX WIN32_LEAN_AND_MEAN)
+    target_include_directories(FO4CloudShadowsPresentRoutingTests PRIVATE src)
+    target_link_libraries(FO4CloudShadowsPresentRoutingTests PRIVATE
+        Detours::Detours d3d11.lib dxgi.lib user32.lib)
+    target_compile_options(FO4CloudShadowsPresentRoutingTests PRIVATE
+        /W4 /WX /utf-8 /permissive- /Zc:__cplusplus /Zc:preprocessor)
+    set_target_properties(FO4CloudShadowsPresentRoutingTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin/$<CONFIG>")
+    add_test(NAME present-routing-native-first
+        COMMAND "$<TARGET_FILE:FO4CloudShadowsPresentRoutingTests>")
+    add_test(NAME present-routing-wrapper-first
+        COMMAND "$<TARGET_FILE:FO4CloudShadowsPresentRoutingTests>" --wrapper-first)
+    set_tests_properties(present-routing-native-first present-routing-wrapper-first
+        PROPERTIES LABELS core TIMEOUT 45)
     foreach(_profile_test IN ITEMS CpuStageProfiler ResidentPageValidation)
         add_executable(FO4CloudShadows${_profile_test}Tests EXCLUDE_FROM_ALL
             tests/${_profile_test}Tests.cpp)
@@ -359,6 +377,7 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
         FO4CloudShadowsShaderToolsTests FO4CloudShadowsSkyCloudCompatibilityTests
         FO4CloudShadowsRendererTests FO4CloudShadowsGodraySettingsTests
         FO4CloudShadowsRuntimeLifecycleTests
+        FO4CloudShadowsPresentRoutingTests
         FO4CloudShadowsCpuStageProfilerTests FO4CloudShadowsResidentPageValidationTests)
     add_custom_target(validation-build DEPENDS FO4CloudShadows fo4cs-tests)
     add_custom_target(release-contract-check
