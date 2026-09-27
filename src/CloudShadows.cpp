@@ -2239,7 +2239,7 @@ namespace CloudShadows
 
         nlohmann::json j;
         j["ProjectionModelVersion"] = kProjectionModelVersion;
-		j["Enabled"] = g_shadowsEnabled.load(std::memory_order_relaxed);
+		j["Enabled"] = FO4CS::ManualFpsLog::EnabledForSave(g_shadowsEnabled.load(std::memory_order_relaxed));
         j["GodrayCloudOcclusion"] =
             FO4CS::GodraysIntegration::IsCloudOcclusionEnabled();
         j["Opacity"] = g_settings.Opacity;
@@ -3185,8 +3185,9 @@ namespace CloudShadows
                 // off (whose bits were never read) must not toggle shadows.
                 previousF10 = GetAsyncKeyState(VK_F10);
             } else {
-                // The Development Menu owns F7/F8/F11. Turning it off must not
-                // leave its sky preview, HUD or measurements running unreachable.
+                // Turning Development menu off restores an automatic test's
+                // original setting and removes its HUD.
+                FO4CS::ManualFpsLog::HideResults();
                 FO4CS::CloudComparison::StopMeasurements();
                 Overlay::CloseForDisabledHotkeys();
                 CancelSingleCloudLock();

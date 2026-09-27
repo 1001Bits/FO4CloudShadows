@@ -21,7 +21,7 @@
       "id": "bHotkeys:CloudShadows",
       "type": "switcher",
       "text": "Development menu",
-      "help": "When enabled, close MCM and use:\nF11 - Open/close the development menu.\nF10 - Toggle cloud shadows on/off.\nF8 - Cycle sky preview: off, magenta clouds, raw opacity.\nF7 - Clear the preview and comparison display.\nDesktop only. Off by default.",
+      "help": "When enabled, close MCM and use:\nF11 - Open/close the development menu and start an FPS test.\nF10 - Toggle cloud shadows for a manual FPS comparison.\nThe menu shows ON/OFF averages and can run an automatic comparison. Stand still outdoors. Desktop only. Off by default.",
       "valueOptions": { "sourceType": "ModSettingBool" }
     }
   ]

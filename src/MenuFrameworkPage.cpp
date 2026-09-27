@@ -123,10 +123,9 @@ namespace FO4CS::MenuFrameworkPage
             ui.separator();
             ui.checkbox("Development menu##hotkeys", &edited.hotkeys);
             Tooltip("When enabled, close this menu and use:\n"
-                "F11 - Open/close the development menu.\n"
-                "F10 - Toggle cloud shadows on/off.\n"
-                "F8 - Cycle sky preview: off, magenta clouds, raw opacity.\n"
-                "F7 - Clear the preview and comparison display.\n"
+                "F11 - Open/close the development menu and start an FPS test.\n"
+                "F10 - Toggle cloud shadows for a manual FPS comparison.\n"
+                "The menu shows ON/OFF averages and can run an automatic comparison. Stand still outdoors.\n"
                 "Desktop only. Off by default.");
             ui.separator();
             ui.wrapped("%s", "Changes are saved when you close this menu or press Apply, and take effect "

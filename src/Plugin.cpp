@@ -913,7 +913,6 @@ namespace
                         CloudShadows::g_settings.DebugMode == 0.0f);
                 ApplyPendingBridgeSettingsOnRenderThread();
                 CloudShadows::PollShadowToggle();
-                FO4CS::CloudComparison::PollControls();
                 TryInitialize();
                 RetryBeginTechniqueHookIfDue();
                 FO4CS::CloudComparison::MaintainShaders(
@@ -2271,6 +2270,15 @@ namespace
         FO4CS::RendererLifetime::Scope rendererLifetime(CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire));
         (void)hullDescriptor;
         (void)domainDescriptor;
+
+        // Opt-in FPS tests need a world-render heartbeat in both ON and OFF.
+        // Observe one native sunlight technique per frame without touching D3D
+        // state or enabling cloud capture in the OFF sample.
+        if (result && FO4CS::ManualFpsLog::NeedsWorldObservation() &&
+            IsDirectionalSunDescriptor(pixelDescriptor) && OwnsImmediateContext() &&
+            !FO4CS::WaterReflectionGuard::IsReflectionUpdateActive() &&
+            ReadShaderIdentity(shader).Filename() == "DFLight")
+            FO4CS::ManualFpsLog::ObserveWorldPass();
 
         // F10 OFF is a true master bypass. Avoid shader-identity VirtualQuery,
         // D3D state inspection, hook maintenance and phase tracking until the

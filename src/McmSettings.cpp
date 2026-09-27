@@ -2,6 +2,7 @@
 #include "PCH.h"
 #include "McmSettings.h"
 #include "McmSettingsFile.h"
+#include "ManualFpsLog.h"
 #include "CloudShadows.h"
 #include "GodraysIntegration.h"
 #include "CloudComparison.h"
@@ -189,6 +190,8 @@ namespace FO4CS::McmSettings
                 throw std::runtime_error("MCM settings changed during read; retrying");
             failedRead.reset();
             const auto changes = McmSettingsFile::Difference(saved, next, force);
+            if (changes.enabled || changes.opacity || changes.cloudHeight)
+                ManualFpsLog::Stop();
             if (changes.opacity) CloudShadows::g_settings.Opacity = next.opacity;
             if (changes.cloudHeight) CloudShadows::g_settings.CloudHeight = next.cloudHeight;
             if (changes.hotkeys)
@@ -227,7 +230,7 @@ namespace FO4CS::McmSettings
         try {
             // F11 saves player settings; diagnostic views stay session-only.
             const auto values = McmSettingsFile::Validate({
-                CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire),
+                ManualFpsLog::EnabledForSave(CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)),
                 CloudShadows::g_settings.Opacity, CloudShadows::g_settings.CloudHeight,
                 CloudShadows::g_hotkeysEnabled.load(std::memory_order_acquire) });
             // Only fields changed in game since the last applied file win; the

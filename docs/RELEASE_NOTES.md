@@ -1,4 +1,31 @@
-# Build d8912e3322fc8cc3 — 27 September 2026
+# Build 3824b403d0b12757 — 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`EC7CB38C31AFA31636CD7E2CFC1B605F5B98CF0303A54036A88340F16AFA5E33`.
+
+- Add FPS testing to the release Development menu, following the Fallout
+  mirrors mod's ON/OFF averages, frame-time distribution and automatic-test
+  workflow. F11 provides Start FPS test, Start manual comparison, stop and
+  hide-display controls. F10 remains the manual shadow toggle.
+- Run OFF/ON/ON/OFF in about 57 seconds, including countdown and settling.
+  Restore the original shadow setting after completion or cancellation; never
+  save temporary benchmark phases. Report live application FPS, mean frame
+  time, p95/p99 and ON-minus-OFF results in the menu and log.
+- Reject incomplete samples after focus loss, menu visibility or absent world
+  rendering. Cancel automatic tests on camera/world, settings, output or render
+  thread changes. Check Present counters, independent wall time, ON lighting
+  coverage and the repeated OFF baseline before accepting the comparison.
+- Remove F7/F8 handlers, sky-preview controls and their MCM help text. MCM still
+  contains only cloud enable, opacity and the Development menu checkbox.
+
+All 12 core checks pass, including automatic completion/restoration, manual
+comparisons, interruption recovery, baseline drift and missing ON lighting.
+Release developer-tools/private-profiling flags remain off. The shaders and
+runtime version list are unchanged. Gameplay validation of the new FPS menu
+is pending at packaging time. Reported frame times include caps and Present
+waits and do not represent isolated CPU/GPU execution time.
+
+# Previous build d8912e3322fc8cc3 — 27 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `CDF7C4C334F81E15863E5D08D2627FF5A25A83770D83C60D7F194F483914D3CE`.

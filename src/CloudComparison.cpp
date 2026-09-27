@@ -22,9 +22,7 @@ namespace FO4CS::CloudComparison
                 std::chrono::steady_clock::now().time_since_epoch()).count();
         }
         std::mutex statusMutex;
-        std::string status = BuildFeatures::kDeveloperTools
-            ? "F10: shadows on/off | F7: stop measurement"
-            : "F10: shadows on/off | F8: sky preview | F7: hide";
+        std::string status = "F10: shadows on/off | F11: FPS test menu";
         // Device objects are never destroyed by a DLL static destructor: at
         // process exit that would run under the loader lock.
         struct DeviceObjects
@@ -139,7 +137,7 @@ namespace FO4CS::CloudComparison
     void FlashStatus(std::string text, double seconds) noexcept
     {
         SetStatus(std::move(text));
-        // An active F8 preview owns the HUD; never arm an expiry that would
+        // An active diagnostic preview owns the HUD; never arm an expiry that would
         // hide the preview while it keeps rendering.
         if (GetPreview() != Preview::Off) {
             hud.store(true, std::memory_order_release);
@@ -175,7 +173,7 @@ namespace FO4CS::CloudComparison
         preview.store(Preview::Off, std::memory_order_release);
         RetirePreview();
         ResetTimings();
-        SPDLOG_INFO("[CloudShadows][Compare] Measurement and preview stopped; F10 starts a new comparison");
+        SPDLOG_INFO("[CloudShadows][Compare] Measurement and preview stopped");
     }
 
     void SetPreview(Preview value) noexcept
@@ -191,23 +189,6 @@ namespace FO4CS::CloudComparison
         ResetTimings();
         SPDLOG_INFO("[CloudShadows][Compare] Sky alignment={} (performance windows excluded while active)",
             value == Preview::Off ? "OFF" : value == Preview::SkyOverlay ? "magenta overlay" : "raw opacity");
-    }
-
-    void PollControls() noexcept
-    {
-        static bool previous7{}, previous8{};
-        if (!CloudShadows::g_hotkeysEnabled.load(std::memory_order_relaxed)) {
-            previous7 = previous8 = false;
-            return;
-        }
-        const bool f7 = (GetAsyncKeyState(VK_F7) & 0x8000) != 0;
-        const bool f8 = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-        if (!Overlay::IsExternalHostActive() && IsForeground()) {
-            if (f7 && !previous7) StopMeasurements();
-            if (f8 && !previous8)
-                SetPreview(static_cast<Preview>((static_cast<unsigned>(GetPreview()) + 1) % 3));
-        }
-        previous7 = f7; previous8 = f8;
     }
 
     bool CompileShaders(ID3D11Device* device, const std::string& source,

@@ -1,4 +1,5 @@
 #include "FrameRateWindow.h"
+#include "FpsTestSession.h"
 
 #include <cmath>
 #include <iostream>
@@ -132,6 +133,92 @@ void TestIndependentCounters()
     }
 }
 
+void TestAutomaticComparison()
+{
+    for (const bool original : { false, true }) {
+        FO4CS::FpsTestSession session;
+        session.Start(true, original);
+        bool enabled = original;
+        unsigned results{};
+        double now{};
+        std::uint32_t presents{};
+        for (unsigned frame = 0; session.Active() && frame < 8000; ++frame) {
+            now += enabled ? 0.012 : 0.010;
+            const auto update = session.Observe({ now, 1, 42, enabled, true, enabled, enabled,
+                false, ++presents, true, now });
+            if (update.result) {
+                Require(update.completedStep == results && update.window.Verified(enabled),
+                    "automatic steps retain correct frame labels and independently checked counters");
+                Require(std::abs(update.window.FPS() - (enabled ? 1000.0/12.0 : 100.0)) < 0.001,
+                    "each phase reports the actual application cadence");
+                ++results;
+            }
+            if (update.setEnabled) enabled = *update.setEnabled;
+        }
+        const auto& snapshot = session.GetSnapshot();
+        Require(results == 4 && snapshot.mode == FO4CS::FpsTestSession::Mode::Finished && enabled == original,
+            "OFF/ON/ON/OFF completes and restores both possible original settings");
+        Require(snapshot.driftOK && snapshot.averages[0].Verified(false) && snapshot.averages[1].Verified(true),
+            "a stationary repeated baseline validates the comparison");
+        Require(std::abs(snapshot.averages[1].Milliseconds() - snapshot.averages[0].Milliseconds() - 2.0) < 0.001,
+            "combined ON/OFF cost uses total measured time and frames");
+        Require(snapshot.averages[1].p99Ms >= 12.0 && snapshot.averages[1].p99Ms <= 12.1,
+            "percentiles cover all ON intervals at 0.1 ms resolution");
+    }
+}
+
+void TestComparisonCancellationAndValidation()
+{
+    for (const bool original : { false, true }) {
+        FO4CS::FpsTestSession session;
+        session.Start(true, original);
+        const auto restored = session.Cancel();
+        Require(restored && *restored == original && !session.Active() && !session.Cancel(),
+            "cancellation restores once, including an original OFF setting");
+    }
+    FO4CS::FpsTestSession session;
+    session.Start(true, true);
+    bool enabled = true;
+    double now{};
+    std::uint32_t presents{};
+    for (unsigned frame = 0; session.Active() && frame < 10000; ++frame) {
+        const bool last = session.GetSnapshot().step == 3;
+        now += last ? 0.020 : 0.010;
+        const auto update = session.Observe({ now, 1, 42, enabled, true, true, false,
+            true, ++presents, true, now });
+        if (update.setEnabled) enabled = *update.setEnabled;
+    }
+    Require(!session.GetSnapshot().driftOK && !session.GetSnapshot().averages[1].Verified(true),
+        "baseline drift and missing ON lighting cannot pass comparison validation");
+
+    session.Start(false, false);
+    now = 0; presents = 0;
+    for (unsigned frame = 0; frame < 1800; ++frame) {
+        now += .01;
+        const bool eligible = frame < 850 || frame >= 900;
+        session.Observe({ now, 1, 42, false, eligible, false, false,
+            false, ++presents, true, now });
+    }
+    Require(session.GetSnapshot().averages[0].frames == 0,
+        "a focus/menu interruption discards the whole partial measurement and settles again");
+    for (unsigned frame = 0; frame < 600; ++frame) {
+        now += .01;
+        session.Observe({ now, 1, 42, false, true, false, false,
+            false, ++presents, true, now });
+    }
+    Require(session.GetSnapshot().averages[0].Verified(false), "manual sampling recovers after a complete new window");
+    session.ToggleManual(true);
+    Require(session.GetSnapshot().averages[0].frames > 0 && session.GetSnapshot().averages[1].frames == 0,
+        "manual toggle retains the opposite mode and clears only the new mode");
+    Require(!session.Cancel(), "stopping manual comparison does not undo the user's toggle");
+
+    FO4CS::FpsHistogram histogram;
+    for (unsigned i = 0; i < 98; ++i) histogram.Add(10);
+    histogram.Add(2000); histogram.Add(3000);
+    Require(histogram.Percentile(.95) <= 10.1 && histogram.Percentile(.99) >= 2000,
+        "long stalls are retained instead of silently clamped out of percentile reporting");
+}
+
 int main()
 {
     try {
@@ -139,6 +226,8 @@ int main()
         TestStallsAreRetained();
         TestInvalidation();
         TestIndependentCounters();
+        TestAutomaticComparison();
+        TestComparisonCancellationAndValidation();
         std::cout << "Manual FPS tests passed: cadence, state boundaries, warmup, stalls, focus/menu failure, stream changes.\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

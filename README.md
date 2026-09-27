@@ -48,14 +48,28 @@ user INI exists.
 
 Enable **Development menu** in MCM, close MCM, and use the desktop hotkeys:
 
-- **F11** opens or closes the development menu.
-- **F10** toggles cloud shadows on or off for manual comparisons.
-- **F8** cycles the sky preview: off, magenta cloud overlay, raw opacity.
-- **F7** clears the preview and comparison display.
+- **F11** opens or closes the development menu, including the FPS test controls.
+- **F10** toggles cloud shadows and starts a manual FPS comparison.
 
 The Development menu checkbox is off by default and adds no extra MCM controls.
-Turning it off closes the development menu and restores normal rendering if
-a diagnostic view or sky preview was active.
+Turning it off closes the development menu and stops any active FPS test.
+
+Choose **Start FPS test** in F11, then keep the same outdoor view. The menu
+closes and the test runs OFF/ON/ON/OFF in about 57 seconds: a five-second
+countdown, then three seconds of settling and ten seconds of measurement per
+step. It restores the original shadow setting when complete or cancelled;
+test phases are never saved to your settings. **Start manual comparison** lets
+you switch modes with F10 instead. Reopening F11 pauses sampling and provides
+the stop and hide-display buttons. F7 and F8 are unused.
+
+The display and `FO4CloudShadows.log` report application FPS, average frame time,
+95th/99th percentile frame times and the ON-minus-OFF difference. These include
+Present waits, VSync and frame caps; they do not isolate CPU or GPU execution
+time. OFF keeps the plugin installed; the comparison measures toggling the
+shadow effect. The automatic comparison checks the repeated OFF baseline and confirms
+that cloud lighting was submitted throughout ON samples. Focus loss, absent
+world rendering and the F11 menu discard partial windows. Moving the camera or
+changing settings cancels an automatic test. Keep other game menus closed.
 
 Close the game before updating or removing this DLL. Replace the installed mod
 when updating, preserving your user INI. Remove the mod through the mod manager

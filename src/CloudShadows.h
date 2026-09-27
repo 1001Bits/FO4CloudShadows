@@ -450,7 +450,7 @@ namespace CloudShadows
     // Shared by the F10 A/B hotkey and the ImGui menu. Kept separate from
     // Opacity so disabling the feature does not discard the configured value.
     extern std::atomic<bool> g_shadowsEnabled;
-    // Master switch for the F7/F8/F10/F11 hotkeys and the F11 menu (default off).
+    // Master switch for F10/F11 and the FPS test menu (default off).
     extern std::atomic<bool> g_hotkeysEnabled;
 
     // Non-persistent diagnostic: an angular aperture around a real visible

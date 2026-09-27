@@ -21,7 +21,7 @@ namespace FO4CS::McmSettingsFile
         bool enabled = true;
         float opacity = 2.0f;
         float cloudHeight = 10000.0f;
-        // F7/F8/F10/F11 are ignored while false (default for normal players).
+        // F10/F11 and FPS testing are off by default for normal players.
         bool hotkeys = false;
         bool operator==(const Values&) const = default;
     };

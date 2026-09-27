@@ -12,7 +12,6 @@ namespace FO4CS::CloudComparison
     enum class Preview : unsigned { Off, SkyOverlay, RawMask };
     Preview GetPreview() noexcept;
     void SetPreview(Preview preview) noexcept;
-    void PollControls() noexcept;
     void ArmMeasurements() noexcept;
     void StopMeasurements() noexcept;
     // Private profiler can measure timestamps without keyboard input or a HUD.

@@ -4,9 +4,10 @@
 #include <dxgi.h>
 
 // F11-toggled Open Shaders FO4 menu for the standalone Cloud Shadows
-// plugin. Closing with F11 or X saves settings automatically. Release controls
-// match the optional MCM page. Developer builds alone
-// expose capture previews and diagnostics. Draw() is called from the Present hook, just
+// plugin. Closing with F11 or X saves settings automatically. The opt-in
+// release menu includes manual/automatic FPS comparison; benchmark phases are
+// never saved. Developer builds alone expose advanced diagnostics.
+// Draw() is called from the Present hook, just
 // before the swap-chain flip, so ImGui composites on the finished frame.
 namespace Overlay
 {

@@ -4,7 +4,7 @@
 #include "McmSettings.h"
 #include "EngineAPI.h"
 #include "CloudComparison.h"
-#include "CloudCubePreview.h"
+#include "ManualFpsLog.h"
 #include "CloudShadows.h"
 #include "GodraysIntegration.h"
 #include "GraphicsProxyCompat.h"
@@ -72,7 +72,6 @@ namespace Overlay
 		HWND g_wndProcHwnd = nullptr;
 		ID3D11Device* g_dev = nullptr;
 		ID3D11DeviceContext* g_ctx = nullptr;
-		FO4CS::CloudCubePreview g_cubePreview;
 		ImFont* g_titleFont = nullptr;
 		ImFont* g_subtextFont = nullptr;
 
@@ -830,55 +829,88 @@ void main(uint3 id : SV_DispatchThreadID)
 			return true;
 		}
 
-		void DrawCubemapPreview()
+		void DrawFpsReadout()
 		{
-			if (!ImGui::CollapsingHeader("Cubemap preview")) return;
-			ImGui::TextWrapped("Live cloud opacity: black = clear sky, white = cloud. "
-				"These are the six captured faces before shadow strength is applied.");
-			int mode = static_cast<int>(FO4CS::CloudComparison::GetPreview());
-			const char* modes[]{ "Off", "Magenta over visible sky", "Raw opacity across screen" };
-			if (ImGui::Combo("Sky alignment (F8)", &mode, modes, IM_ARRAYSIZE(modes)))
-				FO4CS::CloudComparison::SetPreview(static_cast<FO4CS::CloudComparison::Preview>(mode));
-			ImGui::TextWrapped("F8 cycles the sky views; F7 clears the preview.");
-			if (!CloudShadows::g_shadowsEnabled.load(std::memory_order_relaxed)) {
-				ImGui::TextWrapped("Enable Cloud Shadows to view the capture.");
-				return;
-			}
-			auto* cube = CloudShadows::GetCommittedWorldCloudTiles();
-			if (!cube) {
-				ImGui::TextWrapped("Waiting for a cloud capture. Load an exterior with Cloud Shadows enabled.");
-				return;
-			}
-			auto* atlas = g_cubePreview.Update(g_ctx, cube);
-			if (!atlas) {
-				ImGui::TextWrapped("Cubemap preview unavailable for this capture.");
-				return;
-			}
-			ImGui::TextDisabled("%u x %u per face | latest completed capture",
-				g_cubePreview.FaceSize(), g_cubePreview.FaceSize());
-			if (ImGui::BeginTable("Cloud cube faces", 3, ImGuiTableFlags_SizingStretchSame)) {
-				const char* labels[]{ "+X", "-X", "+Y", "-Y", "+Z (up)", "-Z (down)" };
-				const float faceSize = static_cast<float>(g_cubePreview.FaceSize());
-				const float inset = 0.5f / faceSize;
-				for (unsigned face = 0; face < 6; ++face) {
-					ImGui::TableNextColumn();
-					ImGui::TextUnformatted(labels[face]);
-					const float size = std::clamp(ImGui::GetContentRegionAvail().x, 1.0f, faceSize);
-					const float x = static_cast<float>(face % 3), y = static_cast<float>(face / 3);
-					ImGui::Image(reinterpret_cast<ImTextureID>(atlas), ImVec2(size, size),
-						ImVec2((x + inset) / 3, (y + inset) / 2),
-						ImVec2((x + 1 - inset) / 3, (y + 1 - inset) / 2));
+			using Session = FO4CS::FpsTestSession;
+			const auto stats = FO4CS::ManualFpsLog::Snapshot();
+			ImGui::TextUnformatted("CLOUD SHADOWS - FPS TEST");
+			if (stats.liveFPS > 0)
+				ImGui::Text("FPS: %.1f  |  %.2f ms/frame", stats.liveFPS, stats.liveMs);
+			ImGui::Text("Cloud shadows: %s", CloudShadows::g_shadowsEnabled.load() ? "ON" : "OFF");
+			if (stats.mode == Session::Mode::Automatic || stats.mode == Session::Mode::Manual) {
+				if (stats.paused)
+					ImGui::TextUnformatted("Paused: close menus and return to the foreground exterior.");
+				else if (stats.countdown)
+					ImGui::Text("Starting in %.1f seconds - keep the camera still", stats.remaining);
+				else {
+					if (stats.mode == Session::Mode::Automatic)
+						ImGui::Text("Step %u/4: %s", static_cast<unsigned>(stats.step + 1), stats.enabled ? "ON" : "OFF");
+					ImGui::Text("%s: %.1f seconds remaining", stats.measuring ? "Measuring" : "Settling", stats.remaining);
 				}
-				ImGui::EndTable();
 			}
+			for (unsigned i = 0; i < 2; ++i) {
+				const auto& average = stats.averages[i];
+				if (average.frames) {
+					ImGui::Text("%s average: %.1f FPS | %.2f ms/frame | %.1f s",
+						i ? "ON" : "OFF", average.FPS(), average.Milliseconds(), average.seconds);
+					ImGui::Text("    95%%: %.1f ms | 99%%: %.1f ms | longest: %.1f ms",
+						average.p95Ms, average.p99Ms, average.maxMs);
+					if (!average.countersOK || !average.clocksOK)
+						ImGui::TextUnformatted("    Timing/counter validation failed; sample is unverified.");
+					if (i && (average.maskFrames != average.frames || average.lightingFrames != average.frames))
+						ImGui::TextUnformatted("    Shadows were not confirmed on every ON frame.");
+				} else ImGui::Text("%s average: waiting for a complete sample", i ? "ON" : "OFF");
+			}
+			const auto& off = stats.averages[0]; const auto& on = stats.averages[1];
+			if (off.frames && on.frames) {
+				ImGui::Text("ON minus OFF: %+.2f ms/frame | %+.1f FPS",
+					on.Milliseconds() - off.Milliseconds(), on.FPS() - off.FPS());
+				if (!off.Verified(false) || !on.Verified(true) ||
+					(stats.mode == Session::Mode::Finished && !stats.driftOK))
+					ImGui::TextColored(ImVec4(1, 0.7f, 0.3f, 1), "Comparison inconclusive");
+				if (stats.mode == Session::Mode::Finished)
+					ImGui::Text("Repeated OFF baseline: %s", stats.driftOK ? "stable" : "changed - comparison inconclusive");
+			}
+			ImGui::TextWrapped("%s", FO4CS::ManualFpsLog::Message());
+			ImGui::TextWrapped("Application FPS, including VSync and frame caps. Caps can hide the difference.");
+			ImGui::TextDisabled("F11: menu | F10: manual ON/OFF comparison");
+		}
+
+		void DrawFpsControls()
+		{
+			ImGui::Separator();
+			ImGui::TextWrapped("FPS test: stand still outdoors and keep the same view. "
+				"The automatic test compares OFF/ON/ON/OFF in about 57 seconds, "
+				"then restores your original setting. Results are also written to FO4CloudShadows.log.");
+			const bool vr = FO4CS::RuntimeAPI::GetSingleton().Target() == FO4CS::F4SECompat::RuntimeTarget::kVR;
+			ImGui::BeginDisabled(vr);
+			if (ImGui::Button("Start FPS test")) {
+				FO4CS::ManualFpsLog::Start(true);
+				SetVisible(false);
+			}
+			ImGui::SameLine();
+			if (ImGui::Button("Start manual comparison")) {
+				FO4CS::ManualFpsLog::Start(false);
+				SetVisible(false);
+			}
+			ImGui::EndDisabled();
+			if (vr) ImGui::TextWrapped("Desktop Present timing does not measure headset FPS.");
+			if (FO4CS::ManualFpsLog::IsActive() && ImGui::Button(FO4CS::ManualFpsLog::IsAutomatic()
+                ? "Stop test and restore setting" : "Stop manual comparison"))
+				FO4CS::ManualFpsLog::Stop();
+			if (FO4CS::ManualFpsLog::Showing() && ImGui::Button("Hide FPS display"))
+				FO4CS::ManualFpsLog::HideResults();
+			DrawFpsReadout();
 		}
 
 		void DrawSettings()
 		{
 			using namespace CloudShadows;
 
+			ImGui::BeginDisabled(FO4CS::ManualFpsLog::IsAutomatic());
 			bool enabled = g_shadowsEnabled.load(std::memory_order_relaxed);
 			if (ImGui::Checkbox("Enable Cloud Shadows", &enabled)) {
+                FO4CS::ManualFpsLog::Stop();
 				g_shadowsEnabled.store(enabled, std::memory_order_relaxed);
 				InvalidateWorldCloudCaptureForToggle();
 			}
@@ -921,19 +953,8 @@ void main(uint3 id : SV_DispatchThreadID)
 				ImGuiSliderFlags_AlwaysClamp);
             ImGui::TextWrapped("Controls how strongly clouds dim direct sunlight. Default: 2.0.");
 
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-            ImGui::TextWrapped("F10 toggles shadows and starts timing. "
-                "Keep the camera fixed and close this menu for 13 seconds. F8 previews the cubemap; "
-                "preview frames are excluded from timing. F7 stops measurement and hides the HUD. "
-                "Test selections reset at the next launch.");
-            if (FO4CS::CloudComparison::HudVisible() && ImGui::Button("Stop comparison HUD (F7)"))
-                FO4CS::CloudComparison::StopMeasurements();
-
-#endif
-
-			// Cloud height is no longer user-adjustable (removed 10 Sep 2026); the
-			// saved fCloudHeight value is still honoured for compatibility.
-			DrawCubemapPreview();
+            ImGui::EndDisabled();
+            DrawFpsControls();
 
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
 			if (ImGui::CollapsingHeader("Advanced / debug")) {
@@ -1374,6 +1395,7 @@ void main(uint3 id : SV_DispatchThreadID)
 
 	void Shutdown() noexcept
 	{
+        FO4CS::ManualFpsLog::Stop();
 		std::scoped_lock imguiLock(g_imguiLifetimeMutex);
 		SetVisible(false);
 		FlushPendingSave();
@@ -1424,7 +1446,6 @@ void main(uint3 id : SV_DispatchThreadID)
 		g_grayPreviewCS.Reset();
 		g_screenMaskPreview = {};
 #endif
-		g_cubePreview.Reset();
 		g_titleFont = nullptr;
 		g_subtextFont = nullptr;
 		g_dev = nullptr;
@@ -1466,6 +1487,7 @@ void main(uint3 id : SV_DispatchThreadID)
 		if (!CloudShadows::g_hotkeysEnabled.load(std::memory_order_relaxed) &&
 			!g_visible.load(std::memory_order_acquire) &&
 			!FO4CS::CloudComparison::HudVisible() &&
+            !FO4CS::ManualFpsLog::Showing() &&
 			FO4CS::CloudComparison::GetPreview() == FO4CS::CloudComparison::Preview::Off)
 			return;
 
@@ -1550,48 +1572,20 @@ void main(uint3 id : SV_DispatchThreadID)
 		s_f11Was = f11Down;
 
 		const bool menuVisible = g_visible.load(std::memory_order_acquire);
-		if (!menuVisible && !FO4CS::CloudComparison::HudVisible())
+		if (!menuVisible && !FO4CS::CloudComparison::HudVisible() && !FO4CS::ManualFpsLog::Showing())
 			return;
 
 		ImGui_ImplDX11_NewFrame();
 		ImGui_ImplWin32_NewFrame();
 		ImGui::NewFrame();
-        const auto skyMode = FO4CS::CloudComparison::GetPreview();
-        if (skyMode != FO4CS::CloudComparison::Preview::Off) {
-            if (auto* skyImage = FO4CS::CloudComparison::PreviewImage())
-                ImGui::GetBackgroundDrawList()->AddImage(
-                    reinterpret_cast<ImTextureID>(skyImage), ImVec2(0, 0), ImGui::GetIO().DisplaySize);
-        }
-        if (FO4CS::CloudComparison::HudVisible()) {
+        if (!menuVisible && FO4CS::ManualFpsLog::Showing()) {
             ImGui::SetNextWindowPos(ImVec2(16, 16), ImGuiCond_Always);
-            ImGui::SetNextWindowBgAlpha(0.8f);
+            const float panelWidth = std::max(200.0f, std::min(650.0f, ImGui::GetIO().DisplaySize.x - 32.0f));
+            ImGui::SetNextWindowSizeConstraints(ImVec2(panelWidth, 0), ImVec2(panelWidth, FLT_MAX));
+            ImGui::SetNextWindowBgAlpha(0.88f);
             constexpr auto flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
                 ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_NoFocusOnAppearing;
-            if (ImGui::Begin("Cloud comparison status", nullptr, flags)) {
-                ImGui::Text("Cloud Shadows: %s",
-                    CloudShadows::g_shadowsEnabled.load(std::memory_order_relaxed) ? "ON" : "OFF");
-                if (skyMode != FO4CS::CloudComparison::Preview::Off) {
-                    ImGui::TextColored(ImVec4(1, 0.6f, 1, 1), "SKY ALIGNMENT PREVIEW - timing paused");
-                    if (!FO4CS::CloudComparison::PreviewImage())
-                        ImGui::TextUnformatted("Waiting for a current sky capture and camera. Enable shadows with F10.");
-                    else if (skyMode == FO4CS::CloudComparison::Preview::SkyOverlay)
-                        ImGui::TextUnformatted("Magenta shows captured clouds. Rotate to compare edges. F8: next view | F7: off.");
-                    else
-                        ImGui::TextUnformatted("Raw opacity: white = cloud, black = clear sky. F8 returns to the game.");
-                } else
-                {
-                    ImGui::TextUnformatted(FO4CS::CloudComparison::Status().c_str());
-#if FO4CS_ENABLE_DEVELOPER_TOOLS
-                    const auto gpu = FO4CS::CloudComparison::GetTimings();
-                    if (gpu.frames)
-                        ImGui::Text("GPU capture %.3f ms | projection %.3f ms | %.0f capture draws/frame",
-                            gpu.captureMs, gpu.projectionMs, gpu.draws);
-                    ImGui::TextDisabled("F10: on/off + timing | F8: sky alignment | F7: stop | F11: settings");
-#else
-                    ImGui::TextDisabled("F10: toggle | F8: sky preview | F7: hide | F11: settings");
-#endif
-                }
-            }
+            if (ImGui::Begin("Cloud Shadows FPS", nullptr, flags)) DrawFpsReadout();
             ImGui::End();
         }
 		if (menuVisible) BuildWindow();

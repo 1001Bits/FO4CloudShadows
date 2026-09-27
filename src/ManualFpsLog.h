@@ -2,13 +2,24 @@
 #include <dxgi.h>
 
 #include <cstdint>
+#include "FpsTestSession.h"
 
 namespace FO4CS::ManualFpsLog
 {
-    // Arms read-only logging on the existing F10 edge. Never changes settings
-    // or toggles the renderer itself. Results go to FO4CloudShadows.log.
+    // Opt-in desktop FPS meter available in the release Development menu.
     void OnToggle(bool enabled) noexcept;
     void Stop() noexcept;
+    void Start(bool automatic) noexcept;
+    void HideResults() noexcept;
+    bool IsActive() noexcept;
+    bool IsAutomatic() noexcept;
+    bool Showing() noexcept;
+    bool EnabledForSave(bool live) noexcept;
+    FpsTestSession::Snapshot Snapshot() noexcept;
+    const char* Message() noexcept;
+    // A read-only world-pass observer also runs in OFF mode during a test.
+    bool NeedsWorldObservation() noexcept;
+    void ObserveWorldPass() noexcept;
 
     // Called only after a real authoritative Present (never TEST/auxiliary).
     // frameEnabled is captured BEFORE the Present-boundary F10/settings poll,
