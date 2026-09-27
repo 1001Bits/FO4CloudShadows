@@ -121,10 +121,13 @@ namespace FO4CS::MenuFrameworkPage
                 edited = McmSettingsFile::Validate(edited);
             Tooltip("Controls how strongly clouds dim direct sunlight. Default: 2.0.");
             ui.separator();
-            ui.text("Development Menu", nullptr);
-            ui.checkbox("Development Menu##hotkeys", &edited.hotkeys);
-            Tooltip("Off by default. When on: F11 opens the Cloud Shadows development menu, F10 toggles "
-                "cloud shadows for comparison, F8 cycles the sky-alignment preview and F7 hides it.");
+            ui.checkbox("Development menu##hotkeys", &edited.hotkeys);
+            Tooltip("When enabled, close this menu and use:\n"
+                "F11 - Open/close the development menu.\n"
+                "F10 - Toggle cloud shadows on/off.\n"
+                "F8 - Cycle sky preview: off, magenta clouds, raw opacity.\n"
+                "F7 - Clear the preview and comparison display.\n"
+                "Desktop only. Off by default.");
             ui.separator();
             ui.wrapped("%s", "Changes are saved when you close this menu or press Apply, and take effect "
                 "within two seconds. MCM shows them after restarting Fallout.");

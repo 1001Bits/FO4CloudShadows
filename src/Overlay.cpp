@@ -7,6 +7,7 @@
 #include "CloudCubePreview.h"
 #include "CloudShadows.h"
 #include "GodraysIntegration.h"
+#include "GraphicsProxyCompat.h"
 #include "RuntimeAPI.h"
 #include "Utf8Path.h"
 
@@ -1488,10 +1489,11 @@ void main(uint3 id : SV_DispatchThreadID)
 		}
 		ComPtr<ID3D11Device> outputDevice;
 		if (FAILED(outputChain->GetDevice(IID_PPV_ARGS(&outputDevice))) ||
-			outputDevice.Get() != CloudShadows::g_capturedDevice) {
+			!FO4CS::GraphicsProxyCompat::SameComIdentity(
+				outputDevice.Get(), CloudShadows::g_capturedDevice)) {
 			static bool mismatchLogged = false;
 			if (!mismatchLogged) {
-				SPDLOG_WARN("[CloudShadows][Menu] output/device interface mismatch; deferring menu draw");
+				SPDLOG_WARN("[CloudShadows][Menu] output and renderer have different device identities; deferring menu draw");
 				mismatchLogged = true;
 			}
 			return;

@@ -46,6 +46,17 @@ the package supplies defaults under `Data/MCM/Config/FO4CloudShadows` and does
 not ship a user-settings file. Legacy JSON preferences are migrated when no
 user INI exists.
 
+Enable **Development menu** in MCM, close MCM, and use the desktop hotkeys:
+
+- **F11** opens or closes the development menu.
+- **F10** toggles cloud shadows on or off for manual comparisons.
+- **F8** cycles the sky preview: off, magenta cloud overlay, raw opacity.
+- **F7** clears the preview and comparison display.
+
+The Development menu checkbox is off by default and adds no extra MCM controls.
+Turning it off closes the development menu and restores normal rendering if
+a diagnostic view or sky preview was active.
+
 Close the game before updating or removing this DLL. Replace the installed mod
 when updating, preserving your user INI. Remove the mod through the mod manager
 to uninstall it.

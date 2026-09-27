@@ -66,42 +66,35 @@ int main(int argc, char** argv)
             Require(migrated && migrated->opacity == 3.0f && !migrated->hotkeys,
                 "a changed legacy preference migrates; the development switch never does");
             Files::Values development;
-            development.debugView = 1;
-            development.isolateCloud = true;
-            development.isolationRadius = 20.0f;
+            development.hotkeys = true;
             Require(!Files::LegacyMigration(development).has_value(),
-                "development options are never migrated from the legacy JSON");
+                "the development switch alone does not trigger legacy migration");
         }
         {
-            // Development Menu options round-trip, are bounded, and a
-            // malformed debug view is rejected instead of half-applied.
+            // Older releases exposed diagnostic controls in MCM. Their saved
+            // values must neither enable an invisible view nor reject the
+            // remaining player preferences, even when those old values are bad.
             const auto developmentFile = root / L"development.ini";
             Files::Values development;
             development.hotkeys = true;
-            development.debugView = 3;
-            development.isolateCloud = true;
-            development.isolationRadius = 18.5f;
             Files::Write(developmentFile, development);
-            Require(Files::Read(defaults, developmentFile) == Files::Values{
-                    true, 2.0f, 10000.0f, true, 3, true, 18.5f },
-                "development options round trip");
-            Files::Values bounded = development;
-            bounded.debugView = 9;
-            bounded.isolationRadius = 90.0f;
-            Require(Files::Validate(bounded).debugView == 4 &&
-                    Files::Validate(bounded).isolationRadius == 30.0f,
-                "development options are bounded");
-            Require(WritePrivateProfileStringW(L"CloudShadows", L"iDebugView", L"7",
-                developmentFile.c_str()), "write invalid debug view");
-            bool rejectedView = false;
-            try { (void)Files::Read(defaults, developmentFile); } catch (...) { rejectedView = true; }
-            Require(rejectedView, "debug view must be 0 to 4");
-            auto viewChanged = development;
-            viewChanged.debugView = 1;
-            const auto viewOnly = Files::Difference(development, viewChanged, false);
-            Require(viewOnly.debugView && !viewOnly.hotkeys && !viewOnly.opacity &&
-                    !viewOnly.isolateCloud && !viewOnly.isolationRadius,
-                "a debug view change applies alone");
+            for (const auto* value : { L"1", L"3", L"7", L"invalid" }) {
+                for (const auto* key : { L"iDebugView", L"bIsolateCloud", L"fIsolationRadius" })
+                    Require(WritePrivateProfileStringW(L"CloudShadows", key, value,
+                        developmentFile.c_str()), "write obsolete diagnostic preference");
+                Require(Files::Read(defaults, developmentFile) == development,
+                    "obsolete diagnostics do not affect player settings");
+                Files::Write(developmentFile, development);
+                for (const auto* key : { L"iDebugView", L"bIsolateCloud", L"fIsolationRadius" })
+                    Require(GetPrivateProfileIntW(L"CloudShadows", key, -1,
+                        developmentFile.c_str()) == -1,
+                        "saving removes obsolete diagnostic preferences");
+            }
+            auto switchOff = development;
+            switchOff.hotkeys = false;
+            const auto switchOnly = Files::Difference(development, switchOff, false);
+            Require(switchOnly.hotkeys && !switchOnly.enabled && !switchOnly.opacity && !switchOnly.cloudHeight,
+                "development switch changes independently of player settings");
             fs::remove(developmentFile);
         }
 
@@ -152,28 +145,11 @@ int main(int argc, char** argv)
         for (const auto& row : menu.at("content")) if (row.contains("id")) {
             Require(controls.insert(row.at("id").get<std::string>()).second, "unique MCM setting ids");
         }
-        const std::set<std::string> developmentControls{ "bHotkeys:CloudShadows",
-            "iDebugView:CloudShadows", "bIsolateCloud:CloudShadows",
-            "fIsolationRadius:CloudShadows" };
-        std::set<std::string> expectedControls{ "bEnabled:CloudShadows", "fOpacity:CloudShadows" };
-        expectedControls.insert(developmentControls.begin(), developmentControls.end());
+        const std::set<std::string> expectedControls{
+            "bEnabled:CloudShadows", "fOpacity:CloudShadows", "bHotkeys:CloudShadows" };
         Require(controls == expectedControls,
-            "MCM exposes the player controls and the Development Menu options "
-            "(cloud height is not user-adjustable)");
+            "MCM exposes only the player controls and the Development menu switch");
         Require(canonical.hotkeys == false, "hotkeys are off by default");
-        // Development options stay hidden until their controlling switch is on.
-        for (const auto& row : menu.at("content")) {
-            if (row.contains("id")) {
-                const auto id = row.at("id").get<std::string>();
-                const bool development = developmentControls.contains(id);
-                if (id == "bHotkeys:CloudShadows")
-                    Require(row.value("groupControl", 0) == 1,
-                        "the Development Menu switch controls its options' visibility");
-                else if (development)
-                    Require(row.value("groupCondition", 0) == 1,
-                        "development options are hidden until the Development Menu is on");
-            }
-        }
         FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(true);
         Require(!FO4CS::GodraysIntegration::IsCloudOcclusionEnabled(), "release refuses godray enable even from an old preference");
         Require(!FO4CS::GodraysIntegration::TryInstall(FO4CS::F4SECompat::RuntimeTarget::kLegacy), "release does not install a godray hook");

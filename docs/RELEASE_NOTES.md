@@ -1,4 +1,24 @@
-# Build f202d70ed7dbb9b1 — 27 September 2026
+# Build d8912e3322fc8cc3 — 27 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`CDF7C4C334F81E15863E5D08D2627FF5A25A83770D83C60D7F194F483914D3CE`.
+
+- Remove Debug view, Isolate one cloud and Isolation radius from MCM. The
+  Development menu checkbox enables desktop hotkeys without adding controls.
+  Its description explains F11, F10, F8 and F7 individually.
+- Ignore saved values from the removed controls and remove those keys on the
+  next settings save. Existing cloud enable and opacity preferences are kept.
+- Fix the F11 menu being rejected with ENB 0.501. ENB's device wrapper and its
+  output device have different interface addresses but share COM identity.
+  Compare that identity while continuing to reject different devices and
+  separately wrapped resources.
+
+All 12 core checks pass, including regressions for obsolete MCM settings,
+ENB-style device aliases, distinct wrapper identities and reference lifetimes.
+The shaders, runtime version list and release profiling flags are unchanged.
+In-game confirmation of this menu fix remains pending at packaging time.
+
+# Previous build f202d70ed7dbb9b1 — 27 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `B9A01BD3315CB905F246DEF2BA37159C74A3F2E99E1DC556132B6C7E1ED2C1E0`.

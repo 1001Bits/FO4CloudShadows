@@ -55,8 +55,8 @@ require_match("config/MCM/FO4CloudShadows/settings.ini" "bHotkeys=0"
     "the Development Menu must default to off in MCM")
 require_match("config/CloudShadows.json" "\"Hotkeys\": false"
     "the legacy settings default must keep hotkeys off")
-require_match("config/MCM/FO4CloudShadows/config.json" "\"Development Menu\""
-    "MCM must expose the Development Menu section")
+require_match("config/MCM/FO4CloudShadows/config.json" "\"Development menu\""
+    "MCM must expose the Development menu checkbox")
 
 # The settings JSON is shipped with default values only.
 require_match("config/CloudShadows.json" "\"ProjectionModelVersion\": 4"

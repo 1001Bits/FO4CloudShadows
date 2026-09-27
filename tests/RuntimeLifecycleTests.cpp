@@ -183,7 +183,8 @@ class ForwardingDevice final : public IUnknown
 {
 public:
     enum class Unwrap { Native, Unsupported, Self };
-    explicit ForwardingDevice(IUnknown* native) : native_(native) {}
+    explicit ForwardingDevice(IUnknown* native, bool forwardIdentity = false) :
+        native_(native), forwardIdentity_(forwardIdentity) {}
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** destination) override
     {
         if (!destination) return E_POINTER;
@@ -196,6 +197,8 @@ public:
             return S_OK;
         }
         if (id != __uuidof(IUnknown)) return E_NOINTERFACE;
+        if (forwardIdentity_)
+            return native_->QueryInterface(id, destination);
         *destination = this;
         AddRef();
         return S_OK;
@@ -207,7 +210,35 @@ public:
     Unwrap unwrap{ Unwrap::Native };
 private:
     Microsoft::WRL::ComPtr<IUnknown> native_;
+    bool forwardIdentity_{};
 };
+
+void TestGraphicsDeviceIdentity()
+{
+    using FO4CS::GraphicsProxyCompat::SameComIdentity;
+    std::atomic<unsigned> destroyed{};
+    {
+        Microsoft::WRL::ComPtr<IUnknown> native, other;
+        native.Attach(new TrackedObject(destroyed));
+        other.Attach(new TrackedObject(destroyed));
+        ForwardingDevice enb(native.Get(), true);
+        ForwardingDevice separateWrapper(native.Get());
+        Require(SameComIdentity(native.Get(), native.Get()),
+            "unwrapped output accepts the renderer device");
+        Require(SameComIdentity(&enb, native.Get()) && SameComIdentity(native.Get(), &enb),
+            "ENB output accepts distinct interfaces with the same canonical identity");
+        Require(!SameComIdentity(&separateWrapper, native.Get()) &&
+                !SameComIdentity(native.Get(), &separateWrapper),
+            "a separately wrapped device cannot receive a native output resource");
+        Require(!SameComIdentity(&enb, other.Get()) && !SameComIdentity(native.Get(), other.Get()),
+            "different devices remain incompatible");
+        Require(!SameComIdentity(nullptr, nullptr) && !SameComIdentity(native.Get(), nullptr) &&
+                !SameComIdentity(nullptr, native.Get()), "missing devices are incompatible");
+        Require(enb.references == 1 && separateWrapper.references == 1,
+            "identity queries release all temporary wrapper references");
+    }
+    Require(destroyed == 2, "identity queries release all temporary native references");
+}
 
 void TestGraphicsProxyCapture()
 {
@@ -313,6 +344,7 @@ int main()
         TestPublication();
         TestRetirement();
         TestGraphicsProxyCapture();
+        TestGraphicsDeviceIdentity();
         TestUpscaledSkyViewport();
         std::cout << "PASS: cloud-frame publication, renderer retirement, graphics proxies and scaled Sky\n";
         return 0;

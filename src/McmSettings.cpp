@@ -196,28 +196,20 @@ namespace FO4CS::McmSettings
             if (changes.enabled && CloudShadows::g_shadowsEnabled.exchange(next.enabled,
                     std::memory_order_acq_rel) != next.enabled)
                 CloudShadows::InvalidateWorldCloudCaptureForToggle();
-            // Development options work in every build, but only while the
-            // Development Menu is on; turning it off always restores the
-            // physical sunlight mask.
-            CloudShadows::g_settings.DebugMode =
-                next.hotkeys ? static_cast<float>(next.debugView) : 0.0f;
-            CloudShadows::g_singleCloudRadiusDegrees.store(
-                next.isolationRadius, std::memory_order_relaxed);
-            if (!next.hotkeys || !next.isolateCloud) {
+            // Diagnostic views belong to the F-key menu, never saved MCM
+            // options. Start neutral and clear them when the menu is disabled;
+            // ordinary MCM edits must preserve an active session-only view.
+            if (!next.hotkeys || !saved || force) {
+                CloudShadows::g_settings.DebugMode = 0.0f;
                 CloudShadows::CancelSingleCloudLock();
                 CloudShadows::g_singleCloudIsolationEnabled.store(false, std::memory_order_release);
-            } else if (changes.isolateCloud || changes.hotkeys) {
-                // Leave time to close MCM and face a cloud before locking.
-                CloudShadows::RequestSingleCloudLock(5000);
             }
             GodraysIntegration::SetCloudOcclusionEnabled(false);
             saved = next;
             lastRead = before;
             if (changes.Any())
-                SPDLOG_INFO("[CloudShadows][MCM] Applied saved preferences: enabled={} opacity={:.2f} cloudHeight={:.0f} hotkeys={} "
-                    "debugView={} isolateCloud={} isolationRadius={:.1f}",
-                    next.enabled, next.opacity, next.cloudHeight, next.hotkeys,
-                    next.debugView, next.isolateCloud, next.isolationRadius);
+                SPDLOG_INFO("[CloudShadows][MCM] Applied saved preferences: enabled={} opacity={:.2f} cloudHeight={:.0f} hotkeys={}",
+                    next.enabled, next.opacity, next.cloudHeight, next.hotkeys);
             return true;
         } catch (const std::exception& error) {
             static auto nextWarning = std::chrono::steady_clock::time_point{};
@@ -233,15 +225,11 @@ namespace FO4CS::McmSettings
     bool Save() noexcept
     {
         try {
-            // F11 saves the player settings; the MCM development options keep
-            // their saved values (an F11 debug view stays session-only).
-            const McmSettingsFile::Values development = saved.value_or(McmSettingsFile::Values{});
+            // F11 saves player settings; diagnostic views stay session-only.
             const auto values = McmSettingsFile::Validate({
                 CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire),
                 CloudShadows::g_settings.Opacity, CloudShadows::g_settings.CloudHeight,
-                CloudShadows::g_hotkeysEnabled.load(std::memory_order_acquire),
-                development.debugView, development.isolateCloud,
-                development.isolationRadius });
+                CloudShadows::g_hotkeysEnabled.load(std::memory_order_acquire) });
             // Only fields changed in game since the last applied file win; the
             // writer merges them into whatever the file holds at write time.
             (void)Queue({ values, saved });

@@ -7,6 +7,7 @@
 #include <charconv>
 #include <cmath>
 #include <filesystem>
+#include <initializer_list>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -22,23 +23,15 @@ namespace FO4CS::McmSettingsFile
         float cloudHeight = 10000.0f;
         // F7/F8/F10/F11 are ignored while false (default for normal players).
         bool hotkeys = false;
-        // Development Menu options; they apply only while `hotkeys` is on.
-        // 0 off, 1 world checkerboard, 2 raw depth, 3 transmittance,
-        // 4 capture analysis.
-        int debugView = 0;
-        bool isolateCloud = false;
-        float isolationRadius = 12.0f;
         bool operator==(const Values&) const = default;
     };
 
     struct Changes
     {
         bool enabled{}, opacity{}, cloudHeight{}, hotkeys{};
-        bool debugView{}, isolateCloud{}, isolationRadius{};
         bool Any() const noexcept
         {
-            return enabled || opacity || cloudHeight || hotkeys ||
-                debugView || isolateCloud || isolationRadius;
+            return enabled || opacity || cloudHeight || hotkeys;
         }
     };
 
@@ -50,10 +43,7 @@ namespace FO4CS::McmSettingsFile
         return { force || !previous || previous->enabled != next.enabled,
             force || !previous || previous->opacity != next.opacity,
             force || !previous || previous->cloudHeight != next.cloudHeight,
-            force || !previous || previous->hotkeys != next.hotkeys,
-            force || !previous || previous->debugView != next.debugView,
-            force || !previous || previous->isolateCloud != next.isolateCloud,
-            force || !previous || previous->isolationRadius != next.isolationRadius };
+            force || !previous || previous->hotkeys != next.hotkeys };
     }
 
     // F11 saves what the player changed in game since the file was last
@@ -69,10 +59,6 @@ namespace FO4CS::McmSettingsFile
         if (live.opacity != baseline->opacity) merged.opacity = live.opacity;
         if (live.cloudHeight != baseline->cloudHeight) merged.cloudHeight = live.cloudHeight;
         if (live.hotkeys != baseline->hotkeys) merged.hotkeys = live.hotkeys;
-        if (live.debugView != baseline->debugView) merged.debugView = live.debugView;
-        if (live.isolateCloud != baseline->isolateCloud) merged.isolateCloud = live.isolateCloud;
-        if (live.isolationRadius != baseline->isolationRadius)
-            merged.isolationRadius = live.isolationRadius;
         return merged;
     }
 
@@ -83,9 +69,6 @@ namespace FO4CS::McmSettingsFile
     {
         Values migrated = legacy;
         migrated.hotkeys = Values{}.hotkeys;
-        migrated.debugView = Values{}.debugView;
-        migrated.isolateCloud = Values{}.isolateCloud;
-        migrated.isolationRadius = Values{}.isolationRadius;
         if (migrated == Values{})
             return std::nullopt;
         return migrated;
@@ -97,9 +80,6 @@ namespace FO4CS::McmSettingsFile
             ? std::clamp(values.opacity, 0.0f, 4.0f) : Values{}.opacity;
         values.cloudHeight = std::isfinite(values.cloudHeight)
             ? std::clamp(values.cloudHeight, 10000.0f, 200000.0f) : Values{}.cloudHeight;
-        values.debugView = std::clamp(values.debugView, 0, 4);
-        values.isolationRadius = std::isfinite(values.isolationRadius)
-            ? std::clamp(values.isolationRadius, 2.0f, 30.0f) : Values{}.isolationRadius;
         return values;
     }
 
@@ -147,16 +127,8 @@ namespace FO4CS::McmSettingsFile
             if (*hotkeys != 0.0f && *hotkeys != 1.0f) throw std::runtime_error("MCM hotkeys must be 0 or 1");
             values.hotkeys = *hotkeys == 1.0f;
         }
-        if (const auto view = read(L"iDebugView")) {
-            if (*view != std::floor(*view) || *view < 0.0f || *view > 4.0f)
-                throw std::runtime_error("MCM debug view must be 0 to 4");
-            values.debugView = static_cast<int>(*view);
-        }
-        if (const auto isolate = read(L"bIsolateCloud")) {
-            if (*isolate != 0.0f && *isolate != 1.0f) throw std::runtime_error("MCM cloud isolation must be 0 or 1");
-            values.isolateCloud = *isolate == 1.0f;
-        }
-        if (const auto radius = read(L"fIsolationRadius")) values.isolationRadius = *radius;
+        // Removed MCM diagnostic keys are intentionally ignored. An old saved
+        // debug view must not activate an option the player can no longer see.
     }
 
     inline Values Read(const std::filesystem::path& defaults, const std::filesystem::path& user)
@@ -193,11 +165,10 @@ namespace FO4CS::McmSettingsFile
             write(L"fOpacity", decimal(values.opacity).c_str());
             write(L"fCloudHeight", decimal(values.cloudHeight).c_str());
             write(L"bHotkeys", values.hotkeys ? L"1" : L"0");
-            write(L"iDebugView", std::to_wstring(values.debugView).c_str());
-            write(L"bIsolateCloud", values.isolateCloud ? L"1" : L"0");
-            write(L"fIsolationRadius", decimal(values.isolationRadius).c_str());
-            // The capture method is no longer selectable; drop its old key.
-            WritePrivateProfileStringW(L"CloudShadows", L"iCaptureMethod", nullptr, temporary.c_str());
+            // Remove obsolete controls when saving, preserving unrelated keys.
+            for (const auto* key : { L"iCaptureMethod", L"iDebugView",
+                    L"bIsolateCloud", L"fIsolationRadius" })
+                write(key, nullptr);
             WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary.c_str());
             if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH |
                     (overwrite ? MOVEFILE_REPLACE_EXISTING : 0)))

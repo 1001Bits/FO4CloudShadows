@@ -8,6 +8,22 @@
 
 namespace FO4CS::GraphicsProxyCompat
 {
+    // ENB forwards QueryInterface to its native device but returns a distinct
+    // device pointer from D3D11CreateDevice. Compare the canonical IUnknown,
+    // not the ID3D11Device interface address, before sharing output resources.
+    // Wrappers with their own identity (e.g. RenderDoc) remain distinct.
+    [[nodiscard]] inline bool SameComIdentity(IUnknown* first, IUnknown* second) noexcept
+    {
+        if (!first || !second)
+            return false;
+        if (first == second)
+            return true;
+        Microsoft::WRL::ComPtr<IUnknown> firstIdentity, secondIdentity;
+        return SUCCEEDED(first->QueryInterface(IID_PPV_ARGS(&firstIdentity))) &&
+            SUCCEEDED(second->QueryInterface(IID_PPV_ARGS(&secondIdentity))) &&
+            firstIdentity && firstIdentity.Get() == secondIdentity.Get();
+    }
+
     // ReShade 6.8 exposes this QueryInterface contract in source/com_utils.hpp.
     // Obtain its real D3D11 device so capture sees the bytecode *after* add-ons
     // have modified it. The game's device/context and its proxy stay intact.
