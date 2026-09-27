@@ -56,11 +56,12 @@ to uninstall it.
   both enabled, including sideways movement, turning and melee camera motion.
   That test used ReShade 6.8.0, 1280x720 rendering and 1920x1080 output. It does
   not certify every ReShade effect, upscaler or frame-generation mode.
-- Earlier OG and VR builds passed visual smoke checks. The current universal
-  DLL still needs the full OG/VR acceptance matrix. A later VR save-load crash
-  remains unattributed; the available dump does not directly implicate this
-  plugin. The latest OG retest also exited during save loading amid memory and
-  graphics-driver errors, without a crash dump. See [release notes](docs/RELEASE_NOTES.md).
+- Build `372f3a9044377c14` fixes state preservation when capture is rejected.
+  It passes core and hardware rendering checks and loaded and submitted shadowed
+  sunlight draws in OG. Full OG/AE/VR visual acceptance and long-session testing
+  for this exact DLL remain outstanding. Earlier OG/VR save-load failures remain
+  unattributed. See [release notes](docs/RELEASE_NOTES.md) and the
+  [graphics audit](docs/GRAPHICS_AUDIT_2026-09-27.md).
 - No comprehensive weather-mod compatibility list or matched performance
   measurements have been established for this build.
 

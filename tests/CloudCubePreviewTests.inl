@@ -103,8 +103,18 @@ void RunCubemapPreviewTests(GPU& gpu)
         for (UINT face = 0; face < 6; ++face) for (UINT y = 0; y < size; ++y) for (UINT x = 0; x < size; ++x) {
             const auto input = source[face * size * size + y * size + x];
             const UINT index = (((face / 3) * size + y) * size * 3 + (face % 3) * size + x) * 4;
-            Require(std::abs(pixels[index] - std::clamp(input, 0.0f, 1.0f)) <= 0.5f / 255.0f + 0.00001f &&
-                pixels[index] == pixels[index + 1] && pixels[index] == pixels[index + 2] && pixels[index + 3] == 1,
+            // D3D11.3 specification 3.2.3.6 permits 0.6 ULP on the integer
+            // side of FLOAT -> UNORM. WARP's nearest rounding is not required.
+            constexpr float maxUnormError = 0.6f / 255.0f + 0.00001f;
+            const bool validPixel =
+                std::abs(pixels[index] - std::clamp(input, 0.0f, 1.0f)) <= maxUnormError &&
+                pixels[index] == pixels[index + 1] && pixels[index] == pixels[index + 2] && pixels[index + 3] == 1;
+            if (!validPixel)
+                std::cerr << "Preview mismatch cube=" << cube << " face=" << face
+                    << " pixel=" << x << ',' << y << " source=" << input
+                    << " rgba=" << pixels[index] << ',' << pixels[index + 1] << ','
+                    << pixels[index + 2] << ',' << pixels[index + 3] << '\n';
+            Require(validPixel,
                 "atlas preserves mip-zero face order/orientation and raw opacity without contrast or gamma");
         }
     };

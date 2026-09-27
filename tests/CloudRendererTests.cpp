@@ -45,16 +45,18 @@ namespace
         ComPtr<ID3D11Device> device;
         ComPtr<ID3D11DeviceContext> context;
         ComPtr<ID3D11InfoQueue> messages;
+        bool hardwareAdapter{};
 
-        explicit GPU(bool hardware = false)
+        explicit GPU(bool hardware = false) : hardwareAdapter(hardware)
         {
             D3D_FEATURE_LEVEL level{};
             HRESULT result = D3D11CreateDevice(nullptr,
                 hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP,
-                nullptr, hardware ? 0u : D3D11_CREATE_DEVICE_DEBUG, nullptr, 0,
+                nullptr, D3D11_CREATE_DEVICE_DEBUG, nullptr, 0,
                 D3D11_SDK_VERSION, &device, &level, &context);
             if (result == DXGI_ERROR_SDK_COMPONENT_MISSING) {
-                result = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_WARP,
+                result = D3D11CreateDevice(nullptr,
+                    hardware ? D3D_DRIVER_TYPE_HARDWARE : D3D_DRIVER_TYPE_WARP,
                     nullptr, 0, nullptr, 0, D3D11_SDK_VERSION,
                     &device, &level, &context);
                 std::cout << "D3D debug layer unavailable; GPU assertions still run\n";
@@ -684,6 +686,88 @@ float4 PS(Output i) : SV_Target {
             submitOverlap, &draw, &reason) && reason == Geometry::RejectReason::kTopology,
             "unsupported geometry remains fail neutral and reports why");
         Require(draw.calls == callsBeforeReject, "rejected capture never submits geometry");
+        // A refused capture must leave another renderer's output bindings
+        // intact, including UAVs that the normal Sky path does not use.
+        gpu.context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        D3D11_TEXTURE2D_DESC foreignDesc{};
+        foreignDesc.Width = foreignDesc.Height = 4;
+        foreignDesc.ArraySize = foreignDesc.MipLevels = foreignDesc.SampleDesc.Count = 1;
+        foreignDesc.Format = DXGI_FORMAT_R32_FLOAT;
+        foreignDesc.BindFlags = D3D11_BIND_UNORDERED_ACCESS;
+        ComPtr<ID3D11Texture2D> foreignOutput;
+        ComPtr<ID3D11UnorderedAccessView> foreignUav;
+        Check(gpu.device->CreateTexture2D(&foreignDesc, nullptr, &foreignOutput),
+            "foreign capture output");
+        Check(gpu.device->CreateUnorderedAccessView(foreignOutput.Get(), nullptr, &foreignUav),
+            "foreign capture output UAV");
+        auto* rawForeignUav = foreignUav.Get();
+        gpu.context->OMSetRenderTargetsAndUnorderedAccessViews(
+            1, &rawTarget, nullptr, 1, 1, &rawForeignUav, nullptr);
+        Require(!Geometry::AccumulateOpacity(gpu.context.Get(), layout,
+            Motion::CloudTechnique::kClouds, opacityFaceSize, opacityTargets,
+            submitOverlap, &draw, &reason) && reason == Geometry::RejectReason::kPixelUav,
+            "capture rejects foreign pixel UAVs");
+        ComPtr<ID3D11UnorderedAccessView> restoredUav;
+        gpu.context->OMGetRenderTargetsAndUnorderedAccessViews(
+            0, nullptr, nullptr, 1, 1, &restoredUav);
+        Require(restoredUav.Get() == foreignUav.Get(),
+            "rejected capture preserves foreign pixel UAV bindings");
+        Require(draw.calls == callsBeforeReject, "foreign UAV rejection never submits geometry");
+        gpu.context->OMSetRenderTargets(1, &rawTarget, nullptr);
+
+        // Dynamic shader linkage is another rejected configuration. Dropping
+        // its class instance while "restoring" an untouched shader disables
+        // subsequent game draws, even when no capture draw was submitted.
+        if (!gpu.hardwareAdapter) {
+            // WARP covers linkage: this synthetic shader also crashed the
+            // NVIDIA compiler in a standalone repro without plugin code.
+            // See docs/GRAPHICS_AUDIT_2026-09-27.md for the hardware limit.
+            constexpr char linkedSource[] = R"(
+interface ColorSource { float4 GetColor(); };
+class FixedColor : ColorSource {
+    float4 value;
+    float4 GetColor() { return value; }
+};
+FixedColor fixedColor;
+ColorSource source;
+float4 main() : SV_Target0 { return source.GetColor(); }
+)";
+            ComPtr<ID3DBlob> linkedCode, linkedErrors;
+            Check(D3DCompile(linkedSource, sizeof(linkedSource) - 1, nullptr,
+                nullptr, nullptr, "main", "ps_5_0", D3DCOMPILE_ENABLE_STRICTNESS,
+                0, &linkedCode, &linkedErrors), "compile dynamically linked pixel shader");
+            ComPtr<ID3D11ClassLinkage> linkage;
+            ComPtr<ID3D11ClassInstance> instance;
+            ComPtr<ID3D11PixelShader> linkedShader;
+            Check(gpu.device->CreateClassLinkage(&linkage), "create shader linkage");
+            Check(gpu.device->CreatePixelShader(linkedCode->GetBufferPointer(),
+                linkedCode->GetBufferSize(), linkage.Get(), &linkedShader),
+                "create dynamically linked pixel shader");
+            Check(linkage->GetClassInstance("fixedColor", 0, &instance),
+                "get declared shader class instance");
+            auto* rawInstance = instance.Get();
+            auto* linkedConstants = fixture.ps.Get();
+            gpu.context->PSSetConstantBuffers(0, 1, &linkedConstants);
+            gpu.context->PSSetShader(linkedShader.Get(), &rawInstance, 1);
+            Require(!Geometry::AccumulateOpacity(gpu.context.Get(), layout,
+                Motion::CloudTechnique::kClouds, opacityFaceSize, opacityTargets,
+                submitOverlap, &draw, &reason) && reason == Geometry::RejectReason::kClassLinkage,
+                "capture rejects dynamic shader linkage");
+            ComPtr<ID3D11PixelShader> restoredShader;
+            ComPtr<ID3D11ClassInstance> restoredInstance;
+            UINT instanceCount = 1;
+            gpu.context->PSGetShader(&restoredShader, &restoredInstance, &instanceCount);
+            Require(restoredShader.Get() == linkedShader.Get() && instanceCount == 1 &&
+                    restoredInstance.Get() == instance.Get(),
+                "rejected capture preserves the shader and its class instance");
+            Require(draw.calls == callsBeforeReject, "linkage rejection never submits geometry");
+        } else {
+            std::cerr << "SKIP hardware dynamic-linkage fixture (NVIDIA compiler repro); "
+                "the WARP suite checks class-instance preservation\n";
+        }
+        std::cout << "Rejected capture preserves pixel UAVs"
+            << (gpu.hardwareAdapter ? "" : " and shader linkage") << ": "
+            << (vr ? "VR" : "flat") << '\n';
         Geometry::ReleaseDeviceResources();
         gpu.context->ClearState();
         gpu.CheckMessages();
@@ -1423,16 +1507,25 @@ RWTexture2D<float> Result : register(u0);
 
 int main(int argc, char** argv)
 {
+    // Automated GPU failures must return to the runner instead of opening a
+    // modal Windows crash dialog and blocking unrelated desktop work.
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     try {
         const bool hardware = argc == 3 && std::string(argv[2]) == "--hardware";
         Require(argc == 2 || (argc == 3 && (hardware || std::string(argv[2]) == "--benchmark")),
             "usage: CloudRendererTests <shader directory> [--benchmark|--hardware]");
         GPU gpu(hardware);
+        std::cerr << "Running main-view camera readback\n";
         RunMainViewCameraReadbackTests(gpu);
+        std::cerr << "Running flat geometry capture\n";
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kFlat);
+        std::cerr << "Running VR geometry capture\n";
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kVr);
+        std::cerr << "Running flat geometry capture with zero fade\n";
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kFlat, 0.0f);
+        std::cerr << "Running VR geometry capture with zero fade\n";
         RunGeometryCaptureTests(gpu, Motion::SkyConstantLayout::kVr, 0.0f);
+        std::cerr << "Running screen projection and comparison\n";
         RunScreenTests(gpu, argv[1], false);
         RunScreenTests(gpu, argv[1], true);
         RunComparisonScreenTests(gpu, argv[1], false);

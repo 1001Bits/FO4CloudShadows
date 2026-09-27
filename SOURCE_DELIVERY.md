@@ -2,8 +2,10 @@
 
 Distribute the runtime ZIP together with the matching Source ZIP and their
 SHA-256 sidecars. Both archive names contain the runtime version and build ID.
-The Git source is published at https://github.com/1001Bits/FO4CloudShadows;
-the build-specific tag and packaged `RELEASE.json` identify the exact revision.
+The project repository is https://github.com/1001Bits/FO4CloudShadows.
+Packaged `RELEASE.json` records the exact source revision and intended
+build-specific tag. The matching Source ZIP supplies that source independently
+of whether the revision and tag have been published to the repository.
 
 The Source ZIP includes the current project, build and release scripts, all five
 runtime HLSL files, vendored Dear ImGui, license notices, and the exact upstream

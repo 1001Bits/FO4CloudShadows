@@ -1,4 +1,38 @@
-# Build acc6bcd8dfab4548 — 26 September 2026
+# Build 372f3a9044377c14 — 27 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`6092986C47E514E7D68323C5BEDDE0A21716894B2B49632D4C1C66C68F463E1F`.
+Use the runtime and matching source archives bearing build ID
+`372f3a9044377c14`; older archives do not contain the fix below.
+
+## Changes
+
+- Preserve native rendering state when a cloud capture is rejected. Previously,
+  cleanup could clear another renderer's pixel UAV or shader class bindings
+  even though capture had not changed the pipeline.
+- Add regression coverage for rejected captures and correct the GPU preview
+  test's float-to-UNORM tolerance to the Direct3D specification.
+- Keep the previous build's cloud projection, opacity defaults and runtime
+  compatibility behavior.
+
+## Validation and limits
+
+All 12 core checks pass, including the binary and release-feature contracts.
+Flat/VR rendering fixtures pass on an RTX 4070 Laptop GPU. The synthetic shader
+class-linkage case runs on WARP because it reproduces an NVIDIA compiler crash
+in an independent program; hardware mode explicitly reports that skip. The
+complete available OG lighting corpus passes: 1,243 shaders, 138 directional
+variants and 66 unique matched hashes. Native sky pixels, ambient lighting and
+output alpha preservation are covered by GPU fixtures.
+
+The OG launch at 15:12 on 27 September confirms this build loads through F4SE
+and submits patched sunlight draws. Full visual acceptance, long sessions,
+matched performance measurements and the AE/VR game matrices for this exact
+build remain outstanding. Developer tools, private profiling and experimental
+godray occlusion remain disabled. See the
+[graphics audit](GRAPHICS_AUDIT_2026-09-27.md) for findings and evidence limits.
+
+# Previous build acc6bcd8dfab4548 — 26 September 2026
 
 The tested DLL reports version **1.0.0.0**. Its SHA-256 is
 `B266593FA734FEA5614216189CE00FEDBE7A353FDDDD2E1A1A39FD8FE0AC50F0`.

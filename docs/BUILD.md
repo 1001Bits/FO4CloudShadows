@@ -23,6 +23,18 @@ checkout, installed package metadata and cached source archives listed in
 `config/vcpkg-source-lock.json`. No game installation is needed for the core
 tests, which use generated GPU fixtures and D3D11 WARP.
 
+For an additional hardware renderer check, run:
+
+```powershell
+out/build/validation/bin/Release/FO4CloudShadowsRendererTests.exe shaders/CloudShadows --hardware
+```
+
+This requests the D3D debug layer when installed. Dynamic shader linkage is
+tested on WARP only: its synthetic fixture reproduced an NVIDIA compiler crash
+in an independent program. Hardware mode reports that skip explicitly and
+still checks pixel-UAV preservation and production capture/projection. See the
+[27 September graphics audit](GRAPHICS_AUDIT_2026-09-27.md) for evidence and limits.
+
 The runtime ZIP has a mod-manager layout with `F4SE`, `Shaders`, `MCM` and
 `Interface` at its root. The source ZIP includes build scripts, vendored sources,
 dependency source archives and a manifest that verifies all packaged files.

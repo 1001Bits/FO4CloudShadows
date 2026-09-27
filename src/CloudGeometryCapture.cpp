@@ -268,27 +268,34 @@ float4 PS(Input i) : SV_Target0 {
             ~SavedState()
             {
                 FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureRestore);
-                context_->VSSetShader(vs_.Get(), nullptr, 0);
-                context_->PSSetShader(ps_.Get(), nullptr, 0);
-                ID3D11Buffer* cb = cb_.Get();
-                if (context1_)
-                    context1_->VSSetConstantBuffers1(0, 1, &cb, &first_, &count_);
-                else
-                    context_->VSSetConstantBuffers(0, 1, &cb);
-                context_->OMSetRenderTargets(static_cast<UINT>(targets_.size()),
-                    targets_.data(), dsv_.Get());
+                // Validation can reject dynamic linkage or pixel UAVs, which
+                // this snapshot deliberately cannot restore. Until capture
+                // actually changes state, destruction must only release refs.
+                if (modified_) {
+                    context_->VSSetShader(vs_.Get(), nullptr, 0);
+                    context_->PSSetShader(ps_.Get(), nullptr, 0);
+                    ID3D11Buffer* cb = cb_.Get();
+                    if (context1_)
+                        context1_->VSSetConstantBuffers1(0, 1, &cb, &first_, &count_);
+                    else
+                        context_->VSSetConstantBuffers(0, 1, &cb);
+                    context_->OMSetRenderTargets(static_cast<UINT>(targets_.size()),
+                        targets_.data(), dsv_.Get());
+                    context_->OMSetBlendState(blend_.Get(), factor_.data(), sampleMask_);
+                    context_->OMSetDepthStencilState(depth_.Get(), stencil_);
+                    context_->RSSetState(rasterizer_.Get());
+                    context_->RSSetViewports(viewportCount_, viewports_.data());
+                    context_->SetPredication(predicate_.Get(), predicateValue_);
+                }
                 for (auto* target : targets_) {
                     if (target)
                         target->Release();
                 }
-                context_->OMSetBlendState(blend_.Get(), factor_.data(), sampleMask_);
-                context_->OMSetDepthStencilState(depth_.Get(), stencil_);
-                context_->RSSetState(rasterizer_.Get());
-                context_->RSSetViewports(viewportCount_, viewports_.data());
-                context_->SetPredication(predicate_.Get(), predicateValue_);
             }
             SavedState(const SavedState&) = delete;
             SavedState& operator=(const SavedState&) = delete;
+
+            void BeginCapture() noexcept { modified_ = true; }
 
             // The stock pair was fetched once here; validation reuses it.
             [[nodiscard]] bool HasStaticShaders() const noexcept
@@ -319,6 +326,7 @@ float4 PS(Input i) : SV_Target0 {
                 D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE> viewports_{};
             ComPtr<ID3D11Predicate> predicate_;
             BOOL predicateValue_{};
+            bool modified_{};
         };
 
         // Stages the replay cannot preserve. VS/PS were already fetched by
@@ -424,6 +432,7 @@ float4 PS(Input i) : SV_Target0 {
             const auto rasterizerIndex = (rasterizer.CullMode - 1u) * 2u +
                 (rasterizer.FrontCounterClockwise ? 0u : 1u);
             cpuTiming.Set(FO4CS::CpuProfile::Stage::CaptureBind);
+            saved.BeginCapture();
             context->VSSetShader(vertexShader, nullptr, 0);
             context->PSSetShader(s_resources.opacityPS[techniqueIndex].Get(), nullptr, 0);
             context->OMSetBlendState(s_resources.opacityBlend.Get(), nullptr, UINT(-1));
