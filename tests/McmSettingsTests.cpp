@@ -26,7 +26,7 @@ int main(int argc, char** argv)
     try {
         Require(argc == 2, "project path required");
         Require(Files::Read(defaults, user) == Files::Values{}, "missing files use release defaults");
-        Files::Write(defaults, { true, 2.0f, 10000.0f });
+        Files::Write(defaults, Files::Values{});
         Require(WritePrivateProfileStringW(L"CloudShadows", L"fOpacity", L"1.25", user.c_str()), "write partial MCM override");
         const auto partial = Files::Read(defaults, user);
         Require(partial == Files::Values{ true, 1.25f, 10000.0f }, "MCM overrides inherit missing defaults");

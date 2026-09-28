@@ -1,4 +1,28 @@
-# Build 92c53ede901e26f1 — 28 September 2026
+# Version 1.1 — 28 September 2026
+
+Build `0c5f8ead508b2e31`. The DLL reports version **1.1.0.0**. Its SHA-256 is
+`89F333E9E59150A3E24BB9C864836816316D9D9D22E18EA771EBB37D65C2146C`.
+
+- Set default shadow opacity to **1.0** in the DLL, MCM and legacy JSON settings.
+- Keep **Development menu off by default**. F11 opens the optional menu and FPS
+  test controls; F10 toggles cloud shadows for a manual comparison. F7/F8 are
+  unused. The MCM page contains cloud enable, opacity and Development menu only.
+- Include the FO4 Community Shaders 0.1.1 adapter, entirely in this plugin.
+  No CS file replacement or upstream plugin change is needed.
+- Include gradual travel re-anchoring on desktop and VR, blending over four
+  seconds to avoid a sudden projection jump.
+- Support Fallout 4 1.10.163, 1.10.984, 1.11.221, 1.11.240 and VR 1.2.72 in one
+  DLL, with the matching script extender and no Address Library requirement.
+- Update the DLL resource, F4SE metadata, development menu and package versions
+  consistently to 1.1.
+
+Existing saved user preferences take precedence over the new defaults; the
+package does not include or overwrite `MCM/Settings/FO4CloudShadows.ini`.
+The rendering implementation is unchanged from build `92c53ede901e26f1` below.
+That build's loaded-save CS test confirms capture, mask dispatch and sunlight
+submissions; full visual and combined-performance acceptance remain outstanding.
+
+# Previous build 92c53ede901e26f1 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `F8AA5D17CE168ECF6FAC1DFC93CF9F76753DFE472F7FAE10829C59CE6113F916`.

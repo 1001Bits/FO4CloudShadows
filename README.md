@@ -50,7 +50,7 @@ appropriate script extender. For a manual install, copy the ZIP's `F4SE`,
 The package does not contain an ESP or ESL.
 
 Enable cloud shadows and adjust **Shadow opacity** in the Cloud Shadows
-settings page. The default opacity is 2.0. Development controls are off by
+settings page. The default opacity is 1.0. Development controls are off by
 default. User settings are stored in `Data/MCM/Settings/FO4CloudShadows.ini`;
 the package supplies defaults under `Data/MCM/Config/FO4CloudShadows` and does
 not ship a user-settings file. Legacy JSON preferences are migrated when no

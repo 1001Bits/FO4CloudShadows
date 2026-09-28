@@ -2060,7 +2060,7 @@ namespace CloudShadows
 		auto finiteOr = [](float input, float fallback) {
 			return std::isfinite(input) ? input : fallback;
 		};
-		value.Opacity = std::clamp(finiteOr(value.Opacity, 2.0f), 0.0f, 4.0f);
+		value.Opacity = std::clamp(finiteOr(value.Opacity, Settings{}.Opacity), 0.0f, 4.0f);
 		value.CloudHeight = std::clamp(finiteOr(value.CloudHeight, Settings{}.CloudHeight), 10000.0f, 200000.0f);
 		value.LayerHeightStep = std::clamp(finiteOr(value.LayerHeightStep, 6000.0f), 0.0f, 50000.0f);
 		value.WorldTileSize = std::clamp(finiteOr(value.WorldTileSize, 20480.0f), 1024.0f, 1000000.0f);

@@ -19,7 +19,7 @@ namespace FO4CS::McmSettingsFile
     struct Values
     {
         bool enabled = true;
-        float opacity = 2.0f;
+        float opacity = 1.0f;
         float cloudHeight = 10000.0f;
         // F10/F11 and FPS testing are off by default for normal players.
         bool hotkeys = false;

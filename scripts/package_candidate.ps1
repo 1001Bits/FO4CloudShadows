@@ -58,8 +58,11 @@ if ($LASTEXITCODE -ne 0) { throw 'Candidate install failed' }
 if ($LASTEXITCODE -ne 0) { throw 'Candidate runtime assets failed verification' }
 $defaults = Get-Content -LiteralPath (Join-Path $stage 'Data/Shaders/Features/CloudShadows.json') -Raw | ConvertFrom-Json
 $mcmDefaults = Get-Content -LiteralPath (Join-Path $stage 'Data/MCM/Config/FO4CloudShadows/settings.ini') -Raw
-if ($defaults.Opacity -ne 2.0 -or $mcmDefaults -notmatch '(?m)^fOpacity=2(?:\.0+)?\r?$') {
-    throw 'Release default opacity must be 2.0 in both JSON and MCM.'
+if ($defaults.Opacity -ne 1.0 -or $mcmDefaults -notmatch '(?m)^fOpacity=1(?:\.0+)?\r?$') {
+    throw 'Release default opacity must be 1.0 in both JSON and MCM.'
+}
+if ($defaults.Hotkeys -ne $false -or $mcmDefaults -notmatch '(?m)^bHotkeys=0\r?$') {
+    throw 'The development menu must default to off in both JSON and MCM.'
 }
 $release = [ordered]@{
     Version = $Version
@@ -69,7 +72,8 @@ $release = [ordered]@{
     SourceURL = "https://github.com/1001Bits/FO4CloudShadows/tree/$revision"
     SourceTag = "build-$buildId"
     License = 'GPL-3.0-only'
-    DefaultOpacity = 2.0
+    DefaultOpacity = 1.0
+    DefaultDevelopmentMenu = $false
     DllSHA256 = (Get-FileHash -LiteralPath $binary -Algorithm SHA256).Hash.ToLowerInvariant()
     SourceArchive = [IO.Path]::GetFileName($sourceZip)
     SourceArchiveSHA256 = (Get-FileHash -LiteralPath $sourceZip -Algorithm SHA256).Hash.ToLowerInvariant()

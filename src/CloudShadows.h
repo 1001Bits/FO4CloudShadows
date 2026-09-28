@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
 #define DLLEXPORT __declspec(dllexport)
 
 #ifndef FO4CLOUDSHADOWS_VERSION_STR
-#define FO4CLOUDSHADOWS_VERSION_STR "1.0.0"
+#define FO4CLOUDSHADOWS_VERSION_STR "1.1.0"
 #endif
 #ifndef FO4CS_BUILD_ID
 #define FO4CS_BUILD_ID "untracked"
@@ -42,7 +42,7 @@ namespace CloudShadows
     // (Present re-reads the file when its mtime changes, roughly every 2 seconds).
     struct Settings
     {
-        float Opacity = 2.0f;
+        float Opacity = 1.0f;
         // Legacy settings/menu-bridge fields retained for schema compatibility.
         // Production composites every authenticated visible-cloud draw into
         // one field on one physical spherical shell; it does not invent a

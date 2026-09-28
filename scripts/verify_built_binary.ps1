@@ -4,7 +4,7 @@ param(
     [string]$BinaryPath,
     [Parameter(Mandatory)]
     [string]$DumpbinPath,
-    [string]$ExpectedVersion = "1.0.0.0",
+    [string]$ExpectedVersion = "1.1.0.0",
     [string]$EvidenceMarkerPath,
     [switch]$RequireReleaseFeatures
 )
@@ -102,6 +102,11 @@ if ($versionOffset -lt 0 -or $versionOffset + 1116 -gt $imageBytes.Length) {
 }
 if ([BitConverter]::ToUInt32($imageBytes, $versionOffset) -ne 1) {
     throw 'Unexpected F4SE metadata schema.'
+}
+$packedPluginVersion = ($expected.Major -shl 24) -bor ($expected.Minor -shl 16) -bor
+    ($expected.Build -shl 4) -bor $expected.Revision
+if ([BitConverter]::ToUInt32($imageBytes, $versionOffset + 4) -ne $packedPluginVersion) {
+    throw "F4SE plugin version does not match $ExpectedVersion."
 }
 $addressFlags = [BitConverter]::ToUInt32($imageBytes, $versionOffset + 520)
 if ($addressFlags -ne 0) {
