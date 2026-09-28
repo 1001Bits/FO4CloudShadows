@@ -67,7 +67,8 @@ namespace SIE
 			// 1/2 = flat shadowed direct+environment, 3 = flat shadowed
 			// direct-only, 4/5 = flat-compatible unshadowed direct+environment;
 			// 6/7 = VR shadowed direct+environment, 8/9 = VR shadowed
-			// direct-only, 10 = VR unshadowed direct+environment.
+			// direct-only, 10 = VR unshadowed direct+environment;
+			// 11 = reflected FO4 CS direct-light colour substitution.
 			uint32_t signatureVariant = 0;
 		};
 
@@ -96,6 +97,14 @@ namespace SIE
 		/// PatchSunShadowShader accepts. Parses only; no blob or copy is made,
 		/// so every shader the game creates can be classified cheaply.
 		static bool IsSunShadowCandidate(const void* data, size_t size) noexcept;
+
+		// FO4 Community Shaders keeps named reflection data. Validate its deferred
+		// lighting ABI and attenuate the direct light colour before its feature
+		// calculations, preserving the original instructions and ambient addends.
+		static bool IsCommunitySunCandidate(const void* data, size_t size) noexcept;
+		static ID3DBlob* PatchCommunitySunShader(
+			ID3DBlob* source, const DXBCPatch& patch, uint32_t factorTempRegister,
+			SunShadowPatchInfo* outInfo = nullptr);
 
 		/// Compile a minimal HLSL snippet and extract its SHEX instruction bytes
 		/// (excluding declarations and ret). Useful for generating injection payloads.

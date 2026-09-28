@@ -11,6 +11,8 @@
 #include <limits>
 #include <memory>
 #include <unordered_set>
+#include <d3d11shader.h>
+#include <wrl/client.h>
 
 #ifdef max
 #undef max
@@ -910,6 +912,8 @@ namespace SIE
 	{
 		return PatchShaderInternal(vanillaBlob, patch, false, 0, nullptr);
 	}
+
+	#include "CommunityShaderAdapter.inl"
 
 	bool DXBCPatcher::IsSunShadowCandidate(const void* data, size_t size) noexcept
 	{

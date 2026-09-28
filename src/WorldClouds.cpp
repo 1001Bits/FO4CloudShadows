@@ -1418,7 +1418,7 @@ namespace CloudShadows
 
             const bool authenticated =
                 command.authentication ==
-                    CloudDrawAuthentication::kStockVisibleCloudShaders;
+                    CloudDrawAuthentication::kAuditedVisibleCloudShaders;
             std::array<ID3D11RenderTargetView*, 6> targets{};
             for (uint32_t face = 0; face < 6; ++face)
                 targets[face] = s_resources->cubeSets[s_mainSkyFrame.WriteIndex()].faceRTVs[face].Get();

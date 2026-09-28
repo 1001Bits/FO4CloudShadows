@@ -87,15 +87,16 @@ to uninstall it.
 
 ## Compatibility and current validation
 
-- Fallout 4 Community Shaders (`FO4CommunityShaders.dll`): the joint test on
-  Fallout 4 1.11.240 with FO4 CS 0.1.1 and Screen Space Shadows enabled loaded
-  both plugins, but cloud capture rejected the replacement sky shaders and
-  cloud shadows did not render. This combination is not compatible with the
-  current build. Our startup exclusion check uses the older
-  `CommunityShaders.dll` name and does not block this DLL. Replaced sky or
-  sunlight shaders and shared renderer hooks can prevent cloud shadows or
-  conflict with rendering; the result depends on enabled features and load
-  order. Loading both successfully is not evidence of compatibility.
+- Fallout 4 Community Shaders (`FO4CommunityShaders.dll`): an adapter for the
+  audited FO4 CS 0.1.1 shaders is included. It accepts the three validated cloud
+  shader pairs and applies cloud attenuation to CS's direct sunlight colour,
+  preserving its lighting features and ambient contributions. It requires no
+  CS file replacement or CS-side plugin changes. The standalone path remains
+  available when CS is absent. Unknown cloud shader pairs or lighting layouts
+  are rejected. Shader validation covers 128 combinations of contact shadows,
+  terrain shadows, wetness and water effects; final in-game validation of this
+  adapter is pending. This does not add cloud attenuation to fog, water surfaces
+  or other forward/volumetric lighting passes.
 - ENB: if ENB's cloud shadows are enabled at startup, this plugin stays inactive.
   Set `[EFFECT] EnableCloudShadows=false` in `enbseries.ini` and restart the game
   to use this implementation.

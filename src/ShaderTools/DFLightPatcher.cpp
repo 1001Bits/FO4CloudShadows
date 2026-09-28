@@ -620,8 +620,15 @@ namespace SIE
 		memcpy(vanillaBlob->GetBufferPointer(), bytes.data(), bytes.size());
 
 		DXBCPatcher::SunShadowPatchInfo patchInfo;
-		ID3DBlob* patchedBlob = DXBCPatcher::PatchSunShadowShader(
-			vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo);
+		// Prefer the reflected CS adapter: the stock terminal pattern can miss
+		// additional direct-light lobes added by CS features such as wetness.
+		const bool communitySun = DXBCPatcher::IsCommunitySunCandidate(
+			bytes.data(), bytes.size());
+		ID3DBlob* patchedBlob = communitySun
+			? DXBCPatcher::PatchCommunitySunShader(
+				vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo)
+			: DXBCPatcher::PatchSunShadowShader(
+				vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo);
 		vanillaBlob->Release();
 		if (!patchedBlob) {
 			if (patchInfo.signatureMatched) {
@@ -872,7 +879,8 @@ namespace SIE
 			// Classify straight from the caller's buffer: the thousands of
 			// non-DFLight shaders are never copied, and their hashes are never
 			// examined again.
-			if (!DXBCPatcher::IsSunShadowCandidate(bytes, size)) {
+			if (!DXBCPatcher::IsSunShadowCandidate(bytes, size) &&
+				!DXBCPatcher::IsCommunitySunCandidate(bytes, size)) {
 				std::unique_lock mapLock(patchedMapMutex);
 				unsupportedHashes.insert(hash);
 				return;

@@ -108,8 +108,8 @@ namespace CloudShadows
     {
         kUnauthenticated = 0,
         // Set only after the live VS/PS bytecode pair has matched the exact
-        // stock runtime permutation for this BSSky cloud technique.
-        kStockVisibleCloudShaders = 0x534B5943u  // "SKYC"
+        // stock or supported replacement permutation for this cloud technique.
+        kAuditedVisibleCloudShaders = 0x534B5943u  // "SKYC"
     };
 
     struct CloudDrawCommand

@@ -1,3 +1,4 @@
+#include "CommunityShadersCompatibility.h"
 #include "CpuStageProfiler.h"
 #include "PCH.h"
 #include "RendererLifetime.h"
@@ -312,6 +313,28 @@ namespace
         return verified == module;
     }
 
+    [[nodiscard]] bool IsCommunityShadersModule(HMODULE module) noexcept
+    {
+        if (!module || module != GetModuleHandleW(L"FO4CommunityShaders.dll") ||
+            !GetProcAddress(module, "F4SEPlugin_Load") ||
+            !GetProcAddress(module, "F4SEPlugin_Version"))
+            return false;
+        static const HMODULE verified = [module]() noexcept -> HMODULE {
+            wchar_t modulePath[32768]{}, gamePath[32768]{};
+            const DWORD moduleLength = GetModuleFileNameW(module, modulePath, 32768);
+            const DWORD gameLength = GetModuleFileNameW(nullptr, gamePath, 32768);
+            if (!moduleLength || moduleLength >= 32768 || !gameLength || gameLength >= 32768)
+                return nullptr;
+            try {
+                std::error_code error;
+                const auto expected = fs::path(gamePath).parent_path() /
+                    L"Data" / L"F4SE" / L"Plugins" / L"FO4CommunityShaders.dll";
+                return fs::equivalent(modulePath, expected, error) && !error ? module : nullptr;
+            } catch (...) { return nullptr; }
+        }();
+        return module == verified;
+    }
+
     bool IsExecutableAddressInModule(
         std::uintptr_t address,
         const wchar_t* moduleName,
@@ -342,6 +365,12 @@ namespace
             *owner = allocationModule;
         const HMODULE expectedModule = GetModuleHandleW(moduleName);
         if (expectedModule && allocationModule == expectedModule)
+            return true;
+        // CS also hooks CreateVertexShader/CreatePixelShader. If it installed
+        // first, keep its entry as our downstream; if it installed later, the
+        // existing route remains untouched. Both orders call each owner once.
+        if (std::wstring_view(moduleName) == L"d3d11.dll" &&
+            IsCommunityShadersModule(allocationModule))
             return true;
         // A ReShade DLL named d3d11.dll can wrap the real runtime. Shader
         // capture explicitly unwraps only ReShade, never an unknown/ENB device.
@@ -1511,7 +1540,7 @@ namespace
         }
     }
 
-    [[nodiscard]] bool AuthenticateStockSkyShaders(
+    [[nodiscard]] bool AuthenticateSkyShaders(
         uint32_t skyTechnique,
         ID3D11VertexShader* vertexShader,
         ID3D11PixelShader* pixelShader,
@@ -1532,9 +1561,21 @@ namespace
         // These exact FO4VR Deferred 0.5.0-dev cache variants preserve native
         // cloud UV/alpha and both outputs. Their only executable difference
         // is equivalent CB12 motion-vector indexing (see compatibility tests).
-        return expected.vertex != 0 && expected.pixel != 0 &&
+        const bool stock = expected.vertex != 0 && expected.pixel != 0 &&
             vertexHash == expected.vertex && (pixelHash == expected.pixel ||
                 (expected.compatiblePixel != 0 && pixelHash == expected.compatiblePixel));
+        if (stock)
+            return true;
+        const bool community = FO4CS::F4SECompat::IsFlatRuntime(
+            FO4CS::RuntimeAPI::GetSingleton().Target()) &&
+            FO4CS::CommunityShadersCompatibility::IsCloudPair(skyTechnique, vertexHash, pixelHash) &&
+            IsCommunityShadersModule(GetModuleHandleW(L"FO4CommunityShaders.dll"));
+        if (community) {
+            static std::atomic<bool> logged{ false };
+            if (!logged.exchange(true))
+                SPDLOG_INFO("[Compatibility] FO4 Community Shaders cloud capture authenticated; preserving CS shaders and lighting features");
+        }
+        return community;
     }
 
     static SwapState BeginSwapUnchecked(ID3D11DeviceContext* ctx, SwapState& s);
@@ -2205,7 +2246,7 @@ namespace
             uint64_t observedVertexHash = 0;
             uint64_t observedPixelHash = 0;
             if (staticShaders) {
-                phase.skyShadersAuthenticated = AuthenticateStockSkyShaders(
+                phase.skyShadersAuthenticated = AuthenticateSkyShaders(
                     skyTechnique, boundVertexShader, boundPixelShader,
                     &observedVertexHash, &observedPixelHash);
                 phase.skyVertexShader.Attach(boundVertexShader);
@@ -2377,7 +2418,7 @@ namespace
             phase.skyShadersAuthenticated = !hull && !domain &&
                 GetStaticBoundSkyShaders(g_d3dContext,
                     boundVS.GetAddressOf(), boundPS.GetAddressOf()) &&
-                AuthenticateStockSkyShaders(
+                AuthenticateSkyShaders(
                     skyTechnique, boundVS.Get(), boundPS.Get());
             phase.skyVertexShader = std::move(boundVS);
             phase.skyPixelShader = std::move(boundPS);
@@ -2792,7 +2833,7 @@ namespace CloudShadows
 
         command.skyTechnique = phase.skyTechnique;
         command.authentication = phase.skyShadersAuthenticated
-            ? CloudShadows::CloudDrawAuthentication::kStockVisibleCloudShaders
+            ? CloudShadows::CloudDrawAuthentication::kAuditedVisibleCloudShaders
             : CloudShadows::CloudDrawAuthentication::kUnauthenticated;
         // BeginTechnique alone cannot attest a later draw: another hook may
         // have replaced either shader in between. Reject its cloud data while
@@ -3730,6 +3771,8 @@ namespace
         switch (a_msg->type) {
         case FO4CS::F4SECompat::kPostPostLoad:
             SPDLOG_INFO("[CloudShadows] kPostPostLoad - trying hooks");
+            if (IsCommunityShadersModule(GetModuleHandleW(L"FO4CommunityShaders.dll")))
+                SPDLOG_INFO("[Compatibility] FO4CommunityShaders.dll detected; audited sky capture and reflected direct-sun adapter enabled");
 			{
 			FO4CS::MenuFrameworkPage::Install();
 			TryInstallReflectionGuard();

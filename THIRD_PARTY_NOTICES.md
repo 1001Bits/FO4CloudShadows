@@ -23,6 +23,12 @@ The following provenance is part of the release license contract:
 | `src/ShaderTools/*` and adaptations | local audited Dynamic Reflections for Fallout 4 source tree (the checkout has no configured upstream URL) | `3c35b6927d26f1d819f4fa7e827d7b3c9b9f2cb7` | GPLv3 with its Modding and Linking Exceptions | `licenses/Dynamic-Reflections-GPL-3.0.txt`, `licenses/Dynamic-Reflections-EXCEPTIONS.txt` |
 | Runtime HLSL formulas/layouts adapted from `BSSkyShader.hlsl` and `BSDFLightShader.hlsl` | [Fallout 4 Community Shaders](https://github.com/northaxosky/fallout4-community-shaders) | `d1ccd465cb38b81baad90973953be1a95e025644` | GPL-3.0-or-later; the cited upstream shader files do not carry the FO4-CS exception | `licenses/Community-Shaders-GPL-3.0.txt` |
 
+The FO4 CS compatibility adapter additionally audits the BSSky/BSDFLight
+constant-buffer and resource layouts from Mute/northaxosky's FO4 Community
+Shaders commit `1a0439a01dabdbd1ad65b0dd9547160d6125b53e` (v0.1.1). Those shader
+files carry `GPL-3.0-only`. Our adapter reads and patches the installed compiled
+shader; the runtime package does not replace or redistribute CS's shader files.
+
 The package ships the complete preferred source form of all five runtime HLSL
 files. A binary release must additionally publish or accompany the complete
 Corresponding Source for the DLL at the exact released revision, including the

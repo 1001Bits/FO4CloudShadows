@@ -1,4 +1,35 @@
-# Build d2e1ad80d10a5584 — 28 September 2026
+# Build 92c53ede901e26f1 � 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`F8AA5D17CE168ECF6FAC1DFC93CF9F76753DFE472F7FAE10829C59CE6113F916`.
+
+- Add an adapter for the audited FO4 Community Shaders 0.1.1 cloud shader
+  variants. Cloud layers 5/6/7 retain their original texture, interpolation,
+  opacity and fade behavior. Unknown replacements remain rejected.
+- Apply our screen-space cloud mask to the direct-light colour in CS's active
+  deferred-light shader. Preserve CS's original instructions, shadow factors,
+  ambient additions, extra lighting lobes and output alpha. No CS files or
+  upstream plugin changes are required.
+- Recognize `FO4CommunityShaders.dll` and permit its shader-creation hooks as
+  a validated downstream owner, keeping an existing outer hook in place.
+- Retain the standalone renderer, menu settings and runtime requirements.
+- Add GPU composition and lifecycle tests plus optional CS shader corpus checks.
+
+Validation: all 14 core checks pass. All 65 matching directional shaders from
+166 captured CS lighting variants patch and create successfully. A further 128
+combinations of directional shader family, ambient light, screen-space shadows,
+terrain shadows, wetness and water effects compile, patch and create on WARP.
+The GPU composition fixture verifies neutral/partial/full cloud attenuation,
+unchanged ambient and output alpha, swizzles and operand modifiers. Local-light
+descriptors, unknown layouts, missing reflection and an occupied t47 are rejected.
+The stock 1,243-shader corpus retains its exact 138 directional matches.
+
+A new loaded-save run is still needed for visual and combined-performance
+acceptance. The adapter does not add cloud-shadow consumers to water surfaces,
+fog or volumetric/forward lighting. Source reference: Mute/northaxosky's FO4 CS
+commit `1a0439a01dabdbd1ad65b0dd9547160d6125b53e`; see THIRD_PARTY_NOTICES.md.
+
+# Previous build d2e1ad80d10a5584 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `450DA0436F159EBDDC862A40223F28ADA098A73D8DAE8B6007FD012443FCA778`.

@@ -23,11 +23,11 @@
 
 namespace SIE
 {
-	/// Loads VanillaDXBC DFLight pixel shaders, applies a DXBC binary patch
+	/// Captures stock or compatible CS DFLight pixel shaders, applies a DXBC patch
 	/// that multiplies only the exact direct-sun intermediate(s) by the
 	/// screen-space cloud factor bound at t47, and caches the resulting
 	/// ID3D11PixelShader objects for runtime swap. Environment and ambient
-	/// addends remain vanilla.
+	/// addends remain unchanged.
 	///
 	/// Standalone cloud-shadow variant — single-texture MUL at t47 only.
 	class DFLightPatcher
@@ -147,7 +147,7 @@ namespace SIE
 		bool EnsurePayload();
 
 		/// Strictly patch/create a runtime-captured shader if supported, or cache
-		/// the hash as unsupported. Never accepts a non-sunlight terminal layout.
+		/// the hash as unsupported. Requires an audited terminal layout or reflected CS sunlight ABI.
 		ID3D11PixelShader* GetOrCreatePatchedShader(uint64_t hash);
 		ID3D11PixelShader* AcquirePatchedShader(uint64_t hash);
 		void DiscardBytecode(uint64_t hash);

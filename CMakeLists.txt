@@ -140,6 +140,7 @@ target_compile_options(imgui_fo4cs PRIVATE /W0 /WX-)
 
 file(GLOB_RECURSE FO4CS_SOURCES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/*.inl"
     "${CMAKE_CURRENT_SOURCE_DIR}/src/*.h")
 # A source/configuration fingerprint distinguishes developer builds that
 # share a release version. Input changes automatically reconfigure this ID.
