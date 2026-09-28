@@ -426,6 +426,9 @@ namespace CloudShadows::AcceptanceRunner
 			switch (target) {
 			case RuntimeTarget::kLegacy:
 				return "OG";
+			case RuntimeTarget::kNG:
+				return "NG";
+			case RuntimeTarget::kAE221:
 			case RuntimeTarget::kAE:
 				return "AE";
 			case RuntimeTarget::kVR:

@@ -16,16 +16,18 @@ property. Volumetric godray occlusion is not included in the release build.
 | Runtime | Game version | Script extender |
 | --- | --- | --- |
 | OG | 1.10.163 | F4SE 0.6.23 |
+| NG | 1.10.984 | F4SE 0.7.2 / 0.7.3 |
+| AE | 1.11.221 | F4SE 0.7.8 |
 | AE | 1.11.240 | F4SE 0.7.9 |
 | VR | 1.2.72 | F4SEVR 0.6.21 |
 
 Use the matching [F4SE](https://f4se.silverlock.org/) and the
 [Microsoft Visual C++ v14 x64 Redistributable](https://aka.ms/vc14/vc_redist.x64.exe).
-**Address Library is not required** on OG, AE or VR. The DLL contains addresses
+**Address Library is not required** on OG, NG, AE or VR. The DLL contains addresses
 for the exact versions above; other mods may still need Address Library.
-Other executable versions, including 1.10.980/984, are not runtime targets of
+Other executable versions, including 1.10.980, are not runtime targets of
 this build. Supporting a different executable version requires a mod update.
-One DLL contains the three supported runtime paths.
+One DLL supports all five exact game versions above.
 
 [MCM](https://www.nexusmods.com/fallout4/mods/21497) provides the settings page.
 The optional [F4SE Menu Framework](https://www.nexusmods.com/fallout4/mods/105090)
@@ -94,6 +96,10 @@ to uninstall it.
   [graphics audit](docs/GRAPHICS_AUDIT_2026-09-27.md).
 - No comprehensive weather-mod compatibility list or matched performance
   measurements have been established for this build.
+- NG 1.10.984 and AE 1.11.221 addresses and the required engine layouts were
+  checked against the exact executables. Host-selection, binary-metadata and
+  GPU projection tests cover the added runtime paths. In-game testing on these
+  two versions is still outstanding; see [runtime verification](docs/RUNTIME_ADDRESSES.md).
 
 For bug reports, include the game and mod versions, reproduction steps,
 `FO4CloudShadows.log`, and a crash report if one exists. Logs are under

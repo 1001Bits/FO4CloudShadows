@@ -5,6 +5,8 @@
 #include "ShaderTools/DFLightPatcher.h"
 #include "ShaderTools/DXBCPatcher.h"
 #include "F4SECompat.h"
+#include "RuntimeAddresses.h"
+#include "RuntimeLayout.h"
 
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -179,12 +181,69 @@ namespace
 				RuntimeTarget::kUnsupported,
 			"editor hosts are rejected");
 
+		struct DesktopHost { Version runtime; Version extender; RuntimeTarget target; };
+		constexpr DesktopHost desktopHosts[]{
+			{ kLegacyRuntime, { 0, 6, 23, 0 }, RuntimeTarget::kLegacy },
+			{ kNGRuntime, { 0, 7, 2, 0 }, RuntimeTarget::kNG },
+			{ kAE221Runtime, { 0, 7, 8, 0 }, RuntimeTarget::kAE221 },
+			{ kAERuntime, { 0, 7, 9, 0 }, RuntimeTarget::kAE }
+		};
+		for (const auto& reported : desktopHosts) {
+			flat.prefix = MakeInterfacePrefix(reported.extender, reported.runtime);
+			Interface host;
+			tests.Require(host.Normalize(&flat), "desktop extender interface normalizes");
+			for (const auto& actual : desktopHosts) {
+				const auto classified = ClassifyHost(host, L"Fallout4.exe", actual.runtime);
+				tests.Require(classified == (actual.runtime == reported.runtime ?
+					reported.target : RuntimeTarget::kUnsupported),
+					"every supported desktop version requires an exact reported/actual match");
+			}
+			tests.Require(ClassifyHost(host, L"Fallout4VR.exe", reported.runtime) ==
+				RuntimeTarget::kUnsupported &&
+				ClassifyHost(host, L"CreationKit.exe", reported.runtime) == RuntimeTarget::kUnsupported,
+				"desktop versions cannot authorize a different executable");
+		}
+
+		// A newly added runtime must never inherit an omitted old column.
+		const FO4CS::RuntimeRVA oldOnly{ 0x100, 0x200, 0x300 };
+		tests.Require(oldOnly.Select(RuntimeTarget::kNG) == 0 &&
+			oldOnly.Select(RuntimeTarget::kAE221) == 0 &&
+			oldOnly.Select(RuntimeTarget::kUnsupported) == 0,
+			"missing runtime addresses fail closed instead of borrowing another version");
+		for (const auto target : { RuntimeTarget::kNG, RuntimeTarget::kAE221 }) {
+			tests.Require(FO4CS::F4SECompat::IsFlatRuntime(target) &&
+				FO4CS::RuntimeAddresses::kVRSetShadersSymbol.Select(target) == 0 &&
+				FO4CS::RuntimeAddresses::kBeginTechniqueSymbol.Select(target) != 0 &&
+				FO4CS::RuntimeAddresses::kUIMessageQueueAddMessageSymbol.Select(target) != 0,
+				"new desktop hosts have shader/cursor routes and cannot select the VR hook");
+			// Fixture from the reviewed NG/AE object layouts: the old filename
+			// slot holds a scatter-table sentinel, and the old map slots are junk.
+			std::array<std::byte, 0x1000> manager{};
+			std::array<std::byte, 0x190> shader{};
+			const std::uintptr_t sentinel = 0xDEADBEEF;
+			const char* filename = "Sky";
+			const std::uint32_t targetSlot = 12, depthSlot = 3;
+			std::memcpy(shader.data() + 0x110, &sentinel, sizeof(sentinel));
+			std::memcpy(shader.data() + 0x188, &filename, sizeof(filename));
+			std::memcpy(manager.data() + 0xDF4 + 33 * 4, &targetSlot, sizeof(targetSlot));
+			std::memcpy(manager.data() + 0xF84 + 1 * 4, &depthSlot, sizeof(depthSlot));
+			const auto layout = FO4CS::LayoutFor(target);
+			const char* readName{};
+			std::uint32_t readTarget{}, readDepth{};
+			std::memcpy(&readName, shader.data() + layout.shaderFilenameOffset, sizeof(readName));
+			std::memcpy(&readTarget, manager.data() + layout.renderTargetMapOffset + 33 * 4, sizeof(readTarget));
+			std::memcpy(&readDepth, manager.data() + layout.depthTargetMapOffset + 1 * 4, sizeof(readDepth));
+			tests.Require(readName == filename && readTarget == targetSlot && readDepth == depthSlot,
+				"new hosts read the reviewed shader name and deferred target maps");
+		}
+
 		// Built-in addresses must never be selected for a nearby/new runtime,
 		// even when the extender and executable agree about that version.
 		for (const Version unsupported : {
-				Version{ 1, 10, 980, 0 }, Version{ 1, 10, 984, 0 },
-				Version{ 1, 11, 221, 0 }, Version{ 1, 11, 241, 0 },
-				Version{ 1, 10, 163, 1 }, Version{ 1, 11, 240, 1 } }) {
+				Version{ 1, 10, 980, 0 }, Version{ 1, 10, 985, 0 },
+				Version{ 1, 11, 222, 0 }, Version{ 1, 11, 241, 0 },
+				Version{ 1, 10, 163, 1 }, Version{ 1, 11, 240, 1 },
+				Version{ 1, 10, 984, 1 }, Version{ 1, 11, 221, 1 } }) {
 			flat.prefix = MakeInterfacePrefix(kF4SEWithPluginInfo, unsupported);
 			Interface unknown;
 			tests.Require(unknown.Normalize(&flat) &&

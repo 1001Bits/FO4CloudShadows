@@ -1,4 +1,29 @@
-# Build 6cbead4449ed1249 � 28 September 2026
+# Build 48c2784b65fcc7f0 — 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`B448F162B7492DCCCB503D81BF735F668DB6B9C0A1CD37A0E982FE52EC97529A`.
+
+- Add Fallout 4 **1.10.984** and **1.11.221** to the same DLL alongside
+  1.10.163, 1.11.240 and VR 1.2.72. Other versions remain rejected.
+- Include a separate reviewed address table for each added executable. Address
+  Library remains unnecessary; install the matching F4SE for your game.
+- Select the newer shader-name and render-target map offsets on both versions,
+  and use the corresponding depth-reconstruction layout. The development menu
+  and log identify the exact runtime.
+- Retain the preceding Present-wrapper fix and existing release settings.
+
+All 58 active runtime addresses pass checks against local executables and
+version-specific databases. All 14 core checks pass, including exact host
+matching, omission/mismatch rejection, the new object-layout fixtures,
+GPU projection for both added runtime paths, and the exported F4SE version
+list with zero Address Library flags. Developer tools and private profiling
+remain compiled off.
+
+NG 1.10.984 and AE 1.11.221 have not yet been launched or visually tested with
+this build. Static executable review and WARP tests do not replace that
+remaining in-game validation. See [address and layout evidence](RUNTIME_ADDRESSES.md).
+
+# Previous build 6cbead4449ed1249 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `4CB99CE14F420714E4EB9A0C6630CB0E87C6DB69B3D2AC7C508A9B29C40904B7`.

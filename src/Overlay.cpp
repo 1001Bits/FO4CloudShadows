@@ -36,6 +36,10 @@ namespace Overlay
 			switch (FO4CS::RuntimeAPI::GetSingleton().Target()) {
 			case RuntimeTarget::kLegacy:
 				return "Fallout 4 OG 1.10.163";
+			case RuntimeTarget::kNG:
+				return "Fallout 4 NG 1.10.984";
+			case RuntimeTarget::kAE221:
+				return "Fallout 4 AE 1.11.221";
 			case RuntimeTarget::kAE:
 				return "Fallout 4 AE 1.11.240";
 			case RuntimeTarget::kVR:

@@ -236,7 +236,7 @@ namespace FO4CS
                 F4SECompat::RuntimeTarget::kUnsupported) {
                 error =
                     "unsupported executable/F4SE combination; expected "
-                    "Fallout4.exe 1.10.163 or 1.11.240, or "
+                    "Fallout4.exe 1.10.163, 1.10.984, 1.11.221 or 1.11.240, or "
                     "Fallout4VR.exe 1.2.72 with F4SEVR 0.6.21";
                 return false;
             }

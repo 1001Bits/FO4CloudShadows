@@ -1,5 +1,6 @@
 #include "CpuStageProfiler.h"
 #include "CloudShadows.h"
+#include "RuntimeLayout.h"
 #include "AcceptanceRunner.h"
 #include "GodraysIntegration.h"
 #include "ManualFpsLog.h"
@@ -325,18 +326,6 @@ namespace CloudShadows
         // the manager's logical map cannot be read.
         constexpr uint32_t kMainRenderTargetPhysicalIndex = 3;
         constexpr uint32_t kMainTempRenderTargetPhysicalIndex = 4;
-        // RenderTargetManager logical->physical maps. Verified in the Ghidra
-        // Combined project: 1.11.240 widened the 12-entry per-depth-target
-        // record array at +0xC80 from 0x18 to 0x1C bytes (+0x30 total), which
-        // moves both maps; the dynamic-resolution floats that follow the depth
-        // map sit at +0xF88 (OG) versus +0xFB8 (1.11.240).
-        constexpr std::size_t kRenderTargetMapOffsetLegacy = 0xDC4;
-        constexpr std::size_t kDepthStencilTargetMapOffsetLegacy = 0xF54;
-        constexpr std::size_t kRenderTargetMapOffsetAE = 0xDF4;
-        constexpr std::size_t kDepthStencilTargetMapOffsetAE = 0xF84;
-        // VR manager accessors at 0x1DB9DD0/0x1DB9E40 use these live maps.
-        constexpr std::size_t kRenderTargetMapOffsetVR = 0x13BC;
-        constexpr std::size_t kDepthStencilTargetMapOffsetVR = 0x15FC;
         [[nodiscard]] bool IsVRRuntime() noexcept
         {
             return FO4CS::RuntimeAPI::GetSingleton().Target() ==
@@ -375,20 +364,13 @@ namespace CloudShadows
             const auto& targets = DeferredTargets(0);
             return slot == 0 ? targets.accumulation0 : targets.accumulation1;
         }
-        [[nodiscard]] bool IsAERuntime() noexcept
-        {
-            return FO4CS::RuntimeAPI::GetSingleton().Target() ==
-                FO4CS::F4SECompat::RuntimeTarget::kAE;
-        }
         [[nodiscard]] std::size_t RenderTargetMapOffset() noexcept
         {
-            return IsVRRuntime() ? kRenderTargetMapOffsetVR :
-                (IsAERuntime() ? kRenderTargetMapOffsetAE : kRenderTargetMapOffsetLegacy);
+            return FO4CS::LayoutFor(FO4CS::RuntimeAPI::GetSingleton().Target()).renderTargetMapOffset;
         }
         [[nodiscard]] std::size_t DepthStencilTargetMapOffset() noexcept
         {
-            return IsVRRuntime() ? kDepthStencilTargetMapOffsetVR :
-                (IsAERuntime() ? kDepthStencilTargetMapOffsetAE : kDepthStencilTargetMapOffsetLegacy);
+            return FO4CS::LayoutFor(FO4CS::RuntimeAPI::GetSingleton().Target()).depthTargetMapOffset;
         }
 
         struct RenderTargetDiagnostic
@@ -2646,13 +2628,7 @@ namespace CloudShadows
 #endif
 
         constexpr UINT kEnginePerFrameRegisterCountFlat = 36;
-        // OG 1.10.163 DFLight reads b2 through c27 (dynamic-resolution depth
-        // scale). 1.11.240's DFLight binds 25 registers and never reads c27,
-        // whose contents there are whatever another technique left behind.
-        constexpr UINT kEnginePerCallRegisterCountLegacy = 28;
-        constexpr UINT kEnginePerCallRegisterCountAE = 25;
         constexpr UINT kEnginePerFrameRegisterCountVR = 61;
-        constexpr UINT kEnginePerCallRegisterCountVR = 46;
         constexpr UINT kEngineStereoRegisterCountVR = 1;
 
         UINT RequiredEnginePerFrameRegisterCount() noexcept
@@ -2665,14 +2641,7 @@ namespace CloudShadows
 
         UINT RequiredEnginePerCallRegisterCount() noexcept
         {
-            switch (FO4CS::RuntimeAPI::GetSingleton().Target()) {
-            case FO4CS::F4SECompat::RuntimeTarget::kVR:
-                return kEnginePerCallRegisterCountVR;
-            case FO4CS::F4SECompat::RuntimeTarget::kAE:
-                return kEnginePerCallRegisterCountAE;
-            default:
-                return kEnginePerCallRegisterCountLegacy;
-            }
+            return FO4CS::LayoutFor(FO4CS::RuntimeAPI::GetSingleton().Target()).perCallRegisterCount;
         }
 
         enum class PrepassRejectReason : uint32_t
@@ -3474,10 +3443,9 @@ namespace CloudShadows
             1.0f / static_cast<float>(outputHeight)
         };
         // OG DFLight uses c0.xy for NDC and c27 to scale its depth fetch.
-        // AE uses c0.zw for NDC and has no c27; select the complete layout.
+        // NG/AE use c0.zw for NDC and have no c27; select the complete layout.
         const bool legacyDepthLayout =
-            FO4CS::RuntimeAPI::GetSingleton().Target() ==
-            FO4CS::F4SECompat::RuntimeTarget::kLegacy;
+            FO4CS::LayoutFor(FO4CS::RuntimeAPI::GetSingleton().Target()).legacyDepthProjection;
         // All runtimes retain the field's world origin. Only VR crossfades
         // travel re-anchors; flat retains its confirmed gameplay origin.
         XMFLOAT3 previousFieldOrigin{};

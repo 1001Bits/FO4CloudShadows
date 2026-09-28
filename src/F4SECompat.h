@@ -54,6 +54,8 @@ namespace FO4CS::F4SECompat
     };
 
     inline constexpr Version kLegacyRuntime{ 1, 10, 163, 0 };
+    inline constexpr Version kNGRuntime{ 1, 10, 984, 0 };
+    inline constexpr Version kAE221Runtime{ 1, 11, 221, 0 };
     inline constexpr Version kAERuntime{ 1, 11, 240, 0 };
     inline constexpr Version kVRRuntime{ 1, 2, 72, 0 };
     inline constexpr Version kF4SEVRProxyRuntime{ 1, 10, 138, 0 };
@@ -312,8 +314,16 @@ namespace FO4CS::F4SECompat
         kUnsupported,
         kLegacy,
         kAE,
-        kVR
+        kVR,
+        kNG,
+        kAE221
     };
+
+    [[nodiscard]] constexpr bool IsFlatRuntime(RuntimeTarget target) noexcept
+    {
+        return target == RuntimeTarget::kLegacy || target == RuntimeTarget::kNG ||
+            target == RuntimeTarget::kAE221 || target == RuntimeTarget::kAE;
+    }
 
     [[nodiscard]] constexpr wchar_t AsciiLower(wchar_t value) noexcept
     {
@@ -362,6 +372,10 @@ namespace FO4CS::F4SECompat
         }
         if (executableVersion == kLegacyRuntime)
             return RuntimeTarget::kLegacy;
+        if (executableVersion == kNGRuntime)
+            return RuntimeTarget::kNG;
+        if (executableVersion == kAE221Runtime)
+            return RuntimeTarget::kAE221;
         if (executableVersion == kAERuntime)
             return RuntimeTarget::kAE;
         return RuntimeTarget::kUnsupported;

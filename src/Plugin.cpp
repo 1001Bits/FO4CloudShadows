@@ -14,6 +14,7 @@
 #include "MenuFrameworkPage.h"
 #include "Overlay.h"
 #include "RuntimeAPI.h"
+#include "RuntimeLayout.h"
 #include "ShaderTools/DFLightDescriptor.h"
 #include "WaterReflectionGuard.h"
 #include "DetourTransaction.h"
@@ -58,6 +59,10 @@ namespace
         switch (target) {
         case RuntimeTarget::kLegacy:
             return "OG 1.10.163";
+        case RuntimeTarget::kNG:
+            return "NG 1.10.984";
+        case RuntimeTarget::kAE221:
+            return "AE 1.11.221";
         case RuntimeTarget::kAE:
             return "AE 1.11.240";
         case RuntimeTarget::kVR:
@@ -1472,8 +1477,7 @@ namespace
         uint32_t skyTechnique) noexcept
     {
         using FO4CS::F4SECompat::RuntimeTarget;
-        const bool flat = target == RuntimeTarget::kLegacy ||
-            target == RuntimeTarget::kAE;
+        const bool flat = FO4CS::F4SECompat::IsFlatRuntime(target);
         const bool vr = target == RuntimeTarget::kVR;
         if (!flat && !vr)
             return {};
@@ -1683,7 +1687,7 @@ namespace
     // detours so OG/AE and VR both retain their exact native ABI.
     //
     // The only object fields observed here are the
-    // stable BSShader type/name slots at 0x18 and 0x110 (0x188 on 1.11.240), read through an opaque
+    // BSShader type/name slots at 0x18 and 0x110 (0x188 on NG/AE), read through an opaque
     // pointer so no CommonLib engine type enters this translation unit.
     using BeginTechniqueFlat_t = bool(WINAPI*)(
         void*, uint32_t, uint32_t, uint32_t, uint32_t);
@@ -1767,12 +1771,12 @@ namespace
         const auto address = reinterpret_cast<std::uintptr_t>(shader);
         // BSShader layout (Combined Ghidra project, BSShader::BSShader):
         //   OG 1.10.163 / VR: shaderType at 0x18, fxpFilename at 0x110.
-        //   1.11.240: three CRITICAL_SECTIONs were added after the vtables,
+        //   NG 1.10.984 / AE 1.11.221 / AE 1.11.240: three CRITICAL_SECTIONs
+        //   were added after the vtables,
         //   moving fxpFilename to 0x188 (shaderType stays at 0x18). Reading
         //   0x110 there returns the 0xDEADBEEF scatter-table sentinel.
-        const bool aeLayout = runtime.Target() == FO4CS::F4SECompat::RuntimeTarget::kAE;
-        const std::size_t filenameOffset = aeLayout ? 0x188u : 0x110u;
-        if (!runtime.ValidateMemory(
+        const auto filenameOffset = FO4CS::LayoutFor(runtime.Target()).shaderFilenameOffset;
+        if (filenameOffset == 0 || !runtime.ValidateMemory(
                 address, filenameOffset + sizeof(const char*),
                 FO4CS::AddressKind::kReadable)) {
             remember(result);
@@ -3952,6 +3956,8 @@ F4SEPlugin_Version = []() constexpr {
     v.IsLayoutDependentAE(true);
     v.SetCompatibleVersions({
         FO4CS::F4SECompat::kLegacyRuntime,
+        FO4CS::F4SECompat::kNGRuntime,
+        FO4CS::F4SECompat::kAE221Runtime,
         FO4CS::F4SECompat::kAERuntime,
         FO4CS::F4SECompat::kVRRuntime,
         // Official F4SEVR 0.6.21 reports this proxy. Query/Load still prove

@@ -107,8 +107,8 @@ $addressFlags = [BitConverter]::ToUInt32($imageBytes, $versionOffset + 520)
 if ($addressFlags -ne 0) {
     throw "F4SE metadata must use exact versions with no Address Library flags; found $addressFlags."
 }
-# Packed F4SE versions: OG 1.10.163, AE 1.11.240, VR 1.2.72, VR's 1.10.138 proxy.
-$compatibleVersions = @(0x010A0A30, 0x010B0F00, 0x01020480, 0x010A08A0)
+# OG 163, NG 984, AE 221/240, VR 72, and the exact F4SEVR runtime proxy.
+$compatibleVersions = @(0x010A0A30, 0x010A3D80, 0x010B0DD0, 0x010B0F00, 0x01020480, 0x010A08A0)
 for ($index = 0; $index -lt 16; ++$index) {
     $actualVersion = [BitConverter]::ToUInt32($imageBytes, $versionOffset + 528 + 4 * $index)
     $expectedRuntime = if ($index -lt $compatibleVersions.Count) { $compatibleVersions[$index] } else { 0 }

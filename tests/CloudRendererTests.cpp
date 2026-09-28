@@ -3,6 +3,7 @@
 #include "CloudCubePreview.h"
 #include "GodrayCloudShader.h"
 #include "MainViewCameraReadback.h"
+#include "RuntimeLayout.h"
 
 #include <d3d11_1.h>
 #include <d3d11sdklayers.h>
@@ -933,14 +934,33 @@ float4 main() : SV_Target0 { return source.GetColor(); }
                 "near/far and both stereo eyes preserve receiver/background contract");
 
         if (!vr) {
-            // 1.11.240 DFLight binds 25 per-call registers, so b2 c27 holds
+            // NG/AE DFLight binds 25 per-call registers, so b2 c27 holds
             // another technique's leftovers there: the CPU layout flag, not
             // the register contents, decides whether it scales the depth fetch.
             call[27] = { 0.5f, 0.5f, 0, 0 };
             gpu.context->UpdateSubresource(b2.Get(), 0, nullptr, call.data(), 0, 0);
-            Require(dispatch(shaders[0].Get()) == production &&
-                dispatch(shaders[1].Get()) == production,
-                "the 1.11.240 layout ignores leftover b2 c27 contents");
+            using FO4CS::F4SECompat::RuntimeTarget;
+            for (const auto runtime : { RuntimeTarget::kNG, RuntimeTarget::kAE221, RuntimeTarget::kAE }) {
+                const auto layout = FO4CS::LayoutFor(runtime);
+                plugin[5][0] = layout.legacyDepthProjection ? 1.0f : 0.0f;
+                gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
+                Require(dispatch(shaders[0].Get()) == production &&
+                    dispatch(shaders[1].Get()) == production,
+                    "every NG/AE runtime ignores leftover b2 c27 contents");
+                // Engine constant-buffer ranges use 256-byte allocation units.
+                // Supply the native 25 registers with zeroed allocation padding.
+                std::array<Float4, 32> nativeCall{};
+                Require(layout.perCallRegisterCount == 25,
+                    "NG/AE accepts the native 25-register payload");
+                std::copy_n(call.begin(), layout.perCallRegisterCount, nativeCall.begin());
+                auto exactCall = gpu.Constants(nativeCall.data(), sizeof(nativeCall));
+                ID3D11Buffer* exactBuffer = exactCall.Get();
+                gpu.context->CSSetConstantBuffers(2, 1, &exactBuffer);
+                Require(dispatch(shaders[0].Get()) == production,
+                    "new runtime projection works with the native constant payload and padding");
+                ID3D11Buffer* restoredBuffer = b2.Get();
+                gpu.context->CSSetConstantBuffers(2, 1, &restoredBuffer);
+            }
             plugin[5][0] = 1;
             gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
             Require(dispatch(shaders[0].Get()) != production,

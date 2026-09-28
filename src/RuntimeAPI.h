@@ -25,6 +25,8 @@ namespace FO4CS
         std::uintptr_t legacy{};
         std::uintptr_t ae{};
         std::uintptr_t vr{};
+        std::uintptr_t ng{};
+        std::uintptr_t ae221{};
 
         [[nodiscard]] constexpr std::uintptr_t Select(
             F4SECompat::RuntimeTarget target) const noexcept
@@ -36,6 +38,10 @@ namespace FO4CS
                 return ae;
             case F4SECompat::RuntimeTarget::kVR:
                 return vr;
+            case F4SECompat::RuntimeTarget::kNG:
+                return ng;
+            case F4SECompat::RuntimeTarget::kAE221:
+                return ae221;
             default:
                 return 0;
             }

@@ -35,6 +35,20 @@ VR_UNUSED = {
     "kUIMessageQueueAddMessageSymbol",
     "kStringPoolGetEntrySymbol",
 }
+# NG keeps the same renderer/function IDs as AE. These two singleton IDs
+# differ; both slots were independently checked in the NG executable.
+NG_IDS = {"kPlayerSingletonSymbol": 2698073, "kUIMessageQueueSingletonSymbol": 2689091}
+RUNTIMES = (("og", (1, 10, 163, 0)), ("ae", (1, 11, 240, 0)),
+            ("vr", (1, 2, 72, 0)), ("ng", (1, 10, 984, 0)),
+            ("ae221", (1, 11, 221, 0)))
+
+
+def symbol_id(name, column):
+    if column == 2:
+        return None
+    if column == 3 and name in NG_IDS:
+        return NG_IDS[name]
+    return SYMBOLS[name][0 if column == 0 else 1]
 
 
 def require(condition, message):
@@ -96,12 +110,12 @@ def verify_image(path, expected_version, table, column, addresses):
     checked = []
     for name, (og_id, ae_id, code) in SYMBOLS.items():
         rva = table[name][column]
-        identity = (og_id, ae_id)[column] if column < 2 else None
-        unused = identity is None if column < 2 else name in VR_UNUSED
+        identity = symbol_id(name, column)
+        unused = name in VR_UNUSED if column == 2 else identity is None
         if unused:
             require(rva == 0, f"{name}: unsupported runtime must have zero RVA")
             continue
-        if column < 2:
+        if identity is not None:
             require(rva == addresses[identity], f"{name}: RVA differs from original ID {identity}")
         byte_count = 16 if code else 8
         require(0 < rva and rva + byte_count <= image_size, f"{name}: outside image")
@@ -122,7 +136,7 @@ def verify_image(path, expected_version, table, column, addresses):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, default=Path(__file__).resolve().parent.parent)
-    for runtime in ("og", "ae", "vr"):
+    for runtime, _ in RUNTIMES:
         parser.add_argument(f"--{runtime}-exe", type=Path, required=True)
         if runtime != "vr":
             parser.add_argument(f"--{runtime}-addresses", type=Path, required=True)
@@ -130,15 +144,16 @@ def main():
     args = parser.parse_args()
     header = (args.source_root / "src/RuntimeAddresses.h").read_text(encoding="utf-8")
     number = r"(0x[0-9A-Fa-f]+|[0-9]+)"
-    pattern = rf"inline constexpr RuntimeRVA (\w+)\s*\{{\s*{number}\s*,\s*{number}\s*,\s*{number}\s*\}};"
+    columns = r"\s*,\s*".join([number] * len(RUNTIMES))
+    pattern = rf"inline constexpr RuntimeRVA (\w+)\s*\{{\s*{columns}\s*\}};"
     entries = re.findall(pattern, header)
     table = {name: tuple(int(value, 0) for value in values) for name, *values in entries}
     require(len(entries) == len(table) and set(table) == set(SYMBOLS), "Runtime address table has missing, duplicate or unreviewed symbols")
     results = {}
-    for column, (runtime, version) in enumerate((("og", (1, 10, 163, 0)), ("ae", (1, 11, 240, 0)), ("vr", (1, 2, 72, 0)))):
+    for column, (runtime, version) in enumerate(RUNTIMES):
         addresses, digest = {}, None
-        if column < 2:
-            wanted = {symbol[column] for symbol in SYMBOLS.values() if symbol[column] is not None}
+        if runtime != "vr":
+            wanted = {symbol_id(name, column) for name in SYMBOLS} - {None}
             addresses, digest = database(getattr(args, f"{runtime}_addresses"), wanted)
         result = verify_image(getattr(args, f"{runtime}_exe"), version, table, column, addresses)
         if digest:
