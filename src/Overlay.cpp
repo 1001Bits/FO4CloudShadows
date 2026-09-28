@@ -1261,7 +1261,7 @@ void main(uint3 id : SV_DispatchThreadID)
 			bool open = g_visible.load(std::memory_order_acquire);
 			const ImGuiWindowFlags flags =
 				ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoTitleBar;
-			if (ImGui::Begin("Open Shaders FO4", &open, flags)) {
+			if (ImGui::Begin("Cloud Shadows FO4", &open, flags)) {
 				// Dynamic Reflections' undocked CS header: large Jost title on the
 				// left, global actions on the right, then the heavy separator.
 				if (ImGui::BeginTable("##HeaderLayout", 2, ImGuiTableFlags_SizingStretchProp)) {
@@ -1272,7 +1272,7 @@ void main(uint3 id : SV_DispatchThreadID)
 					if (g_titleFont)
 						ImGui::PushFont(g_titleFont);
 					ImGui::SetWindowFontScale(1.7f);
-					ImGui::TextUnformatted("Open Shaders FO4");
+					ImGui::TextUnformatted("Cloud Shadows FO4");
 					ImGui::SetWindowFontScale(1.0f);
 					if (g_titleFont)
 						ImGui::PopFont();

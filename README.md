@@ -87,8 +87,11 @@ to uninstall it.
 
 ## Compatibility and current validation
 
-- Fallout 4 Community Shaders (`FO4CommunityShaders.dll`): coexistence is not
-  supported or validated. Our current startup exclusion check uses the older
+- Fallout 4 Community Shaders (`FO4CommunityShaders.dll`): the joint test on
+  Fallout 4 1.11.240 with FO4 CS 0.1.1 and Screen Space Shadows enabled loaded
+  both plugins, but cloud capture rejected the replacement sky shaders and
+  cloud shadows did not render. This combination is not compatible with the
+  current build. Our startup exclusion check uses the older
   `CommunityShaders.dll` name and does not block this DLL. Replaced sky or
   sunlight shaders and shared renderer hooks can prevent cloud shadows or
   conflict with rendering; the result depends on enabled features and load

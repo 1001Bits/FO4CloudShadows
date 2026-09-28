@@ -3,7 +3,7 @@
 #include <d3d11.h>
 #include <dxgi.h>
 
-// F11-toggled Open Shaders FO4 menu for the standalone Cloud Shadows
+// F11-toggled Cloud Shadows FO4 menu for the standalone Cloud Shadows
 // plugin. Closing with F11 or X saves settings automatically. The opt-in
 // release menu includes manual/automatic FPS comparison; benchmark phases are
 // never saved. Developer builds alone expose advanced diagnostics.

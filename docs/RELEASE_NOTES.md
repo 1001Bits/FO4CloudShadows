@@ -1,4 +1,22 @@
-# Build 9b9302cd6ecad960 — 28 September 2026
+# Build d2e1ad80d10a5584 — 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`450DA0436F159EBDDC862A40223F28ADA098A73D8DAE8B6007FD012443FCA778`.
+
+- Rename the F11 development menu window and heading from **Open Shaders FO4**
+  to **Cloud Shadows FO4**. Hotkeys, controls and rendering behavior are unchanged.
+- Record the joint test of the previous build with FO4 Community Shaders 0.1.1
+  on Fallout 4 1.11.240, with CS Screen Space Shadows enabled. Both plugins
+  loaded and an exterior save ran, but our cloud capture rejected CS's sky
+  shaders and cloud shadows did not render. The observed vertex and pixel
+  hashes exactly match the compiled BSSky entries in the CS shader cache.
+  This documents a confirmed incompatibility; this build does not fix it.
+
+The DLL rebuild and package checks pass. In-game visual confirmation of the
+renamed title awaits installation and restart. Re-anchor visual acceptance
+remains pending because the joint setup did not produce cloud shadows.
+
+# Previous build 9b9302cd6ecad960 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `5B7D106B84994A7CAF07BE94426DD807258127A87EE62DFC3EFDFF88BC41BDB5`.
