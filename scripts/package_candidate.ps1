@@ -85,6 +85,12 @@ $payload = [Collections.Generic.SortedDictionary[string,string]]::new([StringCom
 foreach ($file in Get-ChildItem -LiteralPath $stage -Recurse -File -Force) {
     $relative = $file.FullName.Substring($stage.Length + 1).Replace('\', '/')
     if ($relative.StartsWith('Data/')) { $relative = $relative.Substring(5) }
+    # Keep license notices as text; guides and Markdown belong in the source ZIP.
+    switch ($relative) {
+        'EXCEPTIONS.md' { $relative = 'licenses/FO4CloudShadows-EXCEPTIONS.txt' }
+        'THIRD_PARTY_NOTICES.md' { $relative = 'licenses/FO4CloudShadows-NOTICES.txt' }
+    }
+    if ($relative -match '(?i)(^docs/|(^|/)readme[^/]*$|\.(md|markdown)$)') { continue }
     if ($relative -match '(?i)(^MCM/Settings/|\.(pdb|dxbc|cso|exe|log)$)') { throw "Unexpected runtime payload: $relative" }
     $payload.Add($relative, $file.FullName)
 }

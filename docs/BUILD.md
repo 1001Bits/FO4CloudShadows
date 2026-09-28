@@ -42,7 +42,9 @@ still checks pixel-UAV preservation and production capture/projection. See the
 [27 September graphics audit](GRAPHICS_AUDIT_2026-09-27.md) for evidence and limits.
 
 The runtime ZIP has a mod-manager layout with `F4SE`, `Shaders`, `MCM` and
-`Interface` at its root. The source ZIP includes build scripts, vendored sources,
+`Interface` at its root. It omits Markdown, readmes and documentation; license
+notices remain as text under `licenses`. The source ZIP includes documentation,
+build scripts, vendored sources,
 dependency source archives and a manifest that verifies all packaged files.
 Compiled symbols and game-owned shader dumps are excluded from both ZIPs.
 
