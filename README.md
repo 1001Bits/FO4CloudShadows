@@ -11,6 +11,14 @@ a shadow mask to the game's sunlight pass. Fallout's implementation uses
 dedicated capture draws; it does not have Skyrim's zero-additional-capture-draw
 property. Volumetric godray occlusion is not included in the release build.
 
+Desktop and VR keep the projection origin fixed during nearby movement, then
+re-anchor it after travelling more than 1.5 cloud heights horizontally or half
+a cloud height vertically. The transition blends over four seconds. At the
+default 10,000-unit height, those distances are about 214 m and 71 m. This bounds
+travel drift; the projection is still an approximation between re-anchors.
+Fog does not disable cloud shadows on terrain and objects, but the fog itself
+does not receive cloud occlusion. Dense fog or weak sunlight can hide the effect.
+
 ## Requirements and runtime targets
 
 | Runtime | Game version | Script extender |
@@ -79,6 +87,12 @@ to uninstall it.
 
 ## Compatibility and current validation
 
+- Fallout 4 Community Shaders (`FO4CommunityShaders.dll`): coexistence is not
+  supported or validated. Our current startup exclusion check uses the older
+  `CommunityShaders.dll` name and does not block this DLL. Replaced sky or
+  sunlight shaders and shared renderer hooks can prevent cloud shadows or
+  conflict with rendering; the result depends on enabled features and load
+  order. Loading both successfully is not evidence of compatibility.
 - ENB: if ENB's cloud shadows are enabled at startup, this plugin stays inactive.
   Set `[EFFECT] EnableCloudShadows=false` in `enbseries.ini` and restart the game
   to use this implementation.

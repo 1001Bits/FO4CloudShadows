@@ -595,16 +595,12 @@ bool SampleShellAtOrigin(float3 receiverAbsolute, float3 rayToSun,
 	return true;
 }
 
-// VR travel re-anchoring moves the world-fixed origin; for a few seconds the
-// field is also projected from the previous origin and blended out, so the
-// ground pattern dissolves into its new position instead of jumping. Flat
-// retains its confirmed world origin until a world/load reset.
+// Travel re-anchoring moves the world-fixed origin on desktop and VR. For a
+// few seconds the field is also projected from the previous origin and blended
+// out, so the ground pattern dissolves into its new position instead of jumping.
 float BlendPreviousOrigin(float3 receiverAbsolute, float3 rayToSun,
 	float4 geometry, float opacity)
 {
-#if !FO4CS_SHADER_VR
-	return opacity;
-#else
 	float previousWeight = saturate(ProjectionParams.y);
 	if (previousWeight <= 0.0)
 		return opacity;
@@ -614,7 +610,6 @@ float BlendPreviousOrigin(float3 receiverAbsolute, float3 rayToSun,
 			PreviousFieldOrigin.xyz, previousPoint, previousOpacity))
 		previousOpacity = 0.0;
 	return lerp(opacity, previousOpacity, previousWeight);
-#endif
 }
 
 float SampleCloudCoverage(

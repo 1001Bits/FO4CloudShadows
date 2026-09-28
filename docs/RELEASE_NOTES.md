@@ -1,4 +1,33 @@
-# Build 48c2784b65fcc7f0 — 28 September 2026
+# Build 9b9302cd6ecad960 — 28 September 2026
+
+The DLL reports version **1.0.0.0**. Its SHA-256 is
+`5B7D106B84994A7CAF07BE94426DD807258127A87EE62DFC3EFDFF88BC41BDB5`.
+
+- Enable the existing VR travel re-anchoring policy on all four supported
+  desktop runtimes. Read the authenticated main-view GPU camera asynchronously
+  about twice per second, instead of retaining the first origin until a reset.
+- Re-anchor after more than 1.5 cloud heights of horizontal travel or half a
+  cloud height vertically, and blend from the previous projection for four
+  seconds. At the default height these are about 214 m and 71 m. Nearby movement
+  keeps the current anchor; this bounds travel drift rather than providing
+  continuous camera-centred cloud alignment.
+- Send the previous-origin constants on desktop and enable the same shader
+  blend used by VR. Updating the CPU anchor alone would otherwise cause a jump.
+- Document fog behavior and the current unsupported FO4 Community Shaders
+  combination. The existing startup check still misses `FO4CommunityShaders.dll`;
+  this build does not add a new exclusion or compatibility policy.
+
+All 14 core checks pass. The GPU regression first failed against the old desktop
+shader, then passed with the fix; it verifies previous-origin blend weights on
+desktop and VR, production/diagnostic agreement, and clear-sky neutrality. Camera
+readback tests also cover a later desktop camera without a world reset.
+Developer tools and private profiling remain compiled off.
+
+Long-distance in-game visual testing and a joint FO4 Community Shaders run have
+not been performed for this build. Re-anchoring remains a periodic approximation;
+sky alignment can differ between re-anchors and during the four-second blend.
+
+# Previous build 48c2784b65fcc7f0 — 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `B448F162B7492DCCCB503D81BF735F668DB6B9C0A1CD37A0E982FE52EC97529A`.

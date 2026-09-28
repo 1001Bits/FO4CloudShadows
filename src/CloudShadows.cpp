@@ -3446,13 +3446,11 @@ namespace CloudShadows
         // NG/AE use c0.zw for NDC and have no c27; select the complete layout.
         const bool legacyDepthLayout =
             FO4CS::LayoutFor(FO4CS::RuntimeAPI::GetSingleton().Target()).legacyDepthProjection;
-        // All runtimes retain the field's world origin. Only VR crossfades
-        // travel re-anchors; flat retains its confirmed gameplay origin.
+        // Desktop and VR use the same travel re-anchor crossfade. Without
+        // these constants, a new CPU anchor would make the mask jump.
         XMFLOAT3 previousFieldOrigin{};
         float previousFieldWeight = 0.0f;
-        if (FO4CS::RuntimeAPI::GetSingleton().Target() ==
-                FO4CS::F4SECompat::RuntimeTarget::kVR)
-            (void)GetWorldCloudCrossfade(previousFieldOrigin, previousFieldWeight);
+        (void)GetWorldCloudCrossfade(previousFieldOrigin, previousFieldWeight);
         constants.ProjectionParams = {
             legacyDepthLayout ? 1.0f : 0.0f, previousFieldWeight, 0.0f, 0.0f
         };

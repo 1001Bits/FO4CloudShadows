@@ -1624,12 +1624,11 @@ namespace CloudShadows
             FO4CS::CrossfadeWeight(now - s_crossfadeStartTick,
                 FO4CS::ReanchorPolicy::kCrossfadeMilliseconds) <= 0.0f)
             CancelCrossfade();
-        // Once confirmed, VR samples the same exact b12 camera about twice a
-        // second so its world-fixed anchor can follow the player across long
-        // distances. Flat retains its confirmed world origin until a reset,
-        // so normal camera movement cannot shift terrain shadows.
-        if (confirmed && (!vr || (!s_mainViewCameraReadback.Pending() &&
-                now < s_nextAnchorReadbackTick)))
+        // All runtimes sample the exact main-view b12 camera about twice a
+        // second. Keep the anchor fixed during nearby movement, then use the
+        // shared travel threshold and crossfade to follow longer journeys.
+        if (confirmed && !s_mainViewCameraReadback.Pending() &&
+                now < s_nextAnchorReadbackTick)
             return true;
         FO4CS::MainViewCameraReadback::Point observed{};
         if (!s_mainViewCameraReadback.TryRead(context, enginePerFrame,
@@ -1671,7 +1670,7 @@ namespace CloudShadows
                 gameplayCamera.x, gameplayCamera.y, gameplayCamera.z);
             return true;
         }
-        if (vr && FO4CS::NeedsReanchor(
+        if (FO4CS::NeedsReanchor(
                 { s_projectionOrigin.x, s_projectionOrigin.y, s_projectionOrigin.z },
                 observed, g_settings.CloudHeight) &&
             s_confirmedProjectionOrigin.Reanchor(observed)) {

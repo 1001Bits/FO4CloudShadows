@@ -245,6 +245,9 @@ namespace
         Require(std::abs(observed[0] + 24913.4f) < 0.01f &&
             std::abs(observed[2] - 1995.33f) < 0.01f,
             "anchor uses the actual draw camera and D3D11.1 window, not a stale camera");
+        awaitResult(false, 0);
+        Require(observed == Readback::Point{100,200,300},
+            "desktop travel reads a later GPU camera without a world reset");
         readback.Reset();
         awaitResult(true, 2);
         Require(std::abs(observed[0] + 24913.4f) < 0.01f &&
@@ -1063,8 +1066,8 @@ float4 main() : SV_Target0 { return source.GetColor(); }
                 Require(moved[i] == 1.0f,
                     "a player travelling outside a stationary cloud patch becomes sunlit");
         }
-        if (vr) {
-            // Travel re-anchoring blends two projections of the same live
+        {
+            // Desktop and VR travel re-anchoring blend the same live
             // field. The current origin is far behind the player (clear sky
             // above the player from there); the previous origin is the
             // player's own position, directly under the stationary patch.
@@ -1077,7 +1080,7 @@ float4 main() : SV_Target0 { return source.GetColor(); }
                 frame[35] = camera;
             gpu.context->UpdateSubresource(b1.Get(), 0, nullptr, frame.data(), 0, 0);
             plugin[6] = { camera[0], camera[1], camera[2], 1 };
-            for (const float weight : { 0.0f, 0.5f, 1.0f }) {
+            for (const float weight : { 0.0f, 0.25f, 0.5f, 0.75f, 1.0f }) {
                 plugin[5] = { 0, weight, 0, 0 };
                 gpu.context->UpdateSubresource(b0.Get(), 0, nullptr, plugin.data(), 0, 0);
                 const auto blended = dispatch(shaders[0].Get());
