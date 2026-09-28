@@ -94,9 +94,12 @@ to uninstall it.
   CS file replacement or CS-side plugin changes. The standalone path remains
   available when CS is absent. Unknown cloud shader pairs or lighting layouts
   are rejected. Shader validation covers 128 combinations of contact shadows,
-  terrain shadows, wetness and water effects; final in-game validation of this
-  adapter is pending. This does not add cloud attenuation to fog, water surfaces
-  or other forward/volumetric lighting passes.
+  terrain shadows, wetness and water effects. A loaded exterior save on
+  1.11.240 with CS Screen Space Shadows enabled confirmed cloud capture, mask
+  dispatch and shadowed sunlight submissions, including recovery after a load
+  transition, with no errors in either plugin log. Full visual and combined
+  performance acceptance remain outstanding. This does not add cloud
+  attenuation to fog, water surfaces or other forward/volumetric lighting passes.
 - ENB: if ENB's cloud shadows are enabled at startup, this plugin stays inactive.
   Set `[EFFECT] EnableCloudShadows=false` in `enbseries.ini` and restart the game
   to use this implementation.

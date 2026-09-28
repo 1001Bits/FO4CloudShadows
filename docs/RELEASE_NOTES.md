@@ -1,4 +1,4 @@
-# Build 92c53ede901e26f1 — 28 September 2026
+# Build 92c53ede901e26f1 â€” 28 September 2026
 
 The DLL reports version **1.0.0.0**. Its SHA-256 is
 `F8AA5D17CE168ECF6FAC1DFC93CF9F76753DFE472F7FAE10829C59CE6113F916`.
@@ -24,8 +24,19 @@ unchanged ambient and output alpha, swizzles and operand modifiers. Local-light
 descriptors, unknown layouts, missing reflection and an occupied t47 are rejected.
 The stock 1,243-shader corpus retains its exact 138 directional matches.
 
-A new loaded-save run is still needed for visual and combined-performance
-acceptance. The adapter does not add cloud-shadow consumers to water surfaces,
+Live validation on Fallout 4 1.11.240 / F4SE 0.7.9 with FO4 CS 0.1.1 and its
+Screen Space Shadows feature enabled reached an exterior save. The log confirms
+authenticated CS cloud capture, a 1920x1080 shadow prepass and at least 15,000
+submitted shadowed sunlight draws, including recovery after a load transition.
+Neither plugin logged errors. One startup menu-device deferral and three
+cloud-field initialization/reset deferrals were followed by successful setup
+and rendering. The F11 menu also opened and saved settings during the run.
+Only our DLL was replaced; all 74 installed CS DLL/shader files remained
+byte-for-byte identical to the official 0.1.1 archive.
+
+This confirms the rendering path operates together in a loaded save; full
+visual and combined-performance acceptance remain outstanding. The adapter
+does not add cloud-shadow consumers to water surfaces,
 fog or volumetric/forward lighting. Source reference: Mute/northaxosky's FO4 CS
 commit `1a0439a01dabdbd1ad65b0dd9547160d6125b53e`; see THIRD_PARTY_NOTICES.md.
 
