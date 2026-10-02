@@ -1,3 +1,34 @@
+# Version 1.2 — 2 October 2026
+
+Build `dee0d873c05fab93`. The DLL reports version **1.2.0.0**. Its SHA-256 is
+`C2C2034A6171FEC4CAAF3EFAFEA3BB46037C8ACF3E88F10B91BCC0509C8E788D`.
+
+- Add **Weather specific cloud opacity**, off by default, with individual
+  opacity settings on the same 0–4 scale as Shadow opacity.
+- Add sliders for 12 vanilla outdoor weathers in MCM. F4SE Menu Framework also
+  lists DLC and mod weathers from the load order, marks the current weather,
+  and provides a Reset button for each override.
+- Blend opacity gradually during weather transitions, with additional smoothing
+  for sudden changes such as console-forced weather. Menu edits apply directly.
+- Store overrides in the user INI's `[Weather]` section. Weathers without an
+  override follow the global Shadow opacity. DLC and mod overrides can use
+  plugin names and local form IDs to remain stable across load-order changes.
+- Preserve weather settings when saving through the F11 development menu.
+- Avoid the newer Direct3D context query associated with a reported ENB
+  save-load crash. Wrapped contexts use the standard whole-buffer calls;
+  native Direct3D contexts retain support for constant-buffer ranges.
+- Fix missing cloud shadows behind a pass-through `d3d11.dll` proxy that returns
+  the native Windows graphics device, while retaining the ENB/ReShade guards.
+- Improve logging when an unsupported graphics interceptor prevents cloud
+  shader capture.
+- Correct the settings tooltip to show the default Shadow opacity of 1.0.
+
+Validation: the Release build and all 14 core checks pass, including binary
+version, F4SE metadata, weather settings and graphics-wrapper contracts.
+Weather gameplay behavior and the original tester's ENB crash fix still await
+confirmation. The preceding weather test build loaded on OG with ENB 0.501
+and registered its F4SE Menu Framework settings page successfully.
+
 # Version 1.1 — 28 September 2026
 
 Build `0c5f8ead508b2e31`. The DLL reports version **1.1.0.0**. Its SHA-256 is

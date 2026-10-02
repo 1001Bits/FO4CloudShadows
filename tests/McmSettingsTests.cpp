@@ -2,10 +2,13 @@
 #include "McmSettingsFile.h"
 #include "GodraysIntegration.h"
 #include "EnbCompat.h"
+#include "PluginWeatherScan.h"
+#include "WeatherOpacity.h"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <iostream>
 #include <set>
+#include <sstream>
 
 namespace Files = FO4CS::McmSettingsFile;
 namespace fs = std::filesystem;
@@ -128,6 +131,112 @@ int main(int argc, char** argv)
         fs::remove(user);
         Require(Files::Read(defaults, user) == Files::Values{}, "deleting overrides restores defaults");
 
+        {
+            Require(Files::CanonicalWeatherKey("Fallout4.esm|1ca7e4") == "1CA7E4" &&
+                Files::CanonicalWeatherKey("0x2b52a") == "02B52A" &&
+                Files::CanonicalWeatherKey("0300ABCD") == "0300ABCD" &&
+                Files::CanonicalWeatherKey(" DLCCoast.esm | abcd ") == "dlccoast.esm|00ABCD" &&
+                !Files::CanonicalWeatherKey("DLCCoast.esm|1000000") &&
+                !Files::CanonicalWeatherKey("|12") && !Files::CanonicalWeatherKey("xyz"),
+                "weather keys canonicalize and reject malformed IDs");
+            {
+                std::ofstream output(user, std::ios::binary);
+                output << "[CloudShadows]\r\nbWeatherOpacity=1\r\n[Weather]\r\n"
+                    "1ca7e4|25.0\r\nf2B52A=0.75\r\nDLCCoast.esm|abcd|0.5\r\n"
+                    "; kept comment\r\nnot a pairing\r\nf0F1033=oops\r\n";
+            }
+            // The shipped defaults' [Weather] values only feed MCM's display.
+            Require(WritePrivateProfileStringW(L"Weather", L"f1C8556", L"3.0", defaults.c_str()),
+                "write a default-layer weather");
+            const auto read = Files::Read(defaults, user);
+            const Files::WeatherOpacities expected{
+                { "1CA7E4", 4.0f }, { "02B52A", 0.75f }, { "dlccoast.esm|00ABCD", 0.5f } };
+            Require(read.weatherOpacity && read.weathers == expected,
+                "hand-written and MCM weather lines pair; malformed lines and defaults do not");
+            Files::Write(user, read);
+            Require(Files::ReadWeatherLines(user).front() == "1ca7e4|25.0",
+                "an unchanged weather set keeps hand-written lines as written");
+            auto edited = read;
+            edited.weathers["1CA7E4"] = 0.25f;
+            edited.weathers.erase("02B52A");
+            Files::Write(user, edited);
+            Require(Files::Read(defaults, user) == edited, "edited weather pairings round trip");
+            Require(GetPrivateProfileIntW(L"Weather", L"f2B52A", -1, user.c_str()) == -1,
+                "a removed pairing leaves no line behind");
+            const auto lines = Files::ReadWeatherLines(user);
+            Require(std::find(lines.begin(), lines.end(), "f1CA7E4=0.25") != lines.end() &&
+                std::find(lines.begin(), lines.end(), "1ca7e4|25.0") == lines.end(),
+                "edited pairings are written in MCM's key=value form");
+
+            auto file = edited;
+            file.weathers["0F1033"] = 2.0f;   // saved through MCM meanwhile
+            auto live = edited;
+            live.weathers["1CA7E4"] = 1.5f;   // changed in game
+            const auto merged = Files::Merge(file, live, edited);
+            Require(merged.weathers.at("0F1033") == 2.0f && merged.weathers.at("1CA7E4") == 1.5f,
+                "weather pairings merge per weather");
+            Require(Files::Difference(edited, merged, false).weathers &&
+                !Files::Difference(edited, merged, false).opacity, "weather edits are a weather change only");
+            WritePrivateProfileStringW(L"Weather", nullptr, nullptr, defaults.c_str());
+            fs::remove(user);
+        }
+
+        {
+            // A synthetic plugin: one master, a new and an overriding weather,
+            // a compressed record, a climate and an XXXX-sized region list.
+            const auto u32 = [](std::uint32_t value) { return std::string(reinterpret_cast<const char*>(&value), 4); };
+            const auto sub = [](std::string_view type, std::string_view data) {
+                const auto size = static_cast<std::uint16_t>(data.size());
+                return std::string(type) + std::string(reinterpret_cast<const char*>(&size), 2) + std::string(data);
+            };
+            const auto record = [&](std::string_view type, std::uint32_t formID, std::string data,
+                    std::uint32_t flags = 0) {
+                return std::string(type) + u32(static_cast<std::uint32_t>(data.size())) + u32(flags) +
+                    u32(formID) + std::string(8, '\0') + data;
+            };
+            const auto group = [&](std::string_view label, const std::string& records) {
+                return "GRUP" + u32(static_cast<std::uint32_t>(24 + records.size())) + std::string(label) +
+                    std::string(12, '\0') + records;
+            };
+            const auto entry = [&](std::uint32_t weather) { return u32(weather) + u32(30) + u32(0); };
+            std::string plugin = record("TES4", 0, sub("HEDR", std::string(12, '\0')) +
+                sub("MAST", std::string("Fallout4.esm\0", 13)) + sub("DATA", std::string(8, '\0')));
+            plugin += group("GMST", record("GMST", 0x01000900, sub("EDID", std::string("fIgnored\0", 9))));
+            plugin += group("WTHR",
+                record("WTHR", 0x01000801, sub("EDID", std::string("MyStormyWeather\0", 16))) +
+                record("WTHR", 0x0002B52A, sub("EDID", std::string("CommonwealthClear\0", 18))) +
+                record("WTHR", 0x01000802, std::string(16, 'z'), 0x00040000));
+            plugin += group("CLMT", record("CLMT", 0x01000810,
+                sub("EDID", std::string("MyClimate\0", 10)) + sub("WLST", entry(0x01000801) + entry(0x0002B52A))));
+            plugin += group("REGN", record("REGN", 0x01000820,
+                sub("XXXX", u32(12)) + "RDWT" + std::string(2, '\0') + entry(0x01000803)));
+            std::istringstream input(plugin);
+            const auto scan = FO4CS::PluginWeatherScan::Scan(input);
+            Require(scan && scan->masters == std::vector<std::string>{ "Fallout4.esm" } &&
+                scan->weathers.size() == 2 && scan->weathers[0].second == "MyStormyWeather" &&
+                scan->compressedSkipped == 1 &&
+                scan->references == std::vector<std::uint32_t>{ 0x01000801, 0x0002B52A, 0x01000803 },
+                "plugin scan reads masters, weather names and climate/region weather lists");
+            Require(FO4CS::PluginWeatherScan::KeyFor(*scan, "MyWeathers.esp", 0x01000801) == "myweathers.esp|000801" &&
+                FO4CS::PluginWeatherScan::KeyFor(*scan, "MyWeathers.esp", 0x0002B52A) == "02B52A",
+                "file form IDs map to plugin-local and Fallout4.esm keys");
+            std::istringstream notPlugin(std::string("not a plugin file at all, just text"));
+            Require(!FO4CS::PluginWeatherScan::Scan(notPlugin), "a non-plugin file is rejected");
+
+            namespace Weather = FO4CS::WeatherOpacity;
+            Require(Weather::TransitionWeight(0.0f) == 0.0f && Weather::TransitionWeight(1.0f) == 1.0f &&
+                Weather::TransitionWeight(0.5f) == 0.5f && Weather::TransitionWeight(0.1f) < 0.1f,
+                "weather transitions ease in and out");
+            Require(std::abs(Weather::Fade(1.0f, 0.0f, Weather::kFadeSeconds) - std::exp(-1.0f)) < 1e-5f &&
+                Weather::Fade(0.3f, 2.0f, 0.0f) == 0.3f,
+                "the weather fade approaches its target with the configured time constant");
+            float stepped = 1.0f;
+            for (int frame = 0; frame < 600; ++frame)
+                stepped = Weather::Fade(stepped, 0.0f, 1.0f / 60.0f);
+            Require(std::abs(stepped - Weather::Fade(1.0f, 0.0f, 10.0f)) < 1e-3f,
+                "the fade is independent of frame rate");
+        }
+
         const fs::path project = argv[1];
         const auto canonical = Files::Read(project / "config/MCM/FO4CloudShadows/settings.ini", user);
         Require(canonical == Files::Values{}, "shipped MCM and native defaults agree");
@@ -145,10 +254,17 @@ int main(int argc, char** argv)
         for (const auto& row : menu.at("content")) if (row.contains("id")) {
             Require(controls.insert(row.at("id").get<std::string>()).second, "unique MCM setting ids");
         }
-        const std::set<std::string> expectedControls{
-            "bEnabled:CloudShadows", "fOpacity:CloudShadows", "bHotkeys:CloudShadows" };
+        std::set<std::string> expectedControls{
+            "bEnabled:CloudShadows", "fOpacity:CloudShadows", "bHotkeys:CloudShadows",
+            "bWeatherOpacity:CloudShadows" };
+        for (const auto& weather : Files::kVanillaWeathers)
+            expectedControls.insert("f" + std::string(weather.key) + ":Weather");
         Require(controls == expectedControls,
-            "MCM exposes only the player controls and the Development menu switch");
+            "MCM exposes the player controls, the vanilla weather sliders and the Development menu switch");
+        for (const auto& weather : Files::kVanillaWeathers)
+            Require(GetPrivateProfileIntW(L"Weather", (L"f" + std::wstring(weather.key.begin(), weather.key.end())).c_str(),
+                -1, (project / "config/MCM/FO4CloudShadows/settings.ini").c_str()) == 1,
+                "every MCM weather slider has a shipped display default");
         Require(canonical.hotkeys == false, "hotkeys are off by default");
         FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(true);
         Require(!FO4CS::GodraysIntegration::IsCloudOcclusionEnabled(), "release refuses godray enable even from an old preference");

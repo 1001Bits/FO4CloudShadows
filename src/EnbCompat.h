@@ -94,14 +94,20 @@ namespace FO4CS::EnbCompat
     };
 
     // ENB identifies itself through its SDK exports, exactly as ENB's own
-    // ExamplePlugin does. Only ENBGetVersion, a constant getter, is called.
+    // ExamplePlugin does.
+    [[nodiscard]] inline bool IsEnbModule(HMODULE module) noexcept
+    {
+        return module && GetProcAddress(module, "ENBGetSDKVersion");
+    }
+
+    // Only ENBGetVersion, a constant getter, is called.
     [[nodiscard]] inline Detection Detect() noexcept
     {
         Detection result{};
         try {
             for (const wchar_t* name : { L"d3d11.dll", L"dxgi.dll" }) {
                 const HMODULE module = GetModuleHandleW(name);
-                if (!module || !GetProcAddress(module, "ENBGetSDKVersion"))
+                if (!IsEnbModule(module))
                     continue;
                 result.present = true;
                 using GetVersion_t = long (*)();

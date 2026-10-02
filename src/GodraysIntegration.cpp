@@ -9,6 +9,7 @@
 
 #include "CloudShadows.h"
 #include "EngineAPI.h"
+#include "GraphicsProxyCompat.h"
 #include "ShaderTools/DXBCPatch.h"
 #include "ShaderTools/DXBCPatcher.h"
 
@@ -745,7 +746,7 @@ namespace FO4CS::GodraysIntegration
             constants.geometryAndStrength = {
                 CloudShadows::g_settings.CloudHeight,
                 kPlanetRadiusWorld,
-                CloudShadows::g_settings.Opacity,
+                CloudShadows::EffectiveOpacity(),
                 1.0f
             };
             // Godrays run on flat only, where the cloud shell is centred on
@@ -1106,11 +1107,9 @@ namespace FO4CS::GodraysIntegration
             kCloudTextureSlot, 1, &state.previousT47);
         context->PSGetSamplers(
             kCloudSamplerSlot, 1, &state.previousS15);
-        ComPtr<ID3D11DeviceContext1> context1;
-        if (SUCCEEDED(context->QueryInterface(
-                __uuidof(ID3D11DeviceContext1),
-                reinterpret_cast<void**>(context1.GetAddressOf()))) &&
-            context1) {
+        ComPtr<ID3D11DeviceContext1> context1 =
+            FO4CS::GraphicsProxyCompat::NativeContext1(context);
+        if (context1) {
             context1->PSGetConstantBuffers1(
                 kCloudConstantBufferSlot, 1, &state.previousB13,
                 &state.previousB13FirstConstant,

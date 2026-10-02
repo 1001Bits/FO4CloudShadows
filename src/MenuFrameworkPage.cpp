@@ -3,7 +3,9 @@
 #include "MenuFrameworkPage.h"
 #include "McmSettings.h"
 #include "RuntimeAPI.h"
+#include "WeatherOpacity.h"
 
+#include <algorithm>
 #include <mutex>
 #include <type_traits>
 
@@ -31,6 +33,9 @@ namespace FO4CS::MenuFrameworkPage
             bool (*button)(const char*){};
             bool (*hovered)(int){};
             void (*tooltip)(const char*, ...){};
+            // Optional layout helpers for the weather list.
+            void (*sameLine)(float, float){};
+            void (*disabled)(const char*, ...){};
 
             bool Load(HMODULE module) noexcept
             {
@@ -42,6 +47,8 @@ namespace FO4CS::MenuFrameworkPage
                 // RegisterEvent is optional: without it the page still works
                 // and saves through Apply.
                 (void)bind(registerEvent, "RegisterEvent");
+                (void)bind(sameLine, "igSameLine");
+                (void)bind(disabled, "igTextDisabled");
                 return bind(addSection, "AddSectionItem") &&
                     bind(text, "igTextUnformatted") && bind(wrapped, "igTextWrapped") &&
                     bind(separator, "igSeparator") && bind(checkbox, "igCheckbox") &&
@@ -68,6 +75,62 @@ namespace FO4CS::MenuFrameworkPage
                 ui.tooltip("%s", help);
         }
 
+        void Note(const char* text)
+        {
+            if (ui.disabled)
+                ui.disabled("%s", text);
+            else
+                ui.wrapped("%s", text);
+        }
+
+        // Caller holds the mutex. Unpaired weathers show Shadow opacity and
+        // gain a pairing when moved; Reset removes it again.
+        void WeatherRow(const WeatherOpacity::Entry& weather, bool current)
+        {
+            const auto found = edited.weathers.find(weather.key);
+            const bool paired = found != edited.weathers.end();
+            float value = paired ? found->second : edited.opacity;
+            const auto label = weather.label + (current ? "  (current)" : "") + "##w" + weather.key;
+            if (ui.sliderFloat(label.c_str(), &value, 0.0f, 4.0f,
+                    paired ? "%.2f" : "%.2f (Shadow opacity)", 0)) {
+                edited.weathers[weather.key] = value;
+                edited = McmSettingsFile::Validate(edited);
+            }
+            const auto help = weather.plugin + " " + weather.key.substr(weather.key.find('|') + 1) +
+                (paired ? "" : "\nUntil you move this slider, the weather uses Shadow opacity.");
+            Tooltip(help.c_str());
+            if (paired) {
+                if (ui.sameLine)
+                    ui.sameLine(0.0f, -1.0f);
+                if (ui.button(("Reset##r" + weather.key).c_str()))
+                    edited.weathers.erase(weather.key);
+                Tooltip("Use Shadow opacity for this weather again.");
+            }
+        }
+
+        // Caller holds the mutex.
+        void WeatherSection()
+        {
+            ui.checkbox("Weather specific cloud opacity", &edited.weatherOpacity);
+            Tooltip("Each weather can use its own shadow opacity. The opacity fades gradually when "
+                "the weather changes. Weathers you have not changed use Shadow opacity. "
+                "Off by default.");
+            if (!edited.weatherOpacity)
+                return;
+            const auto current = WeatherOpacity::CurrentWeather();
+            const auto catalog = WeatherOpacity::Catalog();
+            if (!catalog) {
+                Note("Listing the weathers of your load order...");
+                return;
+            }
+            const bool currentListed = current.key.empty() || std::any_of(catalog->begin(),
+                catalog->end(), [&](const auto& entry) { return entry.key == current.key; });
+            if (!currentListed)
+                WeatherRow(current, true);
+            for (const auto& entry : *catalog)
+                WeatherRow(entry, entry.key == current.key);
+        }
+
         // Caller holds the mutex. Only the file is written; the render
         // thread's MCM poll applies it within two seconds, as for MCM itself.
         bool Save()
@@ -86,8 +149,9 @@ namespace FO4CS::MenuFrameworkPage
             original = edited;
             saveFailed = false;
             SPDLOG_INFO("[CloudShadows][MenuFramework] Settings saved: enabled={} opacity={:.2f} "
-                "developmentMenu={}",
-                edited.enabled, edited.opacity, edited.hotkeys);
+                "developmentMenu={} weatherOpacity={} weatherPairings={}",
+                edited.enabled, edited.opacity, edited.hotkeys,
+                edited.weatherOpacity, edited.weathers.size());
             return true;
         }
 
@@ -119,7 +183,9 @@ namespace FO4CS::MenuFrameworkPage
             // value finite and in range before it can be saved.
             if (ui.sliderFloat("Shadow opacity", &edited.opacity, 0.0f, 4.0f, "%.2f", 0))
                 edited = McmSettingsFile::Validate(edited);
-            Tooltip("Controls how strongly clouds dim direct sunlight. Default: 2.0.");
+            Tooltip("Controls how strongly clouds dim direct sunlight. Default: 1.0.");
+            ui.separator();
+            WeatherSection();
             ui.separator();
             ui.checkbox("Development menu##hotkeys", &edited.hotkeys);
             Tooltip("When enabled, close this menu and use:\n"

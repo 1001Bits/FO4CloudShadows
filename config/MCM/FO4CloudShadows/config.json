@@ -18,6 +18,110 @@
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
     },
     {
+      "id": "bWeatherOpacity:CloudShadows",
+      "type": "switcher",
+      "text": "Weather specific cloud opacity",
+      "help": "When enabled, each weather below uses its own shadow opacity, fading gradually as the weather changes. A weather you have not changed, and DLC or mod weathers, use Shadow opacity. F4SE Menu Framework also lists DLC and mod weathers. Off by default.",
+      "groupControl": 1,
+      "valueOptions": { "sourceType": "ModSettingBool" }
+    },
+    {
+      "id": "f02B52A:Weather",
+      "type": "slider",
+      "text": "    Clear",
+      "help": "Shadow opacity during clear weather (Fallout4.esm 02B52A). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1D670E:Weather",
+      "type": "slider",
+      "text": "    Clearest skies",
+      "help": "Shadow opacity during clearest skies weather (Fallout4.esm 1D670E). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1C8556:Weather",
+      "type": "slider",
+      "text": "    Overcast",
+      "help": "Shadow opacity during overcast weather (Fallout4.esm 1C8556). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1C3473:Weather",
+      "type": "slider",
+      "text": "    Foggy",
+      "help": "Shadow opacity during foggy weather (Fallout4.esm 1C3473). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1CC186:Weather",
+      "type": "slider",
+      "text": "    Misty",
+      "help": "Shadow opacity during misty weather (Fallout4.esm 1CC186). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1CD096:Weather",
+      "type": "slider",
+      "text": "    Misty rain",
+      "help": "Shadow opacity during misty rain weather (Fallout4.esm 1CD096). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1CA7E4:Weather",
+      "type": "slider",
+      "text": "    Rain",
+      "help": "Shadow opacity during rain weather (Fallout4.esm 1CA7E4). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f1C3D5E:Weather",
+      "type": "slider",
+      "text": "    Radstorm",
+      "help": "Shadow opacity during radstorm weather (Fallout4.esm 1C3D5E). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f0F1033:Weather",
+      "type": "slider",
+      "text": "    Glowing Sea overcast",
+      "help": "Shadow opacity during Glowing Sea overcast weather (Fallout4.esm 0F1033). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f10F781:Weather",
+      "type": "slider",
+      "text": "    Marsh overcast",
+      "help": "Shadow opacity during marsh overcast weather (Fallout4.esm 10F781). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f115C64:Weather",
+      "type": "slider",
+      "text": "    Goodneighbor",
+      "help": "Shadow opacity during Goodneighbor weather (Fallout4.esm 115C64). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "f12A18E:Weather",
+      "type": "slider",
+      "text": "    Sanctuary (pre-war)",
+      "help": "Shadow opacity during Sanctuary (pre-war) weather (Fallout4.esm 12A18E). Until you move this slider, the weather uses Shadow opacity.",
+      "groupCondition": 1,
+      "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
       "id": "bHotkeys:CloudShadows",
       "type": "switcher",
       "text": "Development menu",

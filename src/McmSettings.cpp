@@ -7,6 +7,7 @@
 #include "GodraysIntegration.h"
 #include "CloudComparison.h"
 #include "Utf8Path.h"
+#include "WeatherOpacity.h"
 
 #include <condition_variable>
 #include <mutex>
@@ -48,6 +49,8 @@ namespace FO4CS::McmSettings
             // Present for F11: merge with the file, keeping fields changed
             // elsewhere since `baseline` was applied.
             std::optional<McmSettingsFile::Values> baseline;
+            // F11 has no weather controls; its saves never touch them.
+            bool includeWeather = true;
         };
         struct Writer
         {
@@ -76,7 +79,7 @@ namespace FO4CS::McmSettings
                 }
                 values = McmSettingsFile::Merge(file, request.values, request.baseline);
             }
-            McmSettingsFile::Write(user, values);
+            McmSettingsFile::Write(user, values, true, request.includeWeather);
         }
 
         void WriterLoop() noexcept
@@ -190,9 +193,12 @@ namespace FO4CS::McmSettings
                 throw std::runtime_error("MCM settings changed during read; retrying");
             failedRead.reset();
             const auto changes = McmSettingsFile::Difference(saved, next, force);
-            if (changes.enabled || changes.opacity || changes.cloudHeight)
+            if (changes.enabled || changes.opacity || changes.cloudHeight ||
+                changes.weatherOpacity || changes.weathers)
                 ManualFpsLog::Stop();
             if (changes.opacity) CloudShadows::g_settings.Opacity = next.opacity;
+            if (changes.weatherOpacity || changes.weathers)
+                WeatherOpacity::Configure(next.weatherOpacity, next.weathers);
             if (changes.cloudHeight) CloudShadows::g_settings.CloudHeight = next.cloudHeight;
             if (changes.hotkeys)
                 CloudShadows::g_hotkeysEnabled.store(next.hotkeys, std::memory_order_release);
@@ -211,8 +217,10 @@ namespace FO4CS::McmSettings
             saved = next;
             lastRead = before;
             if (changes.Any())
-                SPDLOG_INFO("[CloudShadows][MCM] Applied saved preferences: enabled={} opacity={:.2f} cloudHeight={:.0f} hotkeys={}",
-                    next.enabled, next.opacity, next.cloudHeight, next.hotkeys);
+                SPDLOG_INFO("[CloudShadows][MCM] Applied saved preferences: enabled={} opacity={:.2f} cloudHeight={:.0f} hotkeys={} "
+                    "weatherOpacity={} weatherPairings={}",
+                    next.enabled, next.opacity, next.cloudHeight, next.hotkeys,
+                    next.weatherOpacity, next.weathers.size());
             return true;
         } catch (const std::exception& error) {
             static auto nextWarning = std::chrono::steady_clock::time_point{};
@@ -229,13 +237,17 @@ namespace FO4CS::McmSettings
     {
         try {
             // F11 saves player settings; diagnostic views stay session-only.
-            const auto values = McmSettingsFile::Validate({
+            auto values = McmSettingsFile::Validate({
                 ManualFpsLog::EnabledForSave(CloudShadows::g_shadowsEnabled.load(std::memory_order_acquire)),
                 CloudShadows::g_settings.Opacity, CloudShadows::g_settings.CloudHeight,
                 CloudShadows::g_hotkeysEnabled.load(std::memory_order_acquire) });
+            if (saved) {
+                values.weatherOpacity = saved->weatherOpacity;
+                values.weathers = saved->weathers;
+            }
             // Only fields changed in game since the last applied file win; the
             // writer merges them into whatever the file holds at write time.
-            (void)Queue({ values, saved });
+            (void)Queue({ values, saved, false });
             saved = values;
             lastRead.reset();
             failedRead.reset();

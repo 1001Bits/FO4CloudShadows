@@ -7,6 +7,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#include <string>
+#include <vector>
 
 #include <DirectXMath.h>
 #include <d3d11.h>
@@ -171,6 +173,26 @@ namespace FO4CS::EngineAPI
     [[nodiscard]] DirectX::XMFLOAT4 ReadCameraViewDirection(
         const State* state) noexcept;
     [[nodiscard]] SkyMode ReadSkyMode(const Sky* sky) noexcept;
+
+    // Sky::currentWeather, lastWeather and currentWeatherPct. Outside a
+    // transition `previous` is null and `fraction` is 1; during one the sky
+    // blends from `previous` (weight 1 - fraction) to `current`.
+    struct WeatherState
+    {
+        const void* current{};
+        const void* previous{};
+        float fraction{ 1.0f };
+    };
+    [[nodiscard]] bool ReadWeatherState(const Sky* sky, WeatherState& state) noexcept;
+
+    // A form's runtime ID and the file name of the plugin defining it (empty
+    // for forms created at runtime).
+    [[nodiscard]] bool ReadFormIdentity(const void* form,
+        std::uint32_t& formID, std::string& plugin) noexcept;
+
+    // Loaded plugin file names in load order: regular files, then light (ESL)
+    // files. Empty until the data handler has compiled its files.
+    [[nodiscard]] std::vector<std::string> ReadLoadedPluginNames() noexcept;
     [[nodiscard]] bool ReadVisibleSunDirection(
         const Sky* sky, DirectX::XMFLOAT3& direction) noexcept;
     [[nodiscard]] bool IsExteriorCell(const TESObjectCELL* cell) noexcept;

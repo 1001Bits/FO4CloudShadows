@@ -51,4 +51,8 @@ namespace FO4CS::RuntimeAddresses
     inline constexpr RuntimeRVA kWaterReflectionUpdateSymbol{
         0x007DBA50, 0x007EAD50, 0x007CA020, 0x007972D0, 0x007EAA40
     };
+    // TESDataHandler* slot, read by Papyrus Game.IsPluginInstalled.
+    inline constexpr RuntimeRVA kDataHandlerSymbol{
+        0x058CF080, 0x030E7100, 0x05930B50, 0x02E64E68, 0x030DC080
+    };
 }

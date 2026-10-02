@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-only
 #include "CpuStageProfiler.h"
 #include "CloudGeometryCapture.h"
+#include "GraphicsProxyCompat.h"
 
 #include <d3d11_1.h>
 #include <d3dcompiler.h>
@@ -252,7 +253,7 @@ float4 PS(Input i) : SV_Target0 {
                 FO4CS::CpuProfile::Scope cpuTiming(FO4CS::CpuProfile::Stage::CaptureSave);
                 context_->VSGetShader(&vs_, nullptr, &vsClasses_);
                 context_->PSGetShader(&ps_, nullptr, &psClasses_);
-                (void)context_->QueryInterface(IID_PPV_ARGS(&context1_));
+                context1_ = FO4CS::GraphicsProxyCompat::NativeContext1(context_);
                 if (context1_)
                     context1_->VSGetConstantBuffers1(0, 1, &cb_, &first_, &count_);
                 else

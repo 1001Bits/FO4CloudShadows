@@ -297,6 +297,74 @@ void TestGraphicsProxyCapture()
         "missing proxy device is harmless");
 }
 
+// Stands in for a graphics wrapper's context: any query is a failure, since a
+// wrapper's ID3D11DeviceContext1 reference counting cannot be trusted.
+class CountingWrapperContext final : public IUnknown
+{
+public:
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, void** destination) override
+    {
+        ++queries;
+        if (destination) *destination = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return 2; }
+    ULONG STDMETHODCALLTYPE Release() override { return 1; }
+    unsigned queries{};
+};
+
+void TestNativeContext1()
+{
+    namespace Compat = FO4CS::GraphicsProxyCompat;
+    CountingWrapperContext wrapper;
+    auto* wrapped = reinterpret_cast<ID3D11DeviceContext*>(static_cast<IUnknown*>(&wrapper));
+    Require(!Compat::IsNativeD3D11Object(wrapped) && !Compat::NativeContext1(wrapped) &&
+        wrapper.queries == 0, "a wrapper context is never queried for D3D11.1");
+
+    const HMODULE d3d11 = LoadLibraryW(L"d3d11.dll");
+    const auto create = d3d11 ? reinterpret_cast<PFN_D3D11_CREATE_DEVICE>(
+        GetProcAddress(d3d11, "D3D11CreateDevice")) : nullptr;
+    Microsoft::WRL::ComPtr<ID3D11Device> device;
+    Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
+    Require(create && SUCCEEDED(create(nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0, nullptr, 0,
+        D3D11_SDK_VERSION, device.GetAddressOf(), nullptr, context.GetAddressOf())),
+        "WARP device for the native-context contract");
+    Require(Compat::IsNativeD3D11Object(context.Get()) && Compat::NativeContext1(context.Get()),
+        "the runtime's own context keeps D3D11.1 constant-buffer ranges");
+    Require(!Compat::IsNativeD3D11Object(wrapped) && wrapper.queries == 0,
+        "the cached native vtable does not admit a wrapper");
+}
+
+void TestNativeDeviceBehindProxy()
+{
+    using FO4CS::GraphicsProxyCompat::AcceptNativeD3D11BehindProxy;
+    using Evidence = FO4CS::GraphicsProxyCompat::NativeDeviceEvidence;
+    constexpr Evidence passThrough{ .foreignD3D11Module = true,
+        .gameFacingDevice = true, .nativeDeviceObject = true };
+    static_assert(AcceptNativeD3D11BehindProxy(passThrough),
+        "a Present-only proxy returning the native device keeps shader capture");
+    auto variant = passThrough;
+    variant.foreignD3D11Module = false;
+    Require(!AcceptNativeD3D11BehindProxy(variant),
+        "without a proxy the native module already owns the d3d11.dll name");
+    variant = passThrough;
+    variant.enbModule = true;
+    Require(!AcceptNativeD3D11BehindProxy(variant),
+        "ENB never exposes the shared native vtable to capture");
+    variant = passThrough;
+    variant.reShadeModule = true;
+    Require(!AcceptNativeD3D11BehindProxy(variant),
+        "ReShade keeps its own unwrapped-device contract");
+    variant = passThrough;
+    variant.gameFacingDevice = false;
+    Require(!AcceptNativeD3D11BehindProxy(variant),
+        "a wrapper's nested inner native device cannot qualify");
+    variant = passThrough;
+    variant.nativeDeviceObject = false;
+    Require(!AcceptNativeD3D11BehindProxy(variant),
+        "a wrapped game device keeps the proxy as its only shader route");
+}
+
 void TestUpscaledSkyViewport()
 {
     using FO4CS::IsMainSkyViewport;
@@ -345,6 +413,8 @@ int main()
         TestRetirement();
         TestGraphicsProxyCapture();
         TestGraphicsDeviceIdentity();
+        TestNativeContext1();
+        TestNativeDeviceBehindProxy();
         TestUpscaledSkyViewport();
         std::cout << "PASS: cloud-frame publication, renderer retirement, graphics proxies and scaled Sky\n";
         return 0;

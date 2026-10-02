@@ -37,8 +37,8 @@ using Microsoft::WRL::ComPtr;
 #define DLLEXPORT __declspec(dllexport)
 
 #ifndef FO4CLOUDSHADOWS_VERSION_STR
-#define FO4CLOUDSHADOWS_VERSION_STR "1.1.0"
+#define FO4CLOUDSHADOWS_VERSION_STR "1.2.0"
 #endif
 #ifndef FO4CS_RELEASE_VERSION_STR
-#define FO4CS_RELEASE_VERSION_STR "1.1"
+#define FO4CS_RELEASE_VERSION_STR "1.2"
 #endif

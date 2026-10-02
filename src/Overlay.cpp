@@ -140,10 +140,8 @@ namespace Overlay
 				CaptureShader(&ID3D11DeviceContext::DSGetShader, ds_, dsClasses_, dsClassCount_);
 				CaptureShader(&ID3D11DeviceContext::CSGetShader, cs_, csClasses_, csClassCount_);
 
-				if (SUCCEEDED(context_->QueryInterface(
-						__uuidof(ID3D11DeviceContext1),
-						reinterpret_cast<void**>(context1_.GetAddressOf()))) &&
-					context1_) {
+				context1_ = FO4CS::GraphicsProxyCompat::NativeContext1(context_);
+				if (context1_) {
 					context1_->VSGetConstantBuffers1(
 						0, 1, vsConstantBuffer_.GetAddressOf(),
 						&vsFirstConstant_, &vsConstantCount_);

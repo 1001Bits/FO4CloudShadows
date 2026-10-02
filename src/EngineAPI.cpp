@@ -1,6 +1,7 @@
 #include "EngineAPI.h"
 #include "RuntimeAddresses.h"
 
+#include <algorithm>
 #include <limits>
 #include <cmath>
 #include <mutex>
@@ -319,6 +320,102 @@ namespace FO4CS::EngineAPI
         }
         return static_cast<SkyMode>(
             ReadField<std::uint32_t>(sky, offset));
+    }
+
+    bool ReadWeatherState(const Sky* sky, WeatherState& state) noexcept
+    {
+        state = {};
+        // Papyrus Weather.GetCurrentWeather/GetOutgoingWeather and
+        // GetCurrentWeatherTransition read +0x48, +0x50 and +0x360 (VR +0x350,
+        // the same 0x10-shorter tail as Sky::mode). Sky::UpdateWeather clears
+        // lastWeather and pins the fraction at 1 when a transition completes.
+        const std::size_t fractionOffset = RuntimeAPI::GetSingleton().Target() ==
+            RuntimeTarget::kVR ? 0x350 : 0x360;
+        if (!ValidateReadableField(sky, 0x48, 2 * sizeof(void*)) ||
+            !ValidateReadableField(sky, fractionOffset, sizeof(float)))
+            return false;
+        state.current = ReadField<const void*>(sky, 0x48);
+        state.previous = ReadField<const void*>(sky, 0x50);
+        const float fraction = ReadField<float>(sky, fractionOffset);
+        state.fraction = std::isfinite(fraction) ? std::clamp(fraction, 0.0f, 1.0f) : 1.0f;
+        return state.current != nullptr;
+    }
+
+    namespace
+    {
+        // TESFile::filename is char[0x104] at +0x70 on all five runtimes.
+        [[nodiscard]] bool ReadPluginFileName(const void* file, std::string& name) noexcept
+        {
+            name.clear();
+            if (!ValidateReadableField(file, 0x70, 0x104))
+                return false;
+            const auto* text = static_cast<const char*>(file) + 0x70;
+            name.assign(text, strnlen(text, 0x104));
+            return !name.empty();
+        }
+    }
+
+    bool ReadFormIdentity(const void* form, std::uint32_t& formID, std::string& plugin) noexcept
+    {
+        formID = 0;
+        plugin.clear();
+        try {
+            // TESForm: sourceFiles +0x08 -> { TESFile** data; uint32 size },
+            // formID +0x14. File 0 is the defining plugin (TESForm::GetFile).
+            if (!ValidateReadableField(form, 0x08, 0x10))
+                return false;
+            formID = ReadField<std::uint32_t>(form, 0x14);
+            const auto* files = ReadField<const void*>(form, 0x08);
+            if (files && ValidateReadableField(files, 0, 0x0C) &&
+                ReadField<std::int32_t>(files, 0x08) > 0) {
+                const auto* data = ReadField<const void* const*>(files, 0);
+                if (data && ValidateReadableField(data, 0, sizeof(void*)))
+                    (void)ReadPluginFileName(data[0], plugin);
+            }
+            return formID != 0;
+        } catch (...) {
+            plugin.clear();
+            return false;
+        }
+    }
+
+    std::vector<std::string> ReadLoadedPluginNames() noexcept
+    {
+        std::vector<std::string> names;
+        try {
+            static std::atomic<std::uintptr_t> cache{ 0 };
+            const auto* handler = ResolveIndirectObject<std::byte>(cache, kDataHandlerSymbol);
+            if (!handler)
+                return names;
+            const auto append = [&](const void* const* files, std::uint32_t count, std::uint32_t limit) {
+                if (!files || count == 0 || count > limit ||
+                    !ValidateReadableField(files, 0, count * sizeof(void*)))
+                    return;
+                std::string name;
+                for (std::uint32_t i = 0; i < count; ++i)
+                    if (ReadPluginFileName(files[i], name))
+                        names.push_back(name);
+            };
+            if (RuntimeAPI::GetSingleton().Target() == RuntimeTarget::kVR) {
+                // VR (no ESL): uint32 loadedModCount at +0xFC0, then an inline
+                // TESFile* loadedMods[0xFF] at +0xFC8.
+                if (ValidateReadableField(handler, 0xFC0, 0x08 + 0xFF * sizeof(void*)))
+                    append(reinterpret_cast<const void* const*>(handler + 0xFC8),
+                        ReadField<std::uint32_t>(handler, 0xFC0), 0xFF);
+                return names;
+            }
+            // Flat: compiled file BSTArrays { data +0, capacity +8, size +0x10 }
+            // at +0xFC0 (regular) and +0xFD8 (light).
+            if (!ValidateReadableField(handler, 0xFC0, 0x30))
+                return names;
+            append(ReadField<const void* const*>(handler, 0xFC0),
+                ReadField<std::uint32_t>(handler, 0xFD0), 0xFF);
+            append(ReadField<const void* const*>(handler, 0xFD8),
+                ReadField<std::uint32_t>(handler, 0xFE8), 0x1000);
+        } catch (...) {
+            names.clear();
+        }
+        return names;
     }
 
     bool ReadVisibleSunDirection(const Sky* sky,

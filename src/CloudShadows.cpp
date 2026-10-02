@@ -8,6 +8,8 @@
 #include "CloudComparison.h"
 #include "Overlay.h"
 #include "Utf8Path.h"
+#include "GraphicsProxyCompat.h"
+#include "WeatherOpacity.h"
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
 #include "ConstantBufferProbe.h"
 #endif
@@ -2925,10 +2927,8 @@ namespace CloudShadows
                 for (uint32_t i = 0; i < rawUAVs.size(); ++i)
                     unorderedAccess[i].Attach(rawUAVs[i]);
                 std::array<ID3D11Buffer*, 4> rawCBs{};
-                if (SUCCEEDED(context->QueryInterface(
-                        __uuidof(ID3D11DeviceContext1),
-                        reinterpret_cast<void**>(context1.GetAddressOf()))) &&
-                    context1) {
+                context1 = FO4CS::GraphicsProxyCompat::NativeContext1(context);
+                if (context1) {
                     context1->CSGetConstantBuffers1(
                         0, static_cast<UINT>(rawCBs.size()), rawCBs.data(),
                         constantFirst.data(), constantCount.data());
@@ -3210,6 +3210,11 @@ namespace CloudShadows
             logger->flush();
     }
 
+    float EffectiveOpacity() noexcept
+    {
+        return FO4CS::WeatherOpacity::Effective(g_settings.Opacity);
+    }
+
     bool Prepass()
     {
         FO4CS::CpuProfile::Scope cpuTotal(FO4CS::CpuProfile::Stage::ProjectionTotal);
@@ -3347,11 +3352,9 @@ namespace CloudShadows
         UINT enginePerCallConstantCount = 0;
         UINT engineStereoFirstConstant = 0;
         UINT engineStereoConstantCount = 0;
-        ComPtr<ID3D11DeviceContext1> activeContext1;
-        const bool hasConstantBufferRanges = SUCCEEDED(context->QueryInterface(
-            __uuidof(ID3D11DeviceContext1),
-            reinterpret_cast<void**>(activeContext1.GetAddressOf()))) &&
-            activeContext1;
+        const ComPtr<ID3D11DeviceContext1> activeContext1 =
+            FO4CS::GraphicsProxyCompat::NativeContext1(context);
+        const bool hasConstantBufferRanges = activeContext1 != nullptr;
         if (hasConstantBufferRanges) {
             activeContext1->PSGetConstantBuffers1(
                 12, 1, enginePerFrame.GetAddressOf(),
@@ -3523,7 +3526,7 @@ namespace CloudShadows
             ? g_cloudShadowCS
             : g_cloudShadowProductionCS;
         constants.ShadowParams = {
-            g_settings.Opacity, 1.0f,
+            EffectiveOpacity(), 1.0f,
             screenMaskEvidenceRequestId != 0 ? 1.0f : 0.0f,
             cloudTelemetryRequested ? 1.0f : 0.0f
         };

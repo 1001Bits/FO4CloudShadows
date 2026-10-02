@@ -201,6 +201,9 @@ namespace
     std::unordered_map<std::uintptr_t*, CreatePixelShaderFn> g_createPSOriginals;
     std::unordered_set<std::uintptr_t*> g_createVSOuterHooksObserved;
     std::unordered_set<std::uintptr_t*> g_createPSOuterHooksObserved;
+    // System32 d3d11.dll once the game-facing device shows that a game-folder
+    // d3d11.dll proxy returns it unwrapped (NoteGameFacingD3D11Device).
+    std::atomic<HMODULE> g_passThroughNativeD3D11{ nullptr };
 
     constexpr GUID kCreatePSRouteMarker{
         0xd10c70a4, 0x6b45, 0x4bf1,
@@ -335,6 +338,20 @@ namespace
         return module == verified;
     }
 
+    using FO4CS::GraphicsProxyCompat::NativeSystemD3D11Module;
+
+    [[nodiscard]] std::string ModulePathUtf8(HMODULE module) noexcept
+    {
+        wchar_t path[1024]{};
+        if (!module || !GetModuleFileNameW(module, path, 1024))
+            return "<unknown module>";
+        try {
+            return FO4CS::EnbCompat::ToUtf8(path);
+        } catch (...) {
+            return {};
+        }
+    }
+
     bool IsExecutableAddressInModule(
         std::uintptr_t address,
         const wchar_t* moduleName,
@@ -366,6 +383,13 @@ namespace
         const HMODULE expectedModule = GetModuleHandleW(moduleName);
         if (expectedModule && allocationModule == expectedModule)
             return true;
+        // Behind a pass-through proxy the native runtime is the implementation
+        // the game calls (NoteGameFacingD3D11Device).
+        if (const HMODULE passThrough =
+                g_passThroughNativeD3D11.load(std::memory_order_acquire);
+            passThrough && allocationModule == passThrough &&
+            std::wstring_view(moduleName) == L"d3d11.dll")
+            return true;
         // CS also hooks CreateVertexShader/CreatePixelShader. If it installed
         // first, keep its entry as our downstream; if it installed later, the
         // existing route remains untouched. Both orders call each owner once.
@@ -375,17 +399,9 @@ namespace
         // A ReShade DLL named d3d11.dll can wrap the real runtime. Shader
         // capture explicitly unwraps only ReShade, never an unknown/ENB device.
         if (std::wstring_view(moduleName) == L"d3d11.dll" &&
-            IsReShadeProxy(expectedModule)) {
-            wchar_t systemPath[MAX_PATH]{};
-            const UINT length = GetSystemDirectoryW(systemPath, MAX_PATH);
-            if (length && length < MAX_PATH) {
-                try {
-                    const auto nativePath = fs::path(systemPath) / L"d3d11.dll";
-                    if (allocationModule == GetModuleHandleW(nativePath.c_str()))
-                        return true;
-                } catch (...) { }
-            }
-        }
+            IsReShadeProxy(expectedModule) &&
+            allocationModule == NativeSystemD3D11Module())
+            return true;
         // No generic system-directory fallback: ENB wraps the device and
         // forwards Set/GetPrivateData to the wrapped device. Hooking the wrapped
         // device's shared system vtable as well made both routes point at ENB's
@@ -526,6 +542,42 @@ namespace
             }
         }
         return native;
+    }
+
+    // A game-folder d3d11.dll that returns the native device unwrapped leaves
+    // System32 d3d11.dll as the shader-creation implementation the game calls.
+    // Without this, the name-based check refused it as a foreign interceptor
+    // and no shader identity was captured (user report, 29 Sep 2026).
+    void NoteGameFacingD3D11Device(
+        ID3D11Device* device, bool gameFacing, const char* source) noexcept
+    {
+        if (!gameFacing || g_passThroughNativeD3D11.load(std::memory_order_acquire))
+            return;
+        const HMODULE proxy = GetModuleHandleW(L"d3d11.dll");
+        const HMODULE native = NativeSystemD3D11Module();
+        std::uintptr_t* vtable = nullptr;
+        if (!proxy || !native || !ReadValidatedComVTable(device, 15, &vtable))
+            return;
+        HMODULE owner = nullptr;
+        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            reinterpret_cast<LPCWSTR>(vtable[0]), &owner);
+        const FO4CS::GraphicsProxyCompat::NativeDeviceEvidence evidence{
+            .foreignD3D11Module = proxy != native,
+            .enbModule = FO4CS::EnbCompat::IsEnbModule(proxy),
+            .reShadeModule = IsReShadeProxy(proxy),
+            .gameFacingDevice = gameFacing,
+            .nativeDeviceObject = owner == native,
+        };
+        if (!FO4CS::GraphicsProxyCompat::AcceptNativeD3D11BehindProxy(evidence))
+            return;
+        if (!g_passThroughNativeD3D11.exchange(native, std::memory_order_acq_rel)) {
+            SPDLOG_INFO(
+                "[CloudShadows] d3d11.dll proxy {} returned the native device {} "
+                "via {}; shader capture uses {}",
+                ModulePathUtf8(proxy), static_cast<void*>(device), source,
+                ModulePathUtf8(native));
+        }
     }
 
     inline std::atomic<bool> g_createVSHookInstalled{ false };
@@ -1094,8 +1146,31 @@ namespace
         }
     };
 
+    // A refused interceptor on an auxiliary or wrapped inner device is expected
+    // (ENB). On the game's renderer device it means no shader identity and so
+    // no cloud shadows; the per-vtable INFO line hides that behind a proxy.
+    void ReportRendererShaderCaptureRefused(
+        ID3D11Device* requestedDevice, const char* method,
+        std::uintptr_t current, HMODULE owner) noexcept
+    {
+        if (!requestedDevice || requestedDevice !=
+                g_publishedRendererDevice.load(std::memory_order_acquire))
+            return;
+        static std::atomic<bool> logged{ false };
+        if (logged.exchange(true))
+            return;
+        SPDLOG_ERROR(
+            "[CloudShadows] Renderer device {} routes {} to {} in {}, which is not a "
+            "supported d3d11.dll implementation (d3d11.dll is {}); shader capture is "
+            "unavailable, so cloud shadows cannot be drawn",
+            static_cast<void*>(requestedDevice), method,
+            reinterpret_cast<const void*>(current), ModulePathUtf8(owner),
+            ModulePathUtf8(GetModuleHandleW(L"d3d11.dll")));
+    }
+
     bool InstallCreateVertexShaderHook(ID3D11Device* device, bool authoritative = true) noexcept
     {
+        ID3D11Device* const requestedDevice = device;
         const auto captureDevice = ShaderCaptureDevice(device);
         device = captureDevice.Get();
         // Auxiliary devices (created by overlays or the loader) must not
@@ -1123,6 +1198,7 @@ namespace
         bool routeDataFailed = false;
         bool installThunk = false;
         bool newerOuterHook = false;
+        bool refusedInterceptor = false;
         bool unsupportedInterceptor = false;
         bool hookReady = false;
         std::uintptr_t expectedCurrent = 0;
@@ -1144,6 +1220,7 @@ namespace
                     g_createVSOriginals.erase(vtable);
                     g_createVSOriginals.emplace(vtable, downstream);
                 } else {
+                    refusedInterceptor = true;
                     unsupportedInterceptor =
                         g_createVSOuterHooksObserved.insert(vtable).second;
                 }
@@ -1217,10 +1294,15 @@ namespace
             hookReady = false;
             SPDLOG_LOGGER_CALL(spdlog::default_logger_raw(), ShaderInterceptorLogLevel(),
                 "[CloudShadows] Unsupported pre-existing CreateVertexShader "
-                "interceptor at {} (owner={}); expected executable code in "
+                "interceptor at {} (owner={} {}); expected executable code in "
                 "d3d11.dll; hook left unchanged",
                 reinterpret_cast<const void*>(current),
-                static_cast<void*>(unsupportedOwner));
+                static_cast<void*>(unsupportedOwner),
+                ModulePathUtf8(unsupportedOwner));
+        }
+        if (refusedInterceptor) {
+            ReportRendererShaderCaptureRefused(
+                requestedDevice, "CreateVertexShader", current, unsupportedOwner);
         }
         reportAvailability(hookReady);
         return hookReady;
@@ -1305,6 +1387,7 @@ namespace
 
     bool InstallCreatePixelShaderHook(ID3D11Device* device, bool authoritative = true) noexcept
     {
+        ID3D11Device* const requestedDevice = device;
         const auto captureDevice = ShaderCaptureDevice(device);
         device = captureDevice.Get();
         // Auxiliary devices (created by overlays or the loader) must not
@@ -1331,6 +1414,7 @@ namespace
         bool routeDataFailed = false;
         bool installThunk = false;
         bool newerOuterHook = false;
+        bool refusedInterceptor = false;
         bool unsupportedInterceptor = false;
         bool hookReady = false;
         std::uintptr_t expectedCurrent = 0;
@@ -1352,6 +1436,7 @@ namespace
                     g_createPSOriginals.erase(vtable);
                     g_createPSOriginals.emplace(vtable, downstream);
                 } else {
+                    refusedInterceptor = true;
                     unsupportedInterceptor =
                         g_createPSOuterHooksObserved.insert(vtable).second;
                 }
@@ -1423,9 +1508,14 @@ namespace
             hookReady = false;
             SPDLOG_LOGGER_CALL(spdlog::default_logger_raw(), ShaderInterceptorLogLevel(),
                 "[CloudShadows] Unsupported pre-existing CreatePixelShader interceptor at {} "
-                "(owner={}); expected executable code in d3d11.dll; hook left unchanged",
+                "(owner={} {}); expected executable code in d3d11.dll; hook left unchanged",
                 reinterpret_cast<const void*>(current),
-                static_cast<void*>(unsupportedOwner));
+                static_cast<void*>(unsupportedOwner),
+                ModulePathUtf8(unsupportedOwner));
+        }
+        if (refusedInterceptor) {
+            ReportRendererShaderCaptureRefused(
+                requestedDevice, "CreatePixelShader", current, unsupportedOwner);
         }
         reportAvailability(hookReady);
         return hookReady;
@@ -1998,11 +2088,22 @@ namespace
         if (contextChanged) {
             CloudShadows::InvalidateShadowMaskState();
             SPDLOG_INFO("[CloudShadows] Main immediate context captured/updated: {}", (void*)context);
+            if (context && !FO4CS::GraphicsProxyCompat::IsNativeD3D11Object(context)) {
+                HMODULE owner = nullptr;
+                const auto* vtable = *reinterpret_cast<const std::uintptr_t* const*>(context);
+                GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                    reinterpret_cast<LPCWSTR>(vtable[0]), &owner);
+                SPDLOG_INFO("[Compatibility] Immediate context {} is a graphics wrapper ({}); "
+                    "D3D11.1 constant-buffer range calls are not used on it",
+                    (void*)context, ModulePathUtf8(owner));
+            }
         }
 
         const bool presentReady = swapChain && InstallPresentHook(
             swapChain, "RendererData maintenance", true);
 
+        NoteGameFacingD3D11Device(device, true, "RendererData");
         const bool createVertexShaderReady = InstallCreateVertexShaderHook(device);
         const bool createPixelShaderReady = InstallCreatePixelShaderHook(device);
         g_createVSHookInstalled.store(createVertexShaderReady, std::memory_order_release);
@@ -3550,6 +3651,19 @@ namespace
     static PFN_D3D11CreateDeviceAndSwapChain s_origCreateDeviceAndSwapChain = nullptr;
     static std::atomic<bool> s_createDeviceHooksInstalled{ false };
 
+    // ENB's D3D11CreateDeviceAndSwapChain creates its inner native device via
+    // its own hooked D3D11CreateDevice export; only the outermost call on a
+    // thread returns the device the caller actually receives.
+    thread_local uint32_t g_deviceCreationDepth = 0;
+    struct ScopedDeviceCreation
+    {
+        const bool outermost = g_deviceCreationDepth++ == 0;
+        ScopedDeviceCreation() = default;
+        ScopedDeviceCreation(const ScopedDeviceCreation&) = delete;
+        ScopedDeviceCreation& operator=(const ScopedDeviceCreation&) = delete;
+        ~ScopedDeviceCreation() { --g_deviceCreationDepth; }
+    };
+
     void CaptureCreatedD3DObjects(
         ID3D11Device* device,
         ID3D11DeviceContext* immediateContext) noexcept
@@ -3596,6 +3710,7 @@ namespace
             g_createVSHookInstalled.load(std::memory_order_acquire),
             g_createPSHookInstalled.load(std::memory_order_acquire));
 
+        const ScopedDeviceCreation creation;
         HRESULT ret = s_origCreateDeviceAndSwapChain(
             pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
             SDKVersion, pSwapChainDesc, ppSwapChain, ppDevice, pFeatureLevel,
@@ -3609,6 +3724,12 @@ namespace
 
         if (SUCCEEDED(ret)) {
             try {
+                // Decided before arming capture: the game's shaders follow
+                // immediately, before RendererData publishes the device.
+                NoteGameFacingD3D11Device(
+                    ppDevice ? *ppDevice : nullptr,
+                    creation.outermost && ppSwapChain && *ppSwapChain,
+                    "CreateDeviceAndSwapChain");
                 CaptureCreatedD3DObjects(
                     ppDevice ? *ppDevice : nullptr,
                     ppImmediateContext ? *ppImmediateContext : nullptr);
@@ -3646,6 +3767,7 @@ namespace
             g_createVSHookInstalled.load(std::memory_order_acquire),
             g_createPSHookInstalled.load(std::memory_order_acquire));
 
+        [[maybe_unused]] const ScopedDeviceCreation creation;
         HRESULT ret = s_origCreateDevice(
             pAdapter, DriverType, Software, Flags, pFeatureLevels, FeatureLevels,
             SDKVersion, ppDevice, pFeatureLevel, ppImmediateContext);
@@ -3988,7 +4110,7 @@ extern "C" DLLEXPORT constinit FO4CS::F4SECompat::PluginVersionData
 F4SEPlugin_Version = []() constexpr {
     FO4CS::F4SECompat::PluginVersionData v{};
     v.SetPluginName("FO4CloudShadows");
-    v.SetPluginVersion({ 1, 1, 0, 0 });
+    v.SetPluginVersion({ 1, 2, 0, 0 });
     v.UsesSignatureScanning(false);
     // F4SE checks for an installed database when these bits are set, before
     // calling Load. Built-in addresses use the explicit version list below.

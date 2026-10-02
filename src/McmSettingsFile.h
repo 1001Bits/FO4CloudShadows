@@ -6,16 +6,121 @@
 #include <array>
 #include <charconv>
 #include <cmath>
+#include <cwchar>
+#include <cstdint>
+#include <cstdio>
 #include <filesystem>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
+#include <vector>
 
 namespace FO4CS::McmSettingsFile
 {
+    // Per-weather Shadow opacity (same 0-4 scale), keyed canonically:
+    //   "1CA7E4"               runtime form ID: Fallout4.esm weathers, or any
+    //                          weather by its full load-order form ID
+    //   "dlccoast.esm|00ABCD"  plugin plus local form ID: DLC and mod weathers,
+    //                          stable across load-order changes
+    // A weather without a pairing uses Shadow opacity.
+    using WeatherOpacities = std::map<std::string, float>;
+
+    inline constexpr std::size_t kMaxWeatherEntries = 1024;
+
+    // The outdoor weathers of Fallout4.esm's climates and regions, listed in
+    // MCM (which cannot enumerate forms) and first in the Menu Framework page.
+    struct VanillaWeather
+    {
+        std::string_view key, editorId, label;
+    };
+    inline constexpr std::array<VanillaWeather, 12> kVanillaWeathers{ {
+        { "02B52A", "CommonwealthClear", "Clear" },
+        { "1D670E", "CommonwealthClearestSkies", "Clearest skies" },
+        { "1C8556", "CommonwealthOvercast", "Overcast" },
+        { "1C3473", "CommonwealthFoggy", "Foggy" },
+        { "1CC186", "CommonwealthMisty", "Misty" },
+        { "1CD096", "CommonwealthMistyRainy", "Misty rain" },
+        { "1CA7E4", "CommonwealthRain", "Rain" },
+        { "1C3D5E", "CommonwealthGSRadstorm", "Radstorm" },
+        { "0F1033", "CommonwealthGSOvercast", "Glowing Sea overcast" },
+        { "10F781", "TCommonwealthMarshOvercast", "Marsh overcast" },
+        { "115C64", "GoodneighborWeatherBase", "Goodneighbor" },
+        { "12A18E", "CommonwealthSanctuaryClear", "Sanctuary (pre-war)" },
+    } };
+
+    [[nodiscard]] inline std::string FormatWeatherKey(std::string_view plugin, std::uint32_t id)
+    {
+        std::array<char, 16> hex{};
+        std::snprintf(hex.data(), hex.size(), plugin.empty() && id > 0xFFFFFFu ? "%08X" : "%06X", id);
+        return plugin.empty() ? std::string(hex.data()) : std::string(plugin) + "|" + hex.data();
+    }
+
+    // "1ca7e4", "Fallout4.esm|1CA7E4" or "DLCCoast.esm|abcd" to canonical form.
+    [[nodiscard]] inline std::optional<std::string> CanonicalWeatherKey(std::string_view text)
+    {
+        const auto trim = [](std::string_view value) {
+            while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+            while (!value.empty() && (value.back() == ' ' || value.back() == '\t')) value.remove_suffix(1);
+            return value;
+        };
+        text = trim(text);
+        std::string plugin;
+        std::string_view hex = text;
+        if (const auto bar = text.rfind('|'); bar != std::string_view::npos) {
+            const auto name = trim(text.substr(0, bar));
+            if (name.empty() || name.size() > 260) return std::nullopt;
+            for (const char c : name) {
+                if (static_cast<unsigned char>(c) < 0x20 || c == '|' || c == '=' || c == '[' || c == ']')
+                    return std::nullopt;
+                plugin.push_back(c >= 'A' && c <= 'Z' ? static_cast<char>(c - 'A' + 'a') : c);
+            }
+            hex = trim(text.substr(bar + 1));
+        }
+        if (hex.size() > 2 && hex[0] == '0' && (hex[1] == 'x' || hex[1] == 'X')) hex.remove_prefix(2);
+        std::uint32_t id = 0;
+        if (hex.empty() || hex.size() > 8) return std::nullopt;
+        const auto parsed = std::from_chars(hex.data(), hex.data() + hex.size(), id, 16);
+        if (parsed.ec != std::errc{} || parsed.ptr != hex.data() + hex.size()) return std::nullopt;
+        // Fallout4.esm always loads first, so its local IDs are runtime IDs.
+        if (plugin == "fallout4.esm") plugin.clear();
+        if (!plugin.empty() && id > 0xFFFFFFu) return std::nullopt;
+        return FormatWeatherKey(plugin, id);
+    }
+
+    // One [Weather] line: "f<key>=<value>" (MCM's typed float setting) or the
+    // hand-written "<key>|<value>". Comments, blanks and malformed lines: none.
+    [[nodiscard]] inline std::optional<std::pair<std::string, float>> ParseWeatherLine(std::string_view line)
+    {
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) line.remove_prefix(1);
+        if (line.empty() || line.front() == ';' || line.front() == '#') return std::nullopt;
+        std::string_view key, value;
+        if (const auto equals = line.find('='); equals != std::string_view::npos) {
+            key = line.substr(0, equals);
+            if (key.empty() || (key.front() != 'f' && key.front() != 'F')) return std::nullopt;
+            key.remove_prefix(1);
+            value = line.substr(equals + 1);
+        } else if (const auto bar = line.rfind('|'); bar != std::string_view::npos) {
+            key = line.substr(0, bar);
+            value = line.substr(bar + 1);
+        } else {
+            return std::nullopt;
+        }
+        while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.remove_prefix(1);
+        while (!value.empty() && (value.back() == ' ' || value.back() == '\t' || value.back() == '\r')) value.remove_suffix(1);
+        float number{};
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), number);
+        if (value.empty() || parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+            !std::isfinite(number))
+            return std::nullopt;
+        auto canonical = CanonicalWeatherKey(key);
+        if (!canonical) return std::nullopt;
+        return std::pair{ std::move(*canonical), number };
+    }
+
     struct Values
     {
         bool enabled = true;
@@ -23,15 +128,18 @@ namespace FO4CS::McmSettingsFile
         float cloudHeight = 10000.0f;
         // F10/F11 and FPS testing are off by default for normal players.
         bool hotkeys = false;
+        // Weather-specific opacity is off by default; pairings are kept while off.
+        bool weatherOpacity = false;
+        WeatherOpacities weathers;
         bool operator==(const Values&) const = default;
     };
 
     struct Changes
     {
-        bool enabled{}, opacity{}, cloudHeight{}, hotkeys{};
+        bool enabled{}, opacity{}, cloudHeight{}, hotkeys{}, weatherOpacity{}, weathers{};
         bool Any() const noexcept
         {
-            return enabled || opacity || cloudHeight || hotkeys;
+            return enabled || opacity || cloudHeight || hotkeys || weatherOpacity || weathers;
         }
     };
 
@@ -43,7 +151,9 @@ namespace FO4CS::McmSettingsFile
         return { force || !previous || previous->enabled != next.enabled,
             force || !previous || previous->opacity != next.opacity,
             force || !previous || previous->cloudHeight != next.cloudHeight,
-            force || !previous || previous->hotkeys != next.hotkeys };
+            force || !previous || previous->hotkeys != next.hotkeys,
+            force || !previous || previous->weatherOpacity != next.weatherOpacity,
+            force || !previous || previous->weathers != next.weathers };
     }
 
     // F11 saves what the player changed in game since the file was last
@@ -59,6 +169,24 @@ namespace FO4CS::McmSettingsFile
         if (live.opacity != baseline->opacity) merged.opacity = live.opacity;
         if (live.cloudHeight != baseline->cloudHeight) merged.cloudHeight = live.cloudHeight;
         if (live.hotkeys != baseline->hotkeys) merged.hotkeys = live.hotkeys;
+        if (live.weatherOpacity != baseline->weatherOpacity) merged.weatherOpacity = live.weatherOpacity;
+        // Per weather, so one pairing edited in game keeps the others saved
+        // meanwhile through MCM.
+        if (live.weathers != baseline->weathers) {
+            std::vector<std::string> keys;
+            for (const auto& [key, value] : live.weathers) keys.push_back(key);
+            for (const auto& [key, value] : baseline->weathers) keys.push_back(key);
+            for (const auto& key : keys) {
+                const auto now = live.weathers.find(key);
+                const auto before = baseline->weathers.find(key);
+                const bool present = now != live.weathers.end();
+                if (present == (before != baseline->weathers.end()) &&
+                    (!present || now->second == before->second))
+                    continue;
+                if (present) merged.weathers[key] = now->second;
+                else merged.weathers.erase(key);
+            }
+        }
         return merged;
     }
 
@@ -80,10 +208,48 @@ namespace FO4CS::McmSettingsFile
             ? std::clamp(values.opacity, 0.0f, 4.0f) : Values{}.opacity;
         values.cloudHeight = std::isfinite(values.cloudHeight)
             ? std::clamp(values.cloudHeight, 10000.0f, 200000.0f) : Values{}.cloudHeight;
+        for (auto it = values.weathers.begin(); it != values.weathers.end();) {
+            if (!std::isfinite(it->second) || values.weathers.size() > kMaxWeatherEntries) {
+                it = values.weathers.erase(it);
+                continue;
+            }
+            it->second = std::clamp(it->second, 0.0f, 4.0f);
+            ++it;
+        }
         return values;
     }
 
-    inline void ReadLayer(const std::filesystem::path& path, Values& values)
+    // Raw [Weather] lines of one INI, as Win32 returns them.
+    [[nodiscard]] inline std::vector<std::string> ReadWeatherLines(const std::filesystem::path& path)
+    {
+        std::vector<wchar_t> buffer(32768);
+        const DWORD length = GetPrivateProfileSectionW(L"Weather", buffer.data(),
+            static_cast<DWORD>(buffer.size()), path.c_str());
+        if (length >= buffer.size() - 2) throw std::runtime_error("MCM [Weather] section is too large");
+        std::vector<std::string> lines;
+        for (const wchar_t* line = buffer.data(); *line; line += std::wcslen(line) + 1) {
+            const int size = WideCharToMultiByte(CP_UTF8, 0, line, -1, nullptr, 0, nullptr, nullptr);
+            std::string text(size > 0 ? static_cast<std::size_t>(size - 1) : 0, '\0');
+            if (size > 1)
+                WideCharToMultiByte(CP_UTF8, 0, line, -1, text.data(), size, nullptr, nullptr);
+            lines.push_back(std::move(text));
+        }
+        return lines;
+    }
+
+    // Later lines win, as when the same key is written twice.
+    [[nodiscard]] inline WeatherOpacities ParseWeathers(const std::vector<std::string>& lines)
+    {
+        WeatherOpacities weathers;
+        for (const auto& line : lines)
+            if (auto entry = ParseWeatherLine(line))
+                weathers[entry->first] = entry->second;
+        return weathers;
+    }
+
+    // Only the user layer contributes [Weather] pairings: the shipped defaults
+    // give MCM's sliders a displayed value, which must not pin a weather.
+    inline void ReadLayer(const std::filesystem::path& path, Values& values, bool readWeathers = false)
     {
         // Distinguish a missing override from an unreadable file. Otherwise a
         // sharing/access failure could silently reset the player's settings.
@@ -127,6 +293,15 @@ namespace FO4CS::McmSettingsFile
             if (*hotkeys != 0.0f && *hotkeys != 1.0f) throw std::runtime_error("MCM hotkeys must be 0 or 1");
             values.hotkeys = *hotkeys == 1.0f;
         }
+        if (const auto weatherOpacity = read(L"bWeatherOpacity")) {
+            if (*weatherOpacity != 0.0f && *weatherOpacity != 1.0f)
+                throw std::runtime_error("MCM weather opacity switch must be 0 or 1");
+            values.weatherOpacity = *weatherOpacity == 1.0f;
+        }
+        // A malformed hand-written weather line is skipped, not fatal: it must
+        // not discard the player's other settings.
+        if (readWeathers)
+            values.weathers = ParseWeathers(ReadWeatherLines(path));
         // Removed MCM diagnostic keys are intentionally ignored. An old saved
         // debug view must not activate an option the player can no longer see.
     }
@@ -135,11 +310,14 @@ namespace FO4CS::McmSettingsFile
     {
         Values values;
         ReadLayer(defaults, values);
-        ReadLayer(user, values);
+        ReadLayer(user, values, true);
         return Validate(values);
     }
 
-    inline void Write(const std::filesystem::path& path, Values values, bool overwrite = true)
+    // `includeWeather` false leaves bWeatherOpacity and [Weather] as saved:
+    // the F11 menu does not edit them.
+    inline void Write(const std::filesystem::path& path, Values values, bool overwrite = true,
+        bool includeWeather = true)
     {
         values = Validate(values);
         std::filesystem::create_directories(path.parent_path());
@@ -165,6 +343,40 @@ namespace FO4CS::McmSettingsFile
             write(L"fOpacity", decimal(values.opacity).c_str());
             write(L"fCloudHeight", decimal(values.cloudHeight).c_str());
             write(L"bHotkeys", values.hotkeys ? L"1" : L"0");
+            if (includeWeather)
+                write(L"bWeatherOpacity", values.weatherOpacity ? L"1" : L"0");
+            // Rewrite [Weather] only when its pairings change, so hand-written
+            // lines stay as written until the player edits a weather in game.
+            Values onFile;
+            const auto lines = includeWeather ? ReadWeatherLines(temporary) : std::vector<std::string>{};
+            onFile.weathers = ParseWeathers(lines);
+            if (includeWeather && Validate(std::move(onFile)).weathers != values.weathers) {
+                std::wstring block;
+                const auto append = [&block](std::string_view utf8) {
+                    const int size = MultiByteToWideChar(CP_UTF8, 0, utf8.data(),
+                        static_cast<int>(utf8.size()), nullptr, 0);
+                    std::wstring wide(static_cast<std::size_t>((std::max)(size, 0)), L'\0');
+                    if (size > 0)
+                        MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), wide.data(), size);
+                    block += wide;
+                    block.push_back(L'\0');
+                };
+                // Keep comments and anything else that is not a pairing.
+                for (const auto& line : lines)
+                    if (!ParseWeatherLine(line)) append(line);
+                for (const auto& [key, value] : values.weathers) {
+                    std::string line = "f" + key + "=";
+                    for (const wchar_t digit : decimal(value))
+                        line.push_back(static_cast<char>(digit));  // to_chars output is ASCII
+                    append(line);
+                }
+                block.push_back(L'\0');
+                const bool written = block.size() > 1
+                    ? WritePrivateProfileSectionW(L"Weather", block.c_str(), temporary.c_str())
+                    : WritePrivateProfileStringW(L"Weather", nullptr, nullptr, temporary.c_str());
+                if (!written)
+                    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "write MCM weather settings");
+            }
             // Remove obsolete controls when saving, preserving unrelated keys.
             for (const auto* key : { L"iCaptureMethod", L"iDebugView",
                     L"bIsolateCloud", L"fIsolationRadius" })

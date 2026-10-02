@@ -7,6 +7,7 @@
 #include "MainViewViewport.h"
 #include "CloudComparison.h"
 #include "AcceptanceRunner.h"
+#include "GraphicsProxyCompat.h"
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
 #include "ConstantBufferProbe.h"
 #endif
@@ -184,8 +185,9 @@ namespace CloudShadows
                 ComPtr<ID3D11Buffer> buffer;
                 UINT first = 0;
                 UINT count = 0;
-                ComPtr<ID3D11DeviceContext1> context1;
-                if (SUCCEEDED(context->QueryInterface(IID_PPV_ARGS(&context1))) && context1)
+                const ComPtr<ID3D11DeviceContext1> context1 =
+                    FO4CS::GraphicsProxyCompat::NativeContext1(context);
+                if (context1)
                     context1->VSGetConstantBuffers1(2, 1, buffer.GetAddressOf(), &first, &count);
                 else
                     context->VSGetConstantBuffers(2, 1, buffer.GetAddressOf());
@@ -1337,7 +1339,7 @@ namespace CloudShadows
         {
             if (DiagnosticConsumerActive())
                 return true;
-            if (!(g_settings.Opacity > 0.0f) || !g_dfLightPatcher.IsReady())
+            if (!(EffectiveOpacity() > 0.0f) || !g_dfLightPatcher.IsReady())
                 return false;
             XMFLOAT3 sun{};
             return FO4CS::EngineAPI::ReadVisibleSunDirection(

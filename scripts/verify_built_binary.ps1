@@ -4,7 +4,7 @@ param(
     [string]$BinaryPath,
     [Parameter(Mandatory)]
     [string]$DumpbinPath,
-    [string]$ExpectedVersion = "1.1.0.0",
+    [string]$ExpectedVersion = "1.2.0.0",
     [string]$EvidenceMarkerPath,
     [switch]$RequireReleaseFeatures
 )

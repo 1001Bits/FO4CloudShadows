@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
 #define DLLEXPORT __declspec(dllexport)
 
 #ifndef FO4CLOUDSHADOWS_VERSION_STR
-#define FO4CLOUDSHADOWS_VERSION_STR "1.1.0"
+#define FO4CLOUDSHADOWS_VERSION_STR "1.2.0"
 #endif
 #ifndef FO4CS_BUILD_ID
 #define FO4CS_BUILD_ID "untracked"
@@ -154,6 +154,9 @@ namespace CloudShadows
     // below the horizon, opacity is zero or the lighting patch is not ready,
     // and no explicit diagnostic consumer is active.
     bool CloudShadowsCanBeVisible() noexcept;
+    // Shadow opacity for this frame: g_settings.Opacity, or the current
+    // weather's opacity when weather-specific opacity is enabled.
+    [[nodiscard]] float EffectiveOpacity() noexcept;
 
     // Exact kMain render-target/subresource plus contained-viewport gate for
     // DFLight/prepass work. Sky has a separate kMainTemp contract below.
