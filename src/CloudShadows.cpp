@@ -3210,9 +3210,23 @@ namespace CloudShadows
             logger->flush();
     }
 
+    bool ShadowMaskMatchesBoundTarget(ID3D11DeviceContext* context) noexcept
+    {
+        if (!context || !g_cloudShadowTex)
+            return false;
+        ComPtr<ID3D11RenderTargetView> target;
+        context->OMGetRenderTargets(1, target.GetAddressOf(), nullptr);
+        uint32_t width = 0, height = 0;
+        if (!GetRTVExtent(target.Get(), width, height))
+            return false;
+        D3D11_TEXTURE2D_DESC mask{};
+        g_cloudShadowTex->GetDesc(&mask);
+        return mask.Width == width && mask.Height == height;
+    }
+
     float EffectiveOpacity() noexcept
     {
-        return FO4CS::WeatherOpacity::Effective(g_settings.Opacity);
+        return FO4CS::WeatherOpacity::Effective(g_settings.Opacity) * DaylightFactor();
     }
 
     bool Prepass()
@@ -3238,9 +3252,10 @@ namespace CloudShadows
         if (!TryReadExteriorFrame(viewToWorld, cameraPosition)) {
             return RejectPrepass(PrepassRejectReason::kExteriorFrame);
         }
-        // Night, zero opacity or no lighting patch: the mask would be
-        // exactly neutral, so skip the full-resolution dispatch. This is the
-        // expected state for half of all game time and is not logged.
+        // Night with its switch off, zero opacity or no lighting patch: the mask would be
+        // exactly neutral, so skip the full-resolution dispatch. Nightfall has
+        // normally closed BeginSwap's first gate already; this also covers a
+        // clear night sky, which draws no cloud to withdraw the field at.
         if (!CloudShadowsCanBeVisible())
             return false;
 

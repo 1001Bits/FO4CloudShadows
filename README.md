@@ -3,7 +3,15 @@
 Cloud Shadows adapts the Skyrim Community Shaders technique to Fallout 4. It
 captures the game's actual cloud geometry and textures and projects their
 coverage along the visible sun's direction, dimming direct sunlight beneath
-cloud cover and allowing it through gaps.
+cloud cover and allowing it through gaps. Shadows also fall on moonlit ground at
+night. The "Shadows at night" switch can instead fade them out at sunset and back
+in at sunrise, following the current climate, with nothing running in between.
+On desktop they also fall on water: sun highlights go out and the water's colour
+darkens. Water is unchanged in VR.
+
+Weather specific cloud opacity gives each weather its own strength. MCM's Current
+weather slider sets whichever weather is active, so it works with DLC and weather
+mods such as Vivid Weathers, which replace the vanilla weathers.
 
 The cloud map is a small cubemap. A compute pass reconstructs surface positions
 from scene depth, projects them into the world-anchored cloud field and supplies
@@ -99,7 +107,9 @@ to uninstall it.
   dispatch and shadowed sunlight submissions, including recovery after a load
   transition, with no errors in either plugin log. Full visual and combined
   performance acceptance remain outstanding. This does not add cloud
-  attenuation to fog, water surfaces or other forward/volumetric lighting passes.
+  attenuation to fog or other forward/volumetric lighting passes. FO4 CS 0.4.0
+  and later are not supported: their renamed lighting constants are rejected, so
+  ground shadows do not appear with them.
 - ENB: if ENB's cloud shadows are enabled at startup, this plugin stays inactive.
   Set `[EFFECT] EnableCloudShadows=false` in `enbseries.ini` and restart the game
   to use this implementation.

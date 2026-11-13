@@ -1070,6 +1070,7 @@ float4 main(uint id : SV_VertexID) : SV_Position {
 }
 
 #include "CommunityShaderAdapterTests.inl"
+#include "WaterSunAdapterTests.inl"
 
 int wmain(int argc, wchar_t** argv)
 {
@@ -1077,13 +1078,16 @@ int wmain(int argc, wchar_t** argv)
 	RunF4SECompatibilityTests(tests);
 	std::filesystem::path corpus;
 	std::filesystem::path communityCorpus;
+	std::filesystem::path waterCorpus;
 	if (argc != 1) {
 		if (argc != 3 || (std::wstring_view(argv[1]) != L"--corpus" &&
-			std::wstring_view(argv[1]) != L"--community-corpus")) {
-			std::cerr << "usage: FO4CloudShadowsShaderToolsTests [--corpus <DFLight/PS> | --community-corpus <directory>]\n";
+			std::wstring_view(argv[1]) != L"--community-corpus" &&
+			std::wstring_view(argv[1]) != L"--water-corpus")) {
+			std::cerr << "usage: FO4CloudShadowsShaderToolsTests [--corpus <DFLight/PS> | --community-corpus <directory> | --water-corpus <directory>]\n";
 			return 2;
 		}
 		if (std::wstring_view(argv[1]) == L"--corpus") corpus = argv[2];
+		else if (std::wstring_view(argv[1]) == L"--water-corpus") waterCorpus = argv[2];
 		else communityCorpus = argv[2];
 	}
 
@@ -1137,8 +1141,11 @@ int wmain(int argc, wchar_t** argv)
 	RunLifecycleTests(tests, device.Get(), fixture);
 	RunRecompiledCompositionTests(tests, device.Get(), context.Get(), patch, factorRegister);
 	RunCommunityCompositionTests(tests, device.Get(), context.Get(), patch, factorRegister);
+	RunWaterCompositionTests(tests, device.Get(), context.Get(), patch, factorRegister);
 	if (!communityCorpus.empty())
 		RunCommunityCorpusTests(tests, device.Get(), communityCorpus, patch, factorRegister);
+	if (!waterCorpus.empty())
+		RunWaterCorpusTests(tests, device.Get(), waterCorpus, patch, factorRegister);
 	if (!corpus.empty())
 		RunCorpusTests(tests, device.Get(), corpus, patch, factorRegister);
 

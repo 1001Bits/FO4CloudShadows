@@ -68,7 +68,8 @@ namespace SIE
 			// direct-only, 4/5 = flat-compatible unshadowed direct+environment;
 			// 6/7 = VR shadowed direct+environment, 8/9 = VR shadowed
 			// direct-only, 10 = VR unshadowed direct+environment;
-			// 11 = reflected FO4 CS direct-light colour substitution.
+			// 11 = reflected FO4 CS direct-light colour substitution;
+			// 12 = water surface sun colour.
 			uint32_t signatureVariant = 0;
 		};
 
@@ -103,6 +104,17 @@ namespace SIE
 		// calculations, preserving the original instructions and ambient addends.
 		static bool IsCommunitySunCandidate(const void* data, size_t size) noexcept;
 		static ID3DBlob* PatchCommunitySunShader(
+			ID3DBlob* source, const DXBCPatch& patch, uint32_t factorTempRegister,
+			SunShadowPatchInfo* outInfo = nullptr);
+
+		/// Water shaders compute one surface sun colour, used by both the specular
+		/// highlight and the sunlit surface term. Scales it by the cloud factor and
+		/// darkens the water's own colour down to kWaterShadowFloor under full
+		/// shadow; the shore blend and fog stay exact. Every other layout is
+		/// rejected and stays vanilla.
+		static constexpr float kWaterShadowFloor = 0.5f;
+		static bool IsWaterSunCandidate(const void* data, size_t size) noexcept;
+		static ID3DBlob* PatchWaterSunShader(
 			ID3DBlob* source, const DXBCPatch& patch, uint32_t factorTempRegister,
 			SunShadowPatchInfo* outInfo = nullptr);
 

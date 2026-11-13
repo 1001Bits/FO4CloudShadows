@@ -71,6 +71,11 @@ namespace SIE
 			uint32_t pixelDescriptor,
 			ID3D11PixelShader* vanillaPS) noexcept;
 
+		/// Acquire the replacement for a pixel shader bound during the engine's
+		/// Water technique, or nullptr when it stays vanilla. The caller must
+		/// Release a non-null result.
+		ID3D11PixelShader* AcquireWater(ID3D11PixelShader* vanillaPS) noexcept;
+
 		/// Record the DXBC hash for every PS the game creates, so we can later
 		/// diagnose why a given bound PS wasn't matched to our patched pool.
 		void RecordPSHash(ID3D11PixelShader* vanillaPS, uint64_t hash) noexcept;

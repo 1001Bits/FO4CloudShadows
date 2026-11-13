@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
 #define DLLEXPORT __declspec(dllexport)
 
 #ifndef FO4CLOUDSHADOWS_VERSION_STR
-#define FO4CLOUDSHADOWS_VERSION_STR "1.2.0"
+#define FO4CLOUDSHADOWS_VERSION_STR "1.3.0"
 #endif
 #ifndef FO4CS_BUILD_ID
 #define FO4CS_BUILD_ID "untracked"
@@ -150,13 +150,23 @@ namespace CloudShadows
         ID3D11DeviceContext* context,
         const CloudDrawCommand& command,
         CloudDrawReissue reissue) noexcept;
-    // False when nothing the capture could produce is visible: the sun is
-    // below the horizon, opacity is zero or the lighting patch is not ready,
-    // and no explicit diagnostic consumer is active.
+    // False when nothing the capture could produce is visible: it is night with
+    // "Shadows at night" off, opacity is zero or the lighting patch is not ready, and no explicit
+    // diagnostic consumer is active.
     bool CloudShadowsCanBeVisible() noexcept;
+    // With "Shadows at night" off: 1 by day, 0 at night, fading between them
+    // with the current climate's sun times (DaylightFade.h). Otherwise always 1,
+    // as when the climate cannot be read and for explicit diagnostic consumers,
+    // which work at any hour.
+    [[nodiscard]] float DaylightFactor() noexcept;
     // Shadow opacity for this frame: g_settings.Opacity, or the current
-    // weather's opacity when weather-specific opacity is enabled.
+    // weather's opacity when weather-specific opacity is enabled, faded out
+    // at night.
     [[nodiscard]] float EffectiveOpacity() noexcept;
+
+    // True when the screen mask covers exactly the bound render target. An
+    // out-of-range Load reads 0, which a consumer would show as full shadow.
+    [[nodiscard]] bool ShadowMaskMatchesBoundTarget(ID3D11DeviceContext* context) noexcept;
 
     // Exact kMain render-target/subresource plus contained-viewport gate for
     // DFLight/prepass work. Sky has a separate kMainTemp contract below.
@@ -455,6 +465,11 @@ namespace CloudShadows
     extern std::atomic<bool> g_shadowsEnabled;
     // Master switch for F10/F11 and the FPS test menu (default off).
     extern std::atomic<bool> g_hotkeysEnabled;
+    // MCM "Water shadows". Off leaves every water draw vanilla.
+    inline std::atomic<bool> g_waterShadowsEnabled{ true };
+    // MCM "Shadows at night". Off fades shadows out at sunset and stops their
+    // passes until sunrise.
+    inline std::atomic<bool> g_nightShadowsEnabled{ true };
 
     // Non-persistent diagnostic: an angular aperture around a real visible
     // cloud selected from the current camera direction. It deliberately does

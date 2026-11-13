@@ -1,3 +1,10 @@
+# Version 1.3 — 13 November 2026
+
+- Cloud shadows now darken water, except in VR.
+- New MCM switch for water shadows.
+- New MCM switch to turn off shadows at night.
+- New Current weather slider that also works with Vivid Weathers and other weather mods.
+
 # Version 1.2 — 2 October 2026
 
 Build `dee0d873c05fab93`. The DLL reports version **1.2.0.0**. Its SHA-256 is

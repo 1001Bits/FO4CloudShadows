@@ -185,6 +185,18 @@ namespace FO4CS::EngineAPI
     };
     [[nodiscard]] bool ReadWeatherState(const Sky* sky, WeatherState& state) noexcept;
 
+    // Sky::currentGameHour and the current climate's sun times, as TESClimate
+    // stores them: unsigned counts of ten game minutes.
+    struct SunClock
+    {
+        float hour{};
+        std::uint8_t sunriseBegin{};
+        std::uint8_t sunriseEnd{};
+        std::uint8_t sunsetBegin{};
+        std::uint8_t sunsetEnd{};
+    };
+    [[nodiscard]] bool ReadSunClock(const Sky* sky, SunClock& clock) noexcept;
+
     // A form's runtime ID and the file name of the plugin defining it (empty
     // for forms created at runtime).
     [[nodiscard]] bool ReadFormIdentity(const void* form,

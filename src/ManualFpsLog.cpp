@@ -29,6 +29,7 @@ namespace FO4CS::ManualFpsLog
                 const auto* camera = EngineAPI::GetWorldRootCamera();
                 if (!player || !EngineAPI::IsExteriorCell(player->parentCell) || !sky ||
                     EngineAPI::ReadSkyMode(sky) != EngineAPI::SkyMode::kFull ||
+                    !(CloudShadows::DaylightFactor() > 0.0f) ||
                     !tes || !tes->worldSpace || !camera) return false;
                 scene.world = tes->worldSpace; scene.camera = camera->world;
                 const auto& p = scene.camera.translate;
@@ -151,7 +152,7 @@ namespace FO4CS::ManualFpsLog
         if (eligible && !session.GetSnapshot().countdown) {
             if (!haveAnchor) { anchor = scene; haveAnchor = true; }
             else if (!SameView(anchor, scene)) {
-                if (IsAutomatic()) { Cancel("FPS test cancelled: camera or exterior changed"); return; }
+                if (IsAutomatic()) { Cancel("FPS test cancelled: camera, exterior or daylight changed"); return; }
                 Start(false); anchor = scene; haveAnchor = true;
                 message = "View changed; both averages were reset. Stand still to compare ON and OFF.";
                 eligible = false;

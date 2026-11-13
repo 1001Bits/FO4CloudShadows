@@ -153,6 +153,61 @@ int main(int argc, char** argv)
                 { "1CA7E4", 4.0f }, { "02B52A", 0.75f }, { "dlccoast.esm|00ABCD", 0.5f } };
             Require(read.weatherOpacity && read.weathers == expected,
                 "hand-written and MCM weather lines pair; malformed lines and defaults do not");
+            {
+                Require(read.waterShadows, "water shadows stay on when the user file does not mention them");
+                auto off = read;
+                off.waterShadows = false;
+                Require(Files::Difference(read, off, false).waterShadows &&
+                    !Files::Difference(read, read, false).Any(),
+                    "turning water shadows off is seen as a change, and nothing else is");
+                Require(!Files::Merge(read, off, read).waterShadows && Files::Merge(off, read, read).waterShadows == false,
+                    "an in-game water switch edit wins, and otherwise the saved value is kept");
+                const auto waterFile = user.parent_path() / L"water-switch.ini";
+                Files::Write(waterFile, off);
+                Require(!Files::Read(defaults, waterFile).waterShadows, "the water switch survives a save");
+                Files::Write(waterFile, read);
+                Require(Files::Read(defaults, waterFile).waterShadows, "the water switch turns back on");
+                Require(WritePrivateProfileStringW(L"CloudShadows", L"bWaterShadows", L"2", waterFile.c_str()),
+                    "write an invalid water switch");
+                bool rejected = false;
+                try {
+                    (void)Files::Read(defaults, waterFile);
+                } catch (const std::runtime_error&) {
+                    rejected = true;
+                }
+                Require(rejected, "a water switch other than 0 or 1 is rejected");
+                auto dark = read;
+                dark.nightShadows = false;
+                Require(Files::Difference(read, dark, false).nightShadows, "turning night shadows off is seen as a change");
+                Require(!Files::Merge(read, dark, read).nightShadows, "an in-game night switch edit wins");
+                Files::Write(waterFile, dark);
+                Require(!Files::Read(defaults, waterFile).nightShadows, "the night switch survives a save");
+                // Current weather slider. Only its own paths write the value, so a
+                // stale copy elsewhere can never read back as the player moving it.
+                auto moved = read;
+                moved.currentWeather = 0.25f;
+                Files::Write(waterFile, moved);
+                Require(Files::Read(defaults, waterFile).currentWeather == Files::Read(defaults, user).currentWeather,
+                    "ordinary saves do not write the Current weather slider");
+                Files::Write(waterFile, moved, true, true, true);
+                Require(Files::Read(defaults, waterFile).currentWeather == 0.25f, "the slider's own path writes it");
+                Files::Write(waterFile, read);
+                Require(Files::Read(defaults, waterFile).currentWeather == 0.25f, "a later ordinary save leaves it alone");
+                Require(Files::Merge(read, moved, read).currentWeather == 0.25f, "merging keeps a slider update");
+                Files::Values paired = read;
+                paired.opacity = 0.5f;
+                paired.weathers["vivid weathers - fo4.esp|004C68"] = 3.0f;
+                Require(Files::OpacityFor(paired, "vivid weathers - fo4.esp|004C68") == 3.0f &&
+                    Files::OpacityFor(paired, "02B52A") == paired.weathers.at("02B52A") &&
+                    Files::OpacityFor(paired, "vivid weathers - fo4.esp|004C67") == 0.5f,
+                    "the slider shows a weather's pairing, or Shadow opacity without one");
+                Require(!Files::SliderMoved(1.0f, 1.0004f) && Files::SliderMoved(1.0f, 0.95f),
+                    "a slider step counts as moving it, float formatting does not");
+                Files::Values wild = read;
+                wild.currentWeather = 9.0f;
+                Require(Files::Validate(wild).currentWeather == 4.0f, "the slider stays on the opacity scale");
+                std::filesystem::remove(waterFile);
+            }
             Files::Write(user, read);
             Require(Files::ReadWeatherLines(user).front() == "1ca7e4|25.0",
                 "an unchanged weather set keeps hand-written lines as written");
@@ -256,16 +311,24 @@ int main(int argc, char** argv)
         }
         std::set<std::string> expectedControls{
             "bEnabled:CloudShadows", "fOpacity:CloudShadows", "bHotkeys:CloudShadows",
-            "bWeatherOpacity:CloudShadows" };
+            "bWeatherOpacity:CloudShadows", "bWaterShadows:CloudShadows", "bNightShadows:CloudShadows",
+            "fCurrentWeather:CloudShadows" };
         for (const auto& weather : Files::kVanillaWeathers)
             expectedControls.insert("f" + std::string(weather.key) + ":Weather");
         Require(controls == expectedControls,
             "MCM exposes the player controls, the vanilla weather sliders and the Development menu switch");
+        for (const auto& row : menu.at("content")) if (row.contains("help")) {
+            const auto help = row.at("help").get<std::string>();
+            Require(!help.empty() && help.size() <= 64 && help.back() == '.' && help.find('\n') == std::string::npos &&
+                help.find(". ") == std::string::npos, "every MCM help text is one sentence on one line");
+        }
         for (const auto& weather : Files::kVanillaWeathers)
             Require(GetPrivateProfileIntW(L"Weather", (L"f" + std::wstring(weather.key.begin(), weather.key.end())).c_str(),
                 -1, (project / "config/MCM/FO4CloudShadows/settings.ini").c_str()) == 1,
                 "every MCM weather slider has a shipped display default");
         Require(canonical.hotkeys == false, "hotkeys are off by default");
+        Require(canonical.waterShadows, "water shadows are on by default");
+        Require(canonical.nightShadows, "shadows at night are on by default");
         FO4CS::GodraysIntegration::SetCloudOcclusionEnabled(true);
         Require(!FO4CS::GodraysIntegration::IsCloudOcclusionEnabled(), "release refuses godray enable even from an old preference");
         Require(!FO4CS::GodraysIntegration::TryInstall(FO4CS::F4SECompat::RuntimeTarget::kLegacy), "release does not install a godray hook");

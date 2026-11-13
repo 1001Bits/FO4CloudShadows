@@ -22,6 +22,8 @@ namespace FO4CS::McmSettings
         // Serializes writers of the user INI.
         std::mutex writeMutex;
         std::optional<McmSettingsFile::Values> saved;
+        // The Current weather slider's value as last read or written here.
+        std::optional<float> shownSlider;
         struct Stamp
         {
             fs::file_time_type time{};
@@ -51,6 +53,8 @@ namespace FO4CS::McmSettings
             std::optional<McmSettingsFile::Values> baseline;
             // F11 has no weather controls; its saves never touch them.
             bool includeWeather = true;
+            // Only the slider's own paths write fCurrentWeather.
+            bool includeSlider = false;
         };
         struct Writer
         {
@@ -79,7 +83,7 @@ namespace FO4CS::McmSettings
                 }
                 values = McmSettingsFile::Merge(file, request.values, request.baseline);
             }
-            McmSettingsFile::Write(user, values, true, request.includeWeather);
+            McmSettingsFile::Write(user, values, true, request.includeWeather, request.includeSlider);
         }
 
         void WriterLoop() noexcept
@@ -127,6 +131,29 @@ namespace FO4CS::McmSettings
         {
             std::lock_guard lock(writer.mutex);
             return writer.completed != writer.queued;
+        }
+
+        // Keeps the slider showing the active weather's opacity, so MCM opens on
+        // the right value after the weather changes.
+        void SyncCurrentWeatherSlider()
+        {
+            if (!saved || !saved->weatherOpacity)
+                return;
+            const auto key = WeatherOpacity::CurrentWeather().key;
+            if (key.empty())
+                return;
+            const float desired = McmSettingsFile::OpacityFor(*saved, key);
+            if (!McmSettingsFile::SliderMoved(saved->currentWeather, desired))
+                return;
+            const auto baseline = *saved;
+            saved->currentWeather = desired;
+            shownSlider = desired;
+            SPDLOG_INFO("[CloudShadows][MCM] Current weather slider now shows {:.2f} for {}", desired, key);
+            if (auto* logger = spdlog::default_logger_raw())
+                logger->flush();
+            Request request{ *saved, baseline, true };
+            request.includeSlider = true;
+            (void)Queue(std::move(request));
         }
     }
 
@@ -178,7 +205,10 @@ namespace FO4CS::McmSettings
             if (!force && WriteInFlight())
                 return true;
             const std::array before{ Inspect(defaults), Inspect(user) };
-            if (!force && lastRead && *lastRead == before) return true;
+            if (!force && lastRead && *lastRead == before) {
+                SyncCurrentWeatherSlider();
+                return true;
+            }
             if (!force && failedRead && *failedRead == before) return false;
             McmSettingsFile::Values next;
             try {
@@ -192,14 +222,34 @@ namespace FO4CS::McmSettings
             if (before != std::array{ Inspect(defaults), Inspect(user) })
                 throw std::runtime_error("MCM settings changed during read; retrying");
             failedRead.reset();
+            // A slider value this code did not write is the player moving it. In
+            // menus with no weather there is nothing to apply it to, and the sync
+            // below puts the right value back.
+            const auto beforePairing = next;
+            bool paired = false;
+            if (shownSlider && next.weatherOpacity &&
+                McmSettingsFile::SliderMoved(*shownSlider, next.currentWeather)) {
+                const auto key = WeatherOpacity::CurrentWeather().key;
+                if (!key.empty()) {
+                    next.weathers[key] = next.currentWeather;
+                    paired = true;
+                    SPDLOG_INFO("[CloudShadows][MCM] Current weather slider: {} opacity {:.2f}",
+                        key, next.currentWeather);
+                }
+            }
+            shownSlider = next.currentWeather;
             const auto changes = McmSettingsFile::Difference(saved, next, force);
             if (changes.enabled || changes.opacity || changes.cloudHeight ||
-                changes.weatherOpacity || changes.weathers)
+                changes.weatherOpacity || changes.weathers || changes.waterShadows || changes.nightShadows)
                 ManualFpsLog::Stop();
             if (changes.opacity) CloudShadows::g_settings.Opacity = next.opacity;
             if (changes.weatherOpacity || changes.weathers)
                 WeatherOpacity::Configure(next.weatherOpacity, next.weathers);
             if (changes.cloudHeight) CloudShadows::g_settings.CloudHeight = next.cloudHeight;
+            if (changes.waterShadows)
+                CloudShadows::g_waterShadowsEnabled.store(next.waterShadows, std::memory_order_release);
+            if (changes.nightShadows)
+                CloudShadows::g_nightShadowsEnabled.store(next.nightShadows, std::memory_order_release);
             if (changes.hotkeys)
                 CloudShadows::g_hotkeysEnabled.store(next.hotkeys, std::memory_order_release);
             if (changes.enabled && CloudShadows::g_shadowsEnabled.exchange(next.enabled,
@@ -216,11 +266,18 @@ namespace FO4CS::McmSettings
             GodraysIntegration::SetCloudOcclusionEnabled(false);
             saved = next;
             lastRead = before;
+            if (paired) {
+                Request request{ next, beforePairing, true };
+                request.includeSlider = true;
+                (void)Queue(std::move(request));
+            } else {
+                SyncCurrentWeatherSlider();
+            }
             if (changes.Any())
                 SPDLOG_INFO("[CloudShadows][MCM] Applied saved preferences: enabled={} opacity={:.2f} cloudHeight={:.0f} hotkeys={} "
-                    "weatherOpacity={} weatherPairings={}",
+                    "weatherOpacity={} weatherPairings={} waterShadows={} nightShadows={}",
                     next.enabled, next.opacity, next.cloudHeight, next.hotkeys,
-                    next.weatherOpacity, next.weathers.size());
+                    next.weatherOpacity, next.weathers.size(), next.waterShadows, next.nightShadows);
             return true;
         } catch (const std::exception& error) {
             static auto nextWarning = std::chrono::steady_clock::time_point{};
@@ -244,6 +301,9 @@ namespace FO4CS::McmSettings
             if (saved) {
                 values.weatherOpacity = saved->weatherOpacity;
                 values.weathers = saved->weathers;
+                values.waterShadows = saved->waterShadows;
+                values.nightShadows = saved->nightShadows;
+                values.currentWeather = saved->currentWeather;
             }
             // Only fields changed in game since the last applied file win; the
             // writer merges them into whatever the file holds at write time.

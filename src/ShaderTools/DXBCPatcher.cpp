@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -914,6 +915,7 @@ namespace SIE
 	}
 
 	#include "CommunityShaderAdapter.inl"
+	#include "WaterSunAdapter.inl"
 
 	bool DXBCPatcher::IsSunShadowCandidate(const void* data, size_t size) noexcept
 	{

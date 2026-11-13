@@ -738,7 +738,8 @@ namespace
         kDFLight,
         kDFPrepass,
         kDFComposite,
-        kSky
+        kSky,
+        kWater
     };
 
     // BeginTechnique and immediate-context draws execute serially on the
@@ -752,6 +753,8 @@ namespace
         bool skyShadersAuthenticated{ false };
         ComPtr<ID3D11PixelShader> dfLightVanillaPS;
         ComPtr<ID3D11PixelShader> dfLightPatchedPS;
+        ComPtr<ID3D11PixelShader> waterVanillaPS;
+        ComPtr<ID3D11PixelShader> waterPatchedPS;
         ComPtr<ID3D11VertexShader> skyVertexShader;
         ComPtr<ID3D11PixelShader> skyPixelShader;
     };
@@ -1778,6 +1781,61 @@ namespace
         return s;
     }
 
+    static SwapState BeginWaterSwapUnchecked(ID3D11DeviceContext* ctx, SwapState& s)
+    {
+        // Water reuses the mask this frame's sunlight built, so it costs no
+        // extra pass. The mask holds the first opaque surface behind the water:
+        // cloud shadows are far larger than that distance. It is withdrawn at
+        // Present and whenever sunlight rejects it, so water fails to vanilla.
+        if (!CloudShadows::g_waterShadowsEnabled.load(std::memory_order_acquire) ||
+            g_internalDrawDepth != 0 || !IsCapturedImmediateContext(ctx) ||
+            !CloudShadows::g_shadowMaskValid.load(std::memory_order_acquire) ||
+            !CloudShadows::g_cloudShadowSRV)
+            return s;
+        if (!GetStaticBoundPixelShader(ctx, &s.vanillaPS))
+            return s;
+        auto& phase = g_techniqueState;
+        if (s.vanillaPS != phase.waterVanillaPS.Get()) {
+            phase.waterVanillaPS = s.vanillaPS;
+            phase.waterPatchedPS.Attach(
+                CloudShadows::g_dfLightPatcher.AcquireWater(s.vanillaPS));
+        }
+        if (!phase.waterPatchedPS || !CloudShadows::ShadowMaskMatchesBoundTarget(ctx))
+            return s;
+        s.patchedPS = phase.waterPatchedPS;
+        ctx->PSGetShaderResources(47, 1, &s.prevT47);
+        ID3D11ShaderResourceView* cloudSRV = CloudShadows::g_cloudShadowSRV;
+        ctx->PSSetShader(s.patchedPS.Get(), nullptr, 0);
+        ctx->PSSetShaderResources(47, 1, &cloudSRV);
+        s.swapped = true;
+        return s;
+    }
+
+    // As BeginSwap: an exception never reaches the driver entry, and a failure
+    // before the swap leaves the draw vanilla.
+    static SwapState BeginWaterSwap(ID3D11DeviceContext* ctx) noexcept
+    {
+        SwapState s;
+        try {
+            return BeginWaterSwapUnchecked(ctx, s);
+        } catch (...) {
+            LogHookException("Water shader swap");
+            return s;
+        }
+    }
+
+    static void RecordSubmittedWaterSwap(const SwapState& s) noexcept
+    {
+        if (!s.swapped)
+            return;
+        static std::atomic<uint64_t> submitted{ 0 };
+        const uint64_t n = submitted.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n == 1 || n == 100 || (n % 5000) == 0) {
+            SPDLOG_INFO("[CloudShadows] SUBMITTED water swap #{} vanillaPS={} patchedPS={}",
+                n, static_cast<void*>(s.vanillaPS), static_cast<void*>(s.patchedPS.Get()));
+        }
+    }
+
     static void RecordSubmittedSwap(const SwapState& s) noexcept
     {
         if (!s.swapped)
@@ -1868,6 +1926,25 @@ namespace
         }
 #else
         return *reinterpret_cast<const std::uintptr_t*>(shader);
+#endif
+    }
+
+    // BSShader::type at +0x18. Hundreds of techniques per frame: this comparison
+    // keeps every other shader away from the identity cache below.
+    constexpr std::int32_t kWaterShaderType = 10;
+
+    [[nodiscard]] std::int32_t ReadShaderType(void* shader) noexcept
+    {
+        if (!shader)
+            return -1;
+#if defined(_MSC_VER)
+        __try {
+            return *reinterpret_cast<const std::int32_t*>(static_cast<const std::byte*>(shader) + 0x18);
+        } __except (EXCEPTION_EXECUTE_HANDLER) {
+            return -1;
+        }
+#else
+        return *reinterpret_cast<const std::int32_t*>(static_cast<const std::byte*>(shader) + 0x18);
 #endif
     }
 
@@ -2218,8 +2295,10 @@ namespace
         // but that gate cannot identify VR's DFPrepass/DFComposite world-phase
         // boundaries. Classify exact VR FXP names broadly; shader identities
         // are cached so this does not reintroduce VirtualQuery per technique.
+        // VR binds cached shaders through its own path and is not patched for water.
+        const bool possibleWater = !vrTarget && ReadShaderType(shader) == kWaterShaderType;
         if (!vrTarget && !coarseDirectionalSun &&
-            !possibleSkyDescriptor) {
+            !possibleSkyDescriptor && !possibleWater) {
             return;
         }
 
@@ -2315,6 +2394,9 @@ namespace
                 boundPS->Release();
         } else if (isDFComposite) {
             phase.kind = TechniqueKind::kDFComposite;
+        } else if (possibleWater && fxp == "Water") {
+            if (!privateCapture && ownsImmediateContext)
+                phase.kind = TechniqueKind::kWater;
         } else if (fxp == "Sky") {
             // DFComposite can be absent on menu/weather paths. The first Sky
             // draw then opens exactly one capture epoch; later cloud layers
@@ -2986,6 +3068,7 @@ namespace CloudShadows
         return draw.enabled && draw.immediate &&
             (g_techniqueState.kind == TechniqueKind::kSky ||
              g_techniqueState.kind == TechniqueKind::kDFLight ||
+             g_techniqueState.kind == TechniqueKind::kWater ||
              FO4CS::GodraysIntegration::IsCloudOcclusionEnabled());
     }
 
@@ -2997,6 +3080,15 @@ namespace CloudShadows
         auto swap = BeginSwap(context);
         submit();
         RecordSubmittedSwap(swap);
+        EndSwap(context, swap);
+    }
+
+    template <class TSubmit>
+    void SubmitWithWaterSwap(ID3D11DeviceContext* context, TSubmit&& submit)
+    {
+        auto swap = BeginWaterSwap(context);
+        submit();
+        RecordSubmittedWaterSwap(swap);
         EndSwap(context, swap);
     }
 
@@ -3039,6 +3131,10 @@ namespace CloudShadows
             SubmitWithSunlightSwap(This, submit);
             return;
         }
+        if (draw.immediate && phase.kind == TechniqueKind::kWater) {
+            SubmitWithWaterSwap(This, submit);
+            return;
+        }
         submit();
     }
 
@@ -3077,6 +3173,10 @@ namespace CloudShadows
         if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
             phase.sunShaderValidated) {
             SubmitWithSunlightSwap(This, submit);
+            return;
+        }
+        if (draw.immediate && phase.kind == TechniqueKind::kWater) {
+            SubmitWithWaterSwap(This, submit);
             return;
         }
         submit();
@@ -3125,6 +3225,10 @@ namespace CloudShadows
             SubmitWithSunlightSwap(This, submit);
             return;
         }
+        if (draw.immediate && phase.kind == TechniqueKind::kWater) {
+            SubmitWithWaterSwap(This, submit);
+            return;
+        }
         submit();
     }
 
@@ -3167,6 +3271,10 @@ namespace CloudShadows
         if (draw.immediate && phase.kind == TechniqueKind::kDFLight &&
             phase.sunShaderValidated) {
             SubmitWithSunlightSwap(This, submit);
+            return;
+        }
+        if (draw.immediate && phase.kind == TechniqueKind::kWater) {
+            SubmitWithWaterSwap(This, submit);
             return;
         }
         submit();
@@ -4110,7 +4218,7 @@ extern "C" DLLEXPORT constinit FO4CS::F4SECompat::PluginVersionData
 F4SEPlugin_Version = []() constexpr {
     FO4CS::F4SECompat::PluginVersionData v{};
     v.SetPluginName("FO4CloudShadows");
-    v.SetPluginVersion({ 1, 2, 0, 0 });
+    v.SetPluginVersion({ 1, 3, 0, 0 });
     v.UsesSignatureScanning(false);
     // F4SE checks for an installed database when these bits are set, before
     // calling Load. Built-in addresses use the explicit version list below.

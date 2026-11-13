@@ -341,6 +341,30 @@ namespace FO4CS::EngineAPI
         return state.current != nullptr;
     }
 
+    bool ReadSunClock(const Sky* sky, SunClock& clock) noexcept
+    {
+        clock = {};
+        // Reviewed on all five runtimes (Sun::Update, Sky::GetSunriseEnd and
+        // Sky::GetSunsetBegin): Sky.currentClimate=40, Sky.currentGameHour=358
+        // (VR 348, the same 0x10-shorter tail as Sky::mode), TESClimate.data=80
+        // holding sunrise begin, sunrise end, sunset begin, sunset end.
+        constexpr std::size_t kClimateDataOffset = 0x80;
+        const std::size_t hourOffset = RuntimeAPI::GetSingleton().Target() ==
+            RuntimeTarget::kVR ? 0x348 : 0x358;
+        if (!ValidateReadableField(sky, 0x40, sizeof(void*)) ||
+            !ValidateReadableField(sky, hourOffset, sizeof(float)))
+            return false;
+        const auto* climate = ReadField<const void*>(sky, 0x40);
+        if (!ValidateReadableField(climate, kClimateDataOffset, 4))
+            return false;
+        clock.hour = ReadField<float>(sky, hourOffset);
+        clock.sunriseBegin = ReadField<std::uint8_t>(climate, kClimateDataOffset + 0);
+        clock.sunriseEnd = ReadField<std::uint8_t>(climate, kClimateDataOffset + 1);
+        clock.sunsetBegin = ReadField<std::uint8_t>(climate, kClimateDataOffset + 2);
+        clock.sunsetEnd = ReadField<std::uint8_t>(climate, kClimateDataOffset + 3);
+        return std::isfinite(clock.hour);
+    }
+
     namespace
     {
         // TESFile::filename is char[0x104] at +0x70 on all five runtimes.

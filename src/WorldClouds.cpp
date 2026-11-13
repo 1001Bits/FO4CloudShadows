@@ -7,6 +7,7 @@
 #include "MainViewViewport.h"
 #include "CloudComparison.h"
 #include "AcceptanceRunner.h"
+#include "DaylightFade.h"
 #include "GraphicsProxyCompat.h"
 #if FO4CS_ENABLE_DEVELOPER_TOOLS
 #include "ConstantBufferProbe.h"
@@ -147,6 +148,7 @@ namespace CloudShadows
         // frame and reused by its remaining cloud layers.
         enum class CaptureGate : uint8_t { kUnknown, kCapture, kSkip };
         CaptureGate s_captureGate = CaptureGate::kUnknown;
+        bool s_nightWithdrawn = false;
 
         // Deterministic resource failures are retried with backoff and
         // logged once per failure streak instead of on every Sky draw.
@@ -1346,6 +1348,49 @@ namespace CloudShadows
                        FO4CS::EngineAPI::GetSky(), sun) &&
                 sun.z > 0.0f;
         }
+
+        // Caller holds s_resourceMutex. Nightfall discards the published
+        // field, which closes BeginSwap's first gate: neither the capture nor
+        // the screen pass runs until a sky captured after dawn is published,
+        // so the first morning frame cannot show the evening's clouds.
+        void WithdrawFieldAtNightfall() noexcept
+        {
+            const bool night = !(DaylightFactor() > 0.0f);
+            if (night == s_nightWithdrawn)
+                return;
+            s_nightWithdrawn = night;
+            if (night) {
+                ResetCaptureProgress();
+                WithdrawResolvedFieldForRetry();
+            }
+            SPDLOG_INFO("[CloudShadows] {}", night
+                ? "Night: cloud shadows and capture stopped"
+                : "Day: cloud shadows and capture resumed");
+        }
+    }
+
+    float DaylightFactor() noexcept
+    {
+        try {
+            if (g_nightShadowsEnabled.load(std::memory_order_acquire) || DiagnosticConsumerActive())
+                return 1.0f;
+            FO4CS::EngineAPI::SunClock clock{};
+            const auto* sky = FO4CS::EngineAPI::GetSky();
+            if (!FO4CS::EngineAPI::ReadSunClock(sky, clock)) {
+                static std::atomic_bool logged{ false };
+                if (FO4CS::EngineAPI::ReadSkyMode(sky) == FO4CS::EngineAPI::SkyMode::kFull &&
+                    !logged.exchange(true)) {
+                    SPDLOG_WARN("[CloudShadows] Climate sun times unavailable; shadows stay on at night");
+                }
+                return 1.0f;
+            }
+            using namespace FO4CS::DaylightFade;
+            return Factor(clock.hour, {
+                HoursFromClimateCount(clock.sunriseBegin), HoursFromClimateCount(clock.sunriseEnd),
+                HoursFromClimateCount(clock.sunsetBegin), HoursFromClimateCount(clock.sunsetEnd) });
+        } catch (...) {
+            return 1.0f;
+        }
     }
 
     bool CloudShadowsCanBeVisible() noexcept
@@ -1379,6 +1424,7 @@ namespace CloudShadows
                     return false;
                 s_mainViewRenderedSincePresent = true;
                 if (s_captureGate == CaptureGate::kUnknown) {
+                    WithdrawFieldAtNightfall();
                     s_captureGate = CaptureCanBeVisible()
                         ? CaptureGate::kCapture : CaptureGate::kSkip;
                 }

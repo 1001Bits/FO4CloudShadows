@@ -1,7 +1,7 @@
 
 cmake_minimum_required(VERSION 3.25)
 
-project(FO4CloudShadows VERSION 1.2.0 LANGUAGES CXX)
+project(FO4CloudShadows VERSION 1.3.0 LANGUAGES CXX)
 
 set(FO4CS_RELEASE_VERSION "${PROJECT_VERSION_MAJOR}.${PROJECT_VERSION_MINOR}")
 if(NOT PROJECT_VERSION_PATCH EQUAL 0)
@@ -247,6 +247,15 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
     add_test(NAME world-cloud-anchor-contract COMMAND "$<TARGET_FILE:FO4CloudShadowsWorldAnchorTests>")
     set_tests_properties(world-cloud-anchor-contract PROPERTIES LABELS core TIMEOUT 30)
 
+    add_executable(FO4CloudShadowsDaylightFadeTests EXCLUDE_FROM_ALL
+        tests/DaylightFadeTests.cpp)
+    target_include_directories(FO4CloudShadowsDaylightFadeTests PRIVATE src)
+    target_compile_options(FO4CloudShadowsDaylightFadeTests PRIVATE /W4 /WX /utf-8 /permissive-)
+    set_target_properties(FO4CloudShadowsDaylightFadeTests PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/bin/$<CONFIG>")
+    add_test(NAME daylight-fade-contract COMMAND "$<TARGET_FILE:FO4CloudShadowsDaylightFadeTests>")
+    set_tests_properties(daylight-fade-contract PROPERTIES LABELS core TIMEOUT 30)
+
     add_executable(FO4CloudShadowsFrameRateTests EXCLUDE_FROM_ALL
         tests/FrameRateWindowTests.cpp)
     target_include_directories(FO4CloudShadowsFrameRateTests PRIVATE src)
@@ -374,6 +383,7 @@ if(BUILD_TESTING AND FO4CS_BUILD_TESTS)
     add_custom_target(fo4cs-tests DEPENDS
         FO4CloudShadowsMcmSettingsTests
         FO4CloudShadowsWorldAnchorTests
+        FO4CloudShadowsDaylightFadeTests
         FO4CloudShadowsFrameRateTests
         FO4CloudShadowsShaderToolsTests FO4CloudShadowsSkyCloudCompatibilityTests
         FO4CloudShadowsRendererTests FO4CloudShadowsGodraySettingsTests

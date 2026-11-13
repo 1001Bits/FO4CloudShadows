@@ -131,15 +131,23 @@ namespace FO4CS::McmSettingsFile
         // Weather-specific opacity is off by default; pairings are kept while off.
         bool weatherOpacity = false;
         WeatherOpacities weathers;
+        // Clouds also shade water on desktop.
+        bool waterShadows = true;
+        // Clouds also shade the moonlight. Off fades shadows out at sunset.
+        bool nightShadows = true;
+        // MCM's Current weather slider, shown for whichever weather is active.
+        // A change the plugin did not write itself becomes that weather's pairing.
+        float currentWeather = 1.0f;
         bool operator==(const Values&) const = default;
     };
 
     struct Changes
     {
-        bool enabled{}, opacity{}, cloudHeight{}, hotkeys{}, weatherOpacity{}, weathers{};
+        bool enabled{}, opacity{}, cloudHeight{}, hotkeys{}, weatherOpacity{}, weathers{}, waterShadows{}, nightShadows{};
         bool Any() const noexcept
         {
-            return enabled || opacity || cloudHeight || hotkeys || weatherOpacity || weathers;
+            return enabled || opacity || cloudHeight || hotkeys || weatherOpacity || weathers ||
+                waterShadows || nightShadows;
         }
     };
 
@@ -153,7 +161,9 @@ namespace FO4CS::McmSettingsFile
             force || !previous || previous->cloudHeight != next.cloudHeight,
             force || !previous || previous->hotkeys != next.hotkeys,
             force || !previous || previous->weatherOpacity != next.weatherOpacity,
-            force || !previous || previous->weathers != next.weathers };
+            force || !previous || previous->weathers != next.weathers,
+            force || !previous || previous->waterShadows != next.waterShadows,
+            force || !previous || previous->nightShadows != next.nightShadows };
     }
 
     // F11 saves what the player changed in game since the file was last
@@ -170,6 +180,9 @@ namespace FO4CS::McmSettingsFile
         if (live.cloudHeight != baseline->cloudHeight) merged.cloudHeight = live.cloudHeight;
         if (live.hotkeys != baseline->hotkeys) merged.hotkeys = live.hotkeys;
         if (live.weatherOpacity != baseline->weatherOpacity) merged.weatherOpacity = live.weatherOpacity;
+        if (live.waterShadows != baseline->waterShadows) merged.waterShadows = live.waterShadows;
+        if (live.nightShadows != baseline->nightShadows) merged.nightShadows = live.nightShadows;
+        if (live.currentWeather != baseline->currentWeather) merged.currentWeather = live.currentWeather;
         // Per weather, so one pairing edited in game keeps the others saved
         // meanwhile through MCM.
         if (live.weathers != baseline->weathers) {
@@ -202,8 +215,23 @@ namespace FO4CS::McmSettingsFile
         return migrated;
     }
 
+    // The opacity a weather uses: its pairing, or Shadow opacity.
+    [[nodiscard]] inline float OpacityFor(const Values& values, const std::string& key) noexcept
+    {
+        const auto found = values.weathers.find(key);
+        return found != values.weathers.end() ? found->second : values.opacity;
+    }
+
+    // Slider values pass through MCM's own float formatting.
+    [[nodiscard]] inline bool SliderMoved(float shown, float value) noexcept
+    {
+        return std::abs(shown - value) > 0.001f;
+    }
+
     inline Values Validate(Values values) noexcept
     {
+        values.currentWeather = std::isfinite(values.currentWeather)
+            ? std::clamp(values.currentWeather, 0.0f, 4.0f) : Values{}.currentWeather;
         values.opacity = std::isfinite(values.opacity)
             ? std::clamp(values.opacity, 0.0f, 4.0f) : Values{}.opacity;
         values.cloudHeight = std::isfinite(values.cloudHeight)
@@ -298,6 +326,17 @@ namespace FO4CS::McmSettingsFile
                 throw std::runtime_error("MCM weather opacity switch must be 0 or 1");
             values.weatherOpacity = *weatherOpacity == 1.0f;
         }
+        if (const auto waterShadows = read(L"bWaterShadows")) {
+            if (*waterShadows != 0.0f && *waterShadows != 1.0f)
+                throw std::runtime_error("MCM water shadows switch must be 0 or 1");
+            values.waterShadows = *waterShadows == 1.0f;
+        }
+        if (const auto slider = read(L"fCurrentWeather")) values.currentWeather = *slider;
+        if (const auto nightShadows = read(L"bNightShadows")) {
+            if (*nightShadows != 0.0f && *nightShadows != 1.0f)
+                throw std::runtime_error("MCM night shadows switch must be 0 or 1");
+            values.nightShadows = *nightShadows == 1.0f;
+        }
         // A malformed hand-written weather line is skipped, not fatal: it must
         // not discard the player's other settings.
         if (readWeathers)
@@ -314,10 +353,12 @@ namespace FO4CS::McmSettingsFile
         return Validate(values);
     }
 
-    // `includeWeather` false leaves bWeatherOpacity and [Weather] as saved:
-    // the F11 menu does not edit them.
+    // `includeWeather` false leaves bWeatherOpacity, bWaterShadows, bNightShadows
+    // and [Weather] as saved: the F11 menu does not edit them. fCurrentWeather is
+    // written only on request: any other writer could hold a stale value, which
+    // would read back as the player moving the slider.
     inline void Write(const std::filesystem::path& path, Values values, bool overwrite = true,
-        bool includeWeather = true)
+        bool includeWeather = true, bool includeSlider = false)
     {
         values = Validate(values);
         std::filesystem::create_directories(path.parent_path());
@@ -343,8 +384,13 @@ namespace FO4CS::McmSettingsFile
             write(L"fOpacity", decimal(values.opacity).c_str());
             write(L"fCloudHeight", decimal(values.cloudHeight).c_str());
             write(L"bHotkeys", values.hotkeys ? L"1" : L"0");
-            if (includeWeather)
+            if (includeSlider)
+                write(L"fCurrentWeather", decimal(values.currentWeather).c_str());
+            if (includeWeather) {
                 write(L"bWeatherOpacity", values.weatherOpacity ? L"1" : L"0");
+                write(L"bWaterShadows", values.waterShadows ? L"1" : L"0");
+                write(L"bNightShadows", values.nightShadows ? L"1" : L"0");
+            }
             // Rewrite [Weather] only when its pairings change, so hand-written
             // lines stay as written until the player edits a weather in game.
             Values onFile;

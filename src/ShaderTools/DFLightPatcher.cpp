@@ -624,8 +624,13 @@ namespace SIE
 		// additional direct-light lobes added by CS features such as wetness.
 		const bool communitySun = DXBCPatcher::IsCommunitySunCandidate(
 			bytes.data(), bytes.size());
+		const bool waterSun = !communitySun && DXBCPatcher::IsWaterSunCandidate(
+			bytes.data(), bytes.size());
 		ID3DBlob* patchedBlob = communitySun
 			? DXBCPatcher::PatchCommunitySunShader(
+				vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo)
+			: waterSun
+			? DXBCPatcher::PatchWaterSunShader(
 				vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo)
 			: DXBCPatcher::PatchSunShadowShader(
 				vanillaBlob, cachedSunPatch, cachedFactorTempRegister, &patchInfo);
@@ -682,7 +687,10 @@ namespace SIE
 		}
 		// Keep the validated bytes for a future device generation. Unsupported
 		// bytecode is the only classified data removed from this bounded cache.
-		ready.store(true, std::memory_order_release);
+		// Water alone cannot make the patcher ready: the mask it reads is only
+		// built for sunlight.
+		if (!waterSun)
+			ready.store(true, std::memory_order_release);
 
 		static std::atomic<uint32_t> runtimePatchCount = 0;
 		uint32_t n = ++runtimePatchCount;
@@ -759,6 +767,16 @@ namespace SIE
 			if (!vanillaPS || !IsDirectionalSunDescriptor(pixelDescriptor))
 				return nullptr;
 			const uint64_t hash = LookupPSHash(vanillaPS);
+			return hash ? AcquirePatchedShader(hash) : nullptr;
+		} catch (...) {
+			return nullptr;
+		}
+	}
+
+	ID3D11PixelShader* DFLightPatcher::AcquireWater(ID3D11PixelShader* vanillaPS) noexcept
+	{
+		try {
+			const uint64_t hash = vanillaPS ? LookupPSHash(vanillaPS) : 0;
 			return hash ? AcquirePatchedShader(hash) : nullptr;
 		} catch (...) {
 			return nullptr;
@@ -880,7 +898,8 @@ namespace SIE
 			// non-DFLight shaders are never copied, and their hashes are never
 			// examined again.
 			if (!DXBCPatcher::IsSunShadowCandidate(bytes, size) &&
-				!DXBCPatcher::IsCommunitySunCandidate(bytes, size)) {
+				!DXBCPatcher::IsCommunitySunCandidate(bytes, size) &&
+				!DXBCPatcher::IsWaterSunCandidate(bytes, size)) {
 				std::unique_lock mapLock(patchedMapMutex);
 				unsupportedHashes.insert(hash);
 				return;
