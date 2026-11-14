@@ -215,11 +215,17 @@ namespace FO4CS::McmSettingsFile
         return migrated;
     }
 
-    // The opacity a weather uses: its pairing, or Shadow opacity.
-    [[nodiscard]] inline float OpacityFor(const Values& values, const std::string& key) noexcept
+    // The opacity a weather uses: its pairing, else the pairing of the slider
+    // it follows (`slider`, see WeatherSliders.h), else Shadow opacity.
+    [[nodiscard]] inline float OpacityFor(const Values& values, const std::string& key,
+        const std::string& slider = {}) noexcept
     {
-        const auto found = values.weathers.find(key);
-        return found != values.weathers.end() ? found->second : values.opacity;
+        if (const auto found = values.weathers.find(key); found != values.weathers.end())
+            return found->second;
+        if (!slider.empty())
+            if (const auto found = values.weathers.find(slider); found != values.weathers.end())
+                return found->second;
+        return values.opacity;
     }
 
     // Slider values pass through MCM's own float formatting.
@@ -436,5 +442,43 @@ namespace FO4CS::McmSettingsFile
             std::filesystem::remove(temporary, ignored);
             throw;
         }
+    }
+
+    // MCM shows a weather slider while its hidden switch, [Sliders]
+    // bShow<key>, is 1. A key missing from the user file takes the shipped
+    // default (1, shown). Only values that differ are written; true when the
+    // file changed.
+    inline bool WriteSliderVisibility(const std::filesystem::path& path, const std::filesystem::path& defaults,
+        const std::map<std::string, bool>& visible)
+    {
+        std::vector<std::pair<std::wstring, bool>> changes;
+        for (const auto& [key, shown] : visible) {
+            const std::wstring name = L"bShow" + std::wstring(key.begin(), key.end());
+            const auto fallback = GetPrivateProfileIntW(L"Sliders", name.c_str(), 1, defaults.c_str());
+            const auto current = GetPrivateProfileIntW(L"Sliders", name.c_str(), static_cast<INT>(fallback), path.c_str());
+            if ((current != 0) != shown)
+                changes.emplace_back(name, shown);
+        }
+        if (changes.empty())
+            return false;
+        std::filesystem::create_directories(path.parent_path());
+        auto temporary = path;
+        temporary += L"." + std::to_wstring(GetCurrentProcessId()) + L"." +
+            std::to_wstring(GetTickCount64()) + L".sliders.tmp";
+        try {
+            if (std::filesystem::exists(path))
+                std::filesystem::copy_file(path, temporary);
+            for (const auto& [name, shown] : changes)
+                if (!WritePrivateProfileStringW(L"Sliders", name.c_str(), shown ? L"1" : L"0", temporary.c_str()))
+                    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "write MCM slider visibility");
+            WritePrivateProfileStringW(nullptr, nullptr, nullptr, temporary.c_str());
+            if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_WRITE_THROUGH | MOVEFILE_REPLACE_EXISTING))
+                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "replace MCM settings");
+        } catch (...) {
+            std::error_code ignored;
+            std::filesystem::remove(temporary, ignored);
+            throw;
+        }
+        return true;
     }
 }

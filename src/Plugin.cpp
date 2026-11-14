@@ -4218,7 +4218,7 @@ extern "C" DLLEXPORT constinit FO4CS::F4SECompat::PluginVersionData
 F4SEPlugin_Version = []() constexpr {
     FO4CS::F4SECompat::PluginVersionData v{};
     v.SetPluginName("FO4CloudShadows");
-    v.SetPluginVersion({ 1, 3, 0, 0 });
+    v.SetPluginVersion({ 1, 3, 1, 0 });
     v.UsesSignatureScanning(false);
     // F4SE checks for an installed database when these bits are set, before
     // calling Load. Built-in addresses use the explicit version list below.

@@ -1,3 +1,9 @@
+# Version 1.3.1 — 14 November 2026
+
+- Weather sliders now also apply to Vivid Weathers, NAC X and other weather mods.
+- Weathers without their own slider now follow the closest matching one.
+- MCM only shows the weather sliders your load order uses.
+
 # Version 1.3 — 13 November 2026
 
 - Cloud shadows now darken water, except in VR.

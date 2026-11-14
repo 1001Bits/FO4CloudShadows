@@ -4,6 +4,8 @@
 #include "McmSettingsFile.h"
 
 #include <cstdint>
+#include <map>
+#include <string>
 
 namespace FO4CS::McmSettings
 {
@@ -24,4 +26,7 @@ namespace FO4CS::McmSettings
     std::uint64_t WriteSaved(const McmSettingsFile::Values& values) noexcept;
     // True once the write for `ticket` (or a later one) has failed.
     bool SaveFailed(std::uint64_t ticket) noexcept;
+    // Saves which of the 12 weather sliders MCM shows (vanilla key -> shown),
+    // writing only what changed. Any thread; serialized with the writer.
+    void PublishSliderVisibility(const std::map<std::string, bool>& visible) noexcept;
 }

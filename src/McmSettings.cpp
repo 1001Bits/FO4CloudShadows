@@ -142,7 +142,7 @@ namespace FO4CS::McmSettings
             const auto key = WeatherOpacity::CurrentWeather().key;
             if (key.empty())
                 return;
-            const float desired = McmSettingsFile::OpacityFor(*saved, key);
+            const float desired = McmSettingsFile::OpacityFor(*saved, key, WeatherOpacity::SliderFor(key));
             if (!McmSettingsFile::SliderMoved(saved->currentWeather, desired))
                 return;
             const auto baseline = *saved;
@@ -204,6 +204,10 @@ namespace FO4CS::McmSettings
             // now would revert the edit being saved for one poll.
             if (!force && WriteInFlight())
                 return true;
+            // Weather mods' weathers follow the sliders, and unused sliders are
+            // hidden, once the load order's weathers are listed (background).
+            if (saved && saved->weatherOpacity)
+                (void)WeatherOpacity::Catalog();
             const std::array before{ Inspect(defaults), Inspect(user) };
             if (!force && lastRead && *lastRead == before) {
                 SyncCurrentWeatherSlider();
@@ -348,5 +352,17 @@ namespace FO4CS::McmSettings
             return true;
         std::lock_guard lock(writer.mutex);
         return writer.lastFailed >= ticket;
+    }
+
+    void PublishSliderVisibility(const std::map<std::string, bool>& visible) noexcept
+    {
+        try {
+            if (!Available()) return;
+            std::lock_guard lock(writeMutex);
+            if (McmSettingsFile::WriteSliderVisibility(user, defaults, visible))
+                SPDLOG_INFO("[CloudShadows][MCM] Saved which weather sliders MCM shows; MCM applies it when it next reloads its settings");
+        } catch (const std::exception& error) {
+            SPDLOG_ERROR("[CloudShadows][MCM] Could not save weather slider visibility: {}", error.what());
+        }
     }
 }

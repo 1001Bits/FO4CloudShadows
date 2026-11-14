@@ -2,7 +2,9 @@
 #include "PCH.h"
 #include "WeatherOpacity.h"
 #include "EngineAPI.h"
+#include "McmSettings.h"
 #include "PluginWeatherScan.h"
+#include "WeatherSliders.h"
 
 #include <algorithm>
 #include <chrono>
@@ -34,10 +36,17 @@ namespace FO4CS::WeatherOpacity
             Clock::time_point last{};
         };
 
+        struct CatalogData
+        {
+            std::vector<Entry> entries;
+            // Weather key -> the vanilla slider it follows without its own pairing.
+            std::map<std::string, std::string> sliderOf;
+        };
+
         struct CatalogState
         {
             std::mutex mutex;
-            std::shared_ptr<const std::vector<Entry>> entries;
+            std::shared_ptr<const CatalogData> data;
             bool started{};
         };
 
@@ -67,7 +76,15 @@ namespace FO4CS::WeatherOpacity
             return keys;
         }
 
-        // Caller holds state.mutex.
+        [[nodiscard]] std::shared_ptr<const CatalogData> ReadyCatalog() noexcept
+        {
+            std::lock_guard lock(catalog.mutex);
+            return catalog.data;
+        }
+
+        // Caller holds state.mutex (then the catalog's; never the reverse). A
+        // weather's own pairing, else the pairing of the slider it follows,
+        // else NaN: Shadow opacity.
         [[nodiscard]] float Resolve(const void* weather, float global)
         {
             auto [it, inserted] = state.resolved.try_emplace(
@@ -76,10 +93,21 @@ namespace FO4CS::WeatherOpacity
                 std::uint32_t formID{};
                 std::string plugin;
                 if (EngineAPI::ReadFormIdentity(weather, formID, plugin)) {
-                    for (const auto& key : KeysFor(formID, plugin)) {
+                    const auto keys = KeysFor(formID, plugin);
+                    for (const auto& key : keys) {
                         if (const auto found = state.weathers.find(key); found != state.weathers.end()) {
                             it->second = found->second;
                             break;
+                        }
+                    }
+                    if (std::isnan(it->second)) {
+                        if (const auto data = ReadyCatalog()) {
+                            const auto slider = data->sliderOf.find(keys.front());
+                            if (slider != data->sliderOf.end()) {
+                                const auto found = state.weathers.find(slider->second);
+                                if (found != state.weathers.end())
+                                    it->second = found->second;
+                            }
                         }
                     }
                 }
@@ -87,61 +115,49 @@ namespace FO4CS::WeatherOpacity
             return std::isnan(it->second) ? global : it->second;
         }
 
-        // FX lighting and interior weathers are listed by regions but never
-        // cast cloud shadows.
-        [[nodiscard]] bool Hidden(const std::string& editorId)
-        {
-            const auto name = Lower(editorId);
-            return name.starts_with("fx") || name.find("interior") != std::string::npos;
-        }
-
-        [[nodiscard]] std::vector<Entry> Build(const std::vector<std::string>& plugins)
+        [[nodiscard]] CatalogData Build(const std::vector<std::string>& plugins,
+            std::map<std::string, bool>& visible)
         {
             const auto started = Clock::now();
             std::array<wchar_t, 32768> executable{};
             const auto length = GetModuleFileNameW(nullptr, executable.data(),
                 static_cast<DWORD>(executable.size()));
-            const auto data = fs::path(std::wstring(executable.data(), length)).parent_path() / L"Data";
+            const auto dataDir = fs::path(std::wstring(executable.data(), length)).parent_path() / L"Data";
 
-            struct Known
-            {
-                std::string editorId, plugin;
-                std::size_t order{};
-            };
-            std::map<std::string, Known> names;
-            std::set<std::string> referenced;
+            std::vector<WeatherSliders::PluginScan> scans;
+            scans.reserve(plugins.size());
             std::uint32_t compressed = 0, unreadable = 0;
-            for (std::size_t i = 0; i < plugins.size(); ++i) {
-                std::ifstream input(data / plugins[i], std::ios::binary);
-                const auto scan = input ? PluginWeatherScan::Scan(input) : std::nullopt;
+            for (const auto& name : plugins) {
+                std::ifstream input(dataDir / name, std::ios::binary);
+                auto scan = input ? PluginWeatherScan::Scan(input) : std::nullopt;
                 if (!scan) {
                     ++unreadable;
                     continue;
                 }
                 compressed += scan->compressedSkipped;
-                // Masters load first, so the defining plugin names a weather.
-                for (const auto& [id, editorId] : scan->weathers)
-                    if (const auto key = PluginWeatherScan::KeyFor(*scan, plugins[i], id))
-                        names.try_emplace(*key, Known{ editorId, plugins[i], i });
-                for (const auto id : scan->references)
-                    if (const auto key = PluginWeatherScan::KeyFor(*scan, plugins[i], id))
-                        referenced.insert(*key);
+                scans.push_back({ name, std::move(*scan) });
             }
+            const auto plan = WeatherSliders::BuildPlan(scans);
+            visible = WeatherSliders::Visibility(plan);
 
-            std::vector<Entry> entries;
-            std::set<std::string> listed;
-            for (const auto& vanilla : McmSettingsFile::kVanillaWeathers) {
-                entries.push_back({ std::string(vanilla.key), std::string(vanilla.label), "Fallout4.esm" });
-                listed.insert(std::string(vanilla.key));
+            CatalogData result;
+            result.sliderOf = plan.sliderOf;
+            std::set<std::string> vanilla;
+            std::string shown, hidden;
+            for (const auto& weather : McmSettingsFile::kVanillaWeathers) {
+                const std::string key(weather.key);
+                vanilla.insert(key);
+                auto& names = visible.at(key) ? shown : hidden;
+                names += (names.empty() ? "" : ", ") + std::string(weather.label);
+                if (visible.at(key))
+                    result.entries.push_back({ key, std::string(weather.label), "Fallout4.esm" });
             }
             std::vector<std::pair<std::size_t, Entry>> others;
-            for (const auto& key : referenced) {
-                if (listed.contains(key))
+            for (const auto& key : plan.used) {
+                if (vanilla.contains(key))
                     continue;
-                const auto known = names.find(key);
-                const bool named = known != names.end();
-                if (named && Hidden(known->second.editorId))
-                    continue;
+                const auto known = plan.weathers.find(key);
+                const bool named = known != plan.weathers.end();
                 const auto bar = key.find('|');
                 const std::string plugin = named ? known->second.plugin
                     : bar == std::string::npos ? "Fallout4.esm" : key.substr(0, bar);
@@ -149,25 +165,21 @@ namespace FO4CS::WeatherOpacity
                     : bar == std::string::npos ? key : key.substr(bar + 1);
                 if (Lower(plugin) != "fallout4.esm")
                     label += " (" + plugin + ")";
-                others.push_back({ named ? known->second.order : plugins.size(), { key, label, plugin } });
+                others.push_back({ named ? known->second.order : scans.size(), { key, label, plugin } });
             }
             std::sort(others.begin(), others.end(), [](const auto& a, const auto& b) {
                 return a.first != b.first ? a.first < b.first : a.second.label < b.second.label;
             });
             for (auto& [order, entry] : others)
-                entries.push_back(std::move(entry));
+                result.entries.push_back(std::move(entry));
             SPDLOG_INFO("[CloudShadows][Weather] Listed {} weathers from {} plugins in {} ms "
                 "({} compressed records skipped, {} plugins unreadable)",
-                entries.size(), plugins.size(),
+                result.entries.size(), plugins.size(),
                 std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - started).count(),
                 compressed, unreadable);
-            return entries;
-        }
-
-        [[nodiscard]] std::shared_ptr<const std::vector<Entry>> ReadyCatalog() noexcept
-        {
-            std::lock_guard lock(catalog.mutex);
-            return catalog.entries;
+            SPDLOG_INFO("[CloudShadows][Weather] {} weathers follow a slider; sliders shown: {}; hidden: {}",
+                plan.sliderOf.size(), shown.empty() ? "none" : shown, hidden.empty() ? "none" : hidden);
+            return result;
         }
     }
 
@@ -219,26 +231,52 @@ namespace FO4CS::WeatherOpacity
     {
         try {
             std::lock_guard lock(catalog.mutex);
-            if (catalog.entries || catalog.started)
-                return catalog.entries;
+            if (catalog.data)
+                return std::shared_ptr<const std::vector<Entry>>(catalog.data, &catalog.data->entries);
+            if (catalog.started)
+                return nullptr;
             auto plugins = EngineAPI::ReadLoadedPluginNames();
             if (plugins.empty())
                 return nullptr;  // game data not loaded yet; asked again later
             catalog.started = true;
             std::thread([plugins = std::move(plugins)] {
-                std::shared_ptr<const std::vector<Entry>> built;
+                std::shared_ptr<const CatalogData> built;
+                std::map<std::string, bool> visible;
                 try {
-                    built = std::make_shared<const std::vector<Entry>>(Build(plugins));
+                    built = std::make_shared<const CatalogData>(Build(plugins, visible));
                 } catch (const std::exception& error) {
                     SPDLOG_ERROR("[CloudShadows][Weather] Could not list weathers: {}", error.what());
-                    built = std::make_shared<const std::vector<Entry>>();
+                    built = std::make_shared<const CatalogData>();
+                    visible.clear();
                 }
-                std::lock_guard done(catalog.mutex);
-                catalog.entries = std::move(built);
+                {
+                    std::lock_guard done(catalog.mutex);
+                    catalog.data = std::move(built);
+                }
+                {
+                    // Weathers resolved before the catalog existed may follow a slider now.
+                    std::lock_guard resolved(state.mutex);
+                    state.resolved.clear();
+                }
+                if (!visible.empty())
+                    McmSettings::PublishSliderVisibility(visible);
             }).detach();
         } catch (...) {
         }
         return nullptr;
+    }
+
+    std::string SliderFor(const std::string& key) noexcept
+    {
+        try {
+            const auto data = ReadyCatalog();
+            if (!data)
+                return {};
+            const auto found = data->sliderOf.find(key);
+            return found != data->sliderOf.end() ? found->second : std::string{};
+        } catch (...) {
+            return {};
+        }
     }
 
     Entry CurrentWeather() noexcept
@@ -251,8 +289,8 @@ namespace FO4CS::WeatherOpacity
                 !EngineAPI::ReadFormIdentity(weather.current, formID, plugin))
                 return {};
             Entry entry{ KeysFor(formID, plugin).front(), {}, plugin };
-            if (const auto list = ReadyCatalog()) {
-                for (const auto& listed : *list) {
+            if (const auto data = ReadyCatalog()) {
+                for (const auto& listed : data->entries) {
                     if (listed.key == entry.key) {
                         entry.label = listed.label;
                         break;

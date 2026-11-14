@@ -83,28 +83,41 @@ namespace FO4CS::MenuFrameworkPage
                 ui.wrapped("%s", text);
         }
 
-        // Caller holds the mutex. Unpaired weathers show Shadow opacity and
-        // gain a pairing when moved; Reset removes it again.
+        // Caller holds the mutex. Unpaired weathers show the opacity of the
+        // vanilla slider they follow (or Shadow opacity) and gain a pairing
+        // when moved; Reset removes it again.
         void WeatherRow(const WeatherOpacity::Entry& weather, bool current)
         {
             const auto found = edited.weathers.find(weather.key);
             const bool paired = found != edited.weathers.end();
-            float value = paired ? found->second : edited.opacity;
+            const auto follows = WeatherOpacity::SliderFor(weather.key);
+            std::string followLabel;
+            if (!follows.empty() && follows != weather.key)
+                for (const auto& vanilla : McmSettingsFile::kVanillaWeathers)
+                    if (vanilla.key == follows)
+                        followLabel = std::string(vanilla.label);
+            const auto inherited = followLabel.empty() ? edited.weathers.end() : edited.weathers.find(follows);
+            const bool inherits = inherited != edited.weathers.end();
+            float value = paired ? found->second : inherits ? inherited->second : edited.opacity;
             const auto label = weather.label + (current ? "  (current)" : "") + "##w" + weather.key;
-            if (ui.sliderFloat(label.c_str(), &value, 0.0f, 4.0f,
-                    paired ? "%.2f" : "%.2f (Shadow opacity)", 0)) {
+            const std::string format = paired ? "%.2f" : inherits ? "%.2f (" + followLabel + ")" : "%.2f (Shadow opacity)";
+            if (ui.sliderFloat(label.c_str(), &value, 0.0f, 4.0f, format.c_str(), 0)) {
                 edited.weathers[weather.key] = value;
                 edited = McmSettingsFile::Validate(edited);
             }
             const auto help = weather.plugin + " " + weather.key.substr(weather.key.find('|') + 1) +
-                (paired ? "" : "\nUntil you move this slider, the weather uses Shadow opacity.");
+                (paired ? std::string{} : !followLabel.empty()
+                    ? "\nUntil you move this slider, the weather follows the " + followLabel + " slider."
+                    : std::string("\nUntil you move this slider, the weather uses Shadow opacity."));
             Tooltip(help.c_str());
             if (paired) {
                 if (ui.sameLine)
                     ui.sameLine(0.0f, -1.0f);
                 if (ui.button(("Reset##r" + weather.key).c_str()))
                     edited.weathers.erase(weather.key);
-                Tooltip("Use Shadow opacity for this weather again.");
+                const auto reset = !followLabel.empty() ? "Follow the " + followLabel + " slider again."
+                    : std::string("Use Shadow opacity for this weather again.");
+                Tooltip(reset.c_str());
             }
         }
 
@@ -113,8 +126,8 @@ namespace FO4CS::MenuFrameworkPage
         {
             ui.checkbox("Weather specific cloud opacity", &edited.weatherOpacity);
             Tooltip("Each weather can use its own shadow opacity. The opacity fades gradually when "
-                "the weather changes. Weathers you have not changed use Shadow opacity. "
-                "Off by default.");
+                "the weather changes. A weather you have not changed follows the vanilla weather "
+                "slider its name or type matches, else Shadow opacity. Off by default.");
             if (!edited.weatherOpacity)
                 return;
             const auto current = WeatherOpacity::CurrentWeather();

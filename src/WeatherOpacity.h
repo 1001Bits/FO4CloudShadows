@@ -48,10 +48,15 @@ namespace FO4CS::WeatherOpacity
         std::string plugin;   // defining plugin file name
     };
 
-    // Weathers used by the loaded climates and regions, vanilla outdoor
-    // weathers first. Built once on a background thread from the plugin files;
-    // null until ready. Call after the game data has loaded.
+    // Weathers used by the loaded climates and regions, the vanilla outdoor
+    // weathers whose MCM slider is in use first. Built once on a background
+    // thread from the plugin files; null until ready. Call after the game data
+    // has loaded. Building it also publishes which MCM sliders are shown.
     [[nodiscard]] std::shared_ptr<const std::vector<Entry>> Catalog() noexcept;
+
+    // The vanilla slider key a weather follows when it has no opacity of its
+    // own (see WeatherSliders.h), or empty before the catalog is built.
+    [[nodiscard]] std::string SliderFor(const std::string& key) noexcept;
 
     // The sky's current weather, or an empty key when unavailable.
     [[nodiscard]] Entry CurrentWeather() noexcept;

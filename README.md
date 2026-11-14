@@ -9,9 +9,11 @@ in at sunrise, following the current climate, with nothing running in between.
 On desktop they also fall on water: sun highlights go out and the water's colour
 darkens. Water is unchanged in VR.
 
-Weather specific cloud opacity gives each weather its own strength. MCM's Current
-weather slider sets whichever weather is active, so it works with DLC and weather
-mods such as Vivid Weathers, which replace the vanilla weathers.
+Weather specific cloud opacity gives each weather its own strength. The weather
+sliders also cover DLC and weather mods such as Vivid Weathers and NAC X: a weather
+follows the slider its name matches (fog, rain, clear and so on), otherwise the one
+for its type, and MCM shows only the sliders the loaded weathers use. MCM's Current
+weather slider sets just the weather that is active.
 
 The cloud map is a small cubemap. A compute pass reconstructs surface positions
 from scene depth, projects them into the world-anchored cloud field and supplies

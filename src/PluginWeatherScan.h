@@ -18,11 +18,28 @@ namespace FO4CS::PluginWeatherScan
     // What one plugin file says about weathers. Form IDs are as stored in the
     // file: the top byte indexes `masters`, or is the file itself when it
     // equals masters.size().
+    struct Weather
+    {
+        std::uint32_t id{};
+        std::string editorId;
+        // DATA classification flags: 1 pleasant, 2 cloudy, 4 rainy, 8 snow
+        // (the game's radstorms use snow).
+        std::uint8_t kind{};
+    };
+    // A climate (CLMT WLST) or region (REGN RDWT) and the weathers it lists.
+    // Every such record is kept, even without a list: an override that drops
+    // the list leaves the climate or region without those weathers.
+    struct WeatherList
+    {
+        std::uint32_t id{};
+        bool region{};
+        std::vector<std::uint32_t> weathers;
+    };
     struct Result
     {
         std::vector<std::string> masters;
-        std::vector<std::pair<std::uint32_t, std::string>> weathers;  // WTHR form ID, EDID
-        std::vector<std::uint32_t> references;  // weathers used by CLMT WLST and REGN RDWT
+        std::vector<Weather> weathers;
+        std::vector<WeatherList> lists;
         std::uint32_t compressedSkipped{};
     };
 
@@ -79,7 +96,7 @@ namespace FO4CS::PluginWeatherScan
             }
         }
 
-        inline void WeatherList(std::string_view entries, std::vector<std::uint32_t>& out)
+        inline void ReadWeatherList(std::string_view entries, std::vector<std::uint32_t>& out)
         {
             // CLMT WLST and REGN RDWT: { weather, chance, global } per entry.
             for (; entries.size() >= 12; entries.remove_prefix(12)) {
@@ -135,14 +152,20 @@ namespace FO4CS::PluginWeatherScan
                     if (!input.read(data.data(), record.size))
                         return result;
                     std::string editorId;
+                    std::uint8_t kind = 0;
+                    std::vector<std::uint32_t> listed;
                     Subrecords(data, [&](std::string_view type, std::string_view payload) {
                         if (weather && type == "EDID")
                             editorId.assign(payload.data(), strnlen(payload.data(), payload.size()));
+                        else if (weather && type == "DATA" && payload.size() > 11)
+                            kind = static_cast<std::uint8_t>(payload[11] & 0x0F);
                         else if ((climate && type == "WLST") || (region && type == "RDWT"))
-                            WeatherList(payload, result.references);
+                            ReadWeatherList(payload, listed);
                     });
                     if (weather)
-                        result.weathers.emplace_back(record.formID, std::move(editorId));
+                        result.weathers.push_back({ record.formID, std::move(editorId), kind });
+                    else
+                        result.lists.push_back({ record.formID, region, std::move(listed) });
                 }
             }
             input.clear();

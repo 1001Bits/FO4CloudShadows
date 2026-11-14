@@ -30,7 +30,7 @@ using Microsoft::WRL::ComPtr;
 #define DLLEXPORT __declspec(dllexport)
 
 #ifndef FO4CLOUDSHADOWS_VERSION_STR
-#define FO4CLOUDSHADOWS_VERSION_STR "1.3.0"
+#define FO4CLOUDSHADOWS_VERSION_STR "1.3.1"
 #endif
 #ifndef FO4CS_BUILD_ID
 #define FO4CS_BUILD_ID "untracked"

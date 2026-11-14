@@ -57,99 +57,171 @@
       }
     },
     {
+      "id": "bShow02B52A:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 2,
+      "valueOptions": { "sourceType": "ModSettingBool" }
+    },
+    {
       "id": "f02B52A:Weather",
       "type": "slider",
       "text": "    Clear",
-      "help": "Shadow opacity during clear weather.",
-      "groupCondition": 1,
+      "help": "Opacity for clear weathers, including mods.",
+      "groupCondition": { "AND": [1, 2] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1D670E:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 3,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1D670E:Weather",
       "type": "slider",
       "text": "    Clearest skies",
-      "help": "Shadow opacity during clearest skies weather.",
-      "groupCondition": 1,
+      "help": "Opacity for clearest skies weathers, including mods.",
+      "groupCondition": { "AND": [1, 3] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1C8556:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 4,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1C8556:Weather",
       "type": "slider",
       "text": "    Overcast",
-      "help": "Shadow opacity during overcast weather.",
-      "groupCondition": 1,
+      "help": "Opacity for overcast weathers, including mods.",
+      "groupCondition": { "AND": [1, 4] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1C3473:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 5,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1C3473:Weather",
       "type": "slider",
       "text": "    Foggy",
-      "help": "Shadow opacity during foggy weather.",
-      "groupCondition": 1,
+      "help": "Opacity for foggy weathers, including mods.",
+      "groupCondition": { "AND": [1, 5] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1CC186:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 6,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1CC186:Weather",
       "type": "slider",
       "text": "    Misty",
-      "help": "Shadow opacity during misty weather.",
-      "groupCondition": 1,
+      "help": "Opacity for misty weathers, including mods.",
+      "groupCondition": { "AND": [1, 6] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1CD096:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 7,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1CD096:Weather",
       "type": "slider",
       "text": "    Misty rain",
-      "help": "Shadow opacity during misty rain weather.",
-      "groupCondition": 1,
+      "help": "Opacity for misty rain weathers, including mods.",
+      "groupCondition": { "AND": [1, 7] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1CA7E4:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 8,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1CA7E4:Weather",
       "type": "slider",
       "text": "    Rain",
-      "help": "Shadow opacity during rain weather.",
-      "groupCondition": 1,
+      "help": "Opacity for rain weathers, including mods.",
+      "groupCondition": { "AND": [1, 8] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow1C3D5E:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 9,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f1C3D5E:Weather",
       "type": "slider",
       "text": "    Radstorm",
-      "help": "Shadow opacity during radstorm weather.",
-      "groupCondition": 1,
+      "help": "Opacity for radstorm weathers, including mods.",
+      "groupCondition": { "AND": [1, 9] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow0F1033:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 10,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f0F1033:Weather",
       "type": "slider",
       "text": "    Glowing Sea overcast",
-      "help": "Shadow opacity during Glowing Sea overcast weather.",
-      "groupCondition": 1,
+      "help": "Opacity for Glowing Sea overcast weathers, including mods.",
+      "groupCondition": { "AND": [1, 10] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow10F781:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 11,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f10F781:Weather",
       "type": "slider",
       "text": "    Marsh overcast",
-      "help": "Shadow opacity during marsh overcast weather.",
-      "groupCondition": 1,
+      "help": "Opacity for marsh overcast weathers, including mods.",
+      "groupCondition": { "AND": [1, 11] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow115C64:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 12,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f115C64:Weather",
       "type": "slider",
       "text": "    Goodneighbor",
-      "help": "Shadow opacity during Goodneighbor weather.",
-      "groupCondition": 1,
+      "help": "Opacity for Goodneighbor weathers, including mods.",
+      "groupCondition": { "AND": [1, 12] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
+    },
+    {
+      "id": "bShow12A18E:Sliders",
+      "type": "hiddenSwitcher",
+      "groupControl": 13,
+      "valueOptions": { "sourceType": "ModSettingBool" }
     },
     {
       "id": "f12A18E:Weather",
       "type": "slider",
       "text": "    Sanctuary (pre-war)",
-      "help": "Shadow opacity during Sanctuary (pre-war) weather.",
-      "groupCondition": 1,
+      "help": "Opacity for Sanctuary (pre-war) weathers, including mods.",
+      "groupCondition": { "AND": [1, 13] },
       "valueOptions": { "sourceType": "ModSettingFloat", "min": 0.0, "max": 4.0, "step": 0.05 }
     },
     {

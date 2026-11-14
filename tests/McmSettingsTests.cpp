@@ -4,8 +4,11 @@
 #include "EnbCompat.h"
 #include "PluginWeatherScan.h"
 #include "WeatherOpacity.h"
+#include "WeatherSliders.h"
 #include <nlohmann/json.hpp>
+#include <algorithm>
 #include <fstream>
+#include <map>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -257,8 +260,10 @@ int main(int argc, char** argv)
             std::string plugin = record("TES4", 0, sub("HEDR", std::string(12, '\0')) +
                 sub("MAST", std::string("Fallout4.esm\0", 13)) + sub("DATA", std::string(8, '\0')));
             plugin += group("GMST", record("GMST", 0x01000900, sub("EDID", std::string("fIgnored\0", 9))));
+            std::string rainyData(20, '\0');
+            rainyData[11] = 4;  // classification: rainy
             plugin += group("WTHR",
-                record("WTHR", 0x01000801, sub("EDID", std::string("MyStormyWeather\0", 16))) +
+                record("WTHR", 0x01000801, sub("EDID", std::string("MyStormyWeather\0", 16)) + sub("DATA", rainyData)) +
                 record("WTHR", 0x0002B52A, sub("EDID", std::string("CommonwealthClear\0", 18))) +
                 record("WTHR", 0x01000802, std::string(16, 'z'), 0x00040000));
             plugin += group("CLMT", record("CLMT", 0x01000810,
@@ -268,10 +273,14 @@ int main(int argc, char** argv)
             std::istringstream input(plugin);
             const auto scan = FO4CS::PluginWeatherScan::Scan(input);
             Require(scan && scan->masters == std::vector<std::string>{ "Fallout4.esm" } &&
-                scan->weathers.size() == 2 && scan->weathers[0].second == "MyStormyWeather" &&
-                scan->compressedSkipped == 1 &&
-                scan->references == std::vector<std::uint32_t>{ 0x01000801, 0x0002B52A, 0x01000803 },
-                "plugin scan reads masters, weather names and climate/region weather lists");
+                scan->weathers.size() == 2 && scan->weathers[0].editorId == "MyStormyWeather" &&
+                scan->weathers[0].kind == 4 && scan->weathers[1].kind == 0 &&
+                scan->compressedSkipped == 1 && scan->lists.size() == 2 &&
+                scan->lists[0].id == 0x01000810 && !scan->lists[0].region &&
+                scan->lists[0].weathers == std::vector<std::uint32_t>{ 0x01000801, 0x0002B52A } &&
+                scan->lists[1].id == 0x01000820 && scan->lists[1].region &&
+                scan->lists[1].weathers == std::vector<std::uint32_t>{ 0x01000803 },
+                "plugin scan reads masters, weather names and types, and each climate's and region's list");
             Require(FO4CS::PluginWeatherScan::KeyFor(*scan, "MyWeathers.esp", 0x01000801) == "myweathers.esp|000801" &&
                 FO4CS::PluginWeatherScan::KeyFor(*scan, "MyWeathers.esp", 0x0002B52A) == "02B52A",
                 "file form IDs map to plugin-local and Fallout4.esm keys");
@@ -290,6 +299,87 @@ int main(int argc, char** argv)
                 stepped = Weather::Fade(stepped, 0.0f, 1.0f / 60.0f);
             Require(std::abs(stepped - Weather::Fade(1.0f, 0.0f, 10.0f)) < 1e-3f,
                 "the fade is independent of frame rate");
+
+            namespace Sliders = FO4CS::WeatherSliders;
+            Require(Sliders::Words("DLC03_RadMistWeather") == std::vector<std::string>{ "dlc", "03", "rad", "mist", "weather" } &&
+                Sliders::Words("CommonwealthGSRadstorm") == std::vector<std::string>{ "commonwealth", "gs", "radstorm" } &&
+                Sliders::Words("VW_Rain_Low_2") == std::vector<std::string>{ "vw", "rain", "low", "2" },
+                "editor IDs split into words at underscores, digits and case changes");
+            const auto slider = [](std::string_view editorId, std::uint8_t kind) {
+                return std::string(Sliders::SliderFor("weathermod.esp|000800", editorId, kind).value_or(""));
+            };
+            Require(slider("VW_Clear_1", 0) == "02B52A" && slider("VW_Cloudy_3", 0) == "1C8556" &&
+                slider("Vivid_Fog_2", 0) == "1C3473" && slider("Vivid_Fog_6_GS", 0) == "0F1033" &&
+                slider("VW_Rain_Low", 0) == "1CA7E4" && slider("VW_RadStorm_2", 0) == "1C3D5E" &&
+                slider("NAC_SunnyFog", 0) == "1C3473" && slider("NAC_MistyOvercast", 0) == "1CC186" &&
+                slider("NAC_MistyRainy", 4) == "1CD096" && slider("NAC_ClearSky", 0) == "02B52A" &&
+                slider("MyClearestDay", 0) == "1D670E" && slider("DLC04NukaWorldClearDusty", 0) == "02B52A" &&
+                slider("SwampFog", 0) == "10F781" && slider("GoodneighborDusk", 0) == "115C64",
+                "weather mod weathers follow the slider their editor ID names");
+            Require(slider("GradientSky", 1) == "02B52A" && slider("RadioTower", 2) == "1C8556",
+                "rad inside or after radio-like words is not a radstorm");
+            Require(slider("MQ203Weather", 8) == "1C3D5E" && slider("DiamondWeatherPastel", 4) == "1CA7E4" &&
+                slider("ConcMuseumWeather", 1) == "02B52A" && slider("Plain", 2) == "1C8556" &&
+                slider("DLC03VirtualWeather01", 0).empty(),
+                "without a telling name a weather follows its classification, else nothing");
+            Require(std::string(Sliders::SliderFor("1CC186", "AnythingElse", 4).value_or("")) == "1CC186",
+                "a vanilla slider weather is its own slider");
+
+            // A base game and a weather mod that overrides its climate.
+            Sliders::PluginScan base{ "Fallout4.esm", {} };
+            base.scan.weathers = { { 0x0002B52A, "CommonwealthClear", 1 }, { 0x001CC186, "CommonwealthMisty", 2 } };
+            base.scan.lists = { { 0x00000100, false, { 0x0002B52A, 0x001CC186 } } };
+            Sliders::PluginScan mod{ "Weathers.esp", {} };
+            mod.scan.masters = { "Fallout4.esm" };
+            mod.scan.weathers = { { 0x01000801, "VW_Clear_1", 1 }, { 0x01000802, "Vivid_Fog_2", 2 },
+                { 0x01000803, "Odd_Weather", 4 }, { 0x01000804, "FXLightning", 0 } };
+            mod.scan.lists = { { 0x00000100, false, { 0x01000801, 0x01000802 } },
+                { 0x01000900, true, { 0x01000803, 0x01000804 } } };
+            const auto plan = Sliders::BuildPlan({ base, mod });
+            Require(plan.used == std::set<std::string>{ "weathers.esp|000801", "weathers.esp|000802", "weathers.esp|000803" },
+                "the winning climate list replaces the base game's, and lighting-only weathers are not used");
+            Require(plan.sliderOf.at("weathers.esp|000801") == "02B52A" && plan.sliderOf.at("weathers.esp|000802") == "1C3473" &&
+                plan.sliderOf.at("weathers.esp|000803") == "1CA7E4" && plan.sliderOf.at("1CC186") == "1CC186",
+                "every weather record knows the slider it follows");
+            const auto visible = Sliders::Visibility(plan);
+            Require(visible.size() == 12 && visible.at("02B52A") && visible.at("1C3473") && visible.at("1CA7E4") &&
+                !visible.at("1CC186") && !visible.at("1D670E"),
+                "only sliders a used weather follows are shown");
+            const auto unread = Sliders::Visibility(Sliders::BuildPlan({}));
+            Require(std::all_of(unread.begin(), unread.end(), [](const auto& entry) { return entry.second; }),
+                "with no climate or region lists every slider stays shown");
+
+            Files::Values opacities;
+            opacities.opacity = 0.7f;
+            opacities.weathers["1C3473"] = 0.2f;
+            opacities.weathers["weathers.esp|000802"] = 3.0f;
+            Require(Files::OpacityFor(opacities, "weathers.esp|000802", "1C3473") == 3.0f &&
+                Files::OpacityFor(opacities, "weathers.esp|000805", "1C3473") == 0.2f &&
+                Files::OpacityFor(opacities, "weathers.esp|000806", "1CA7E4") == 0.7f &&
+                Files::OpacityFor(opacities, "weathers.esp|000806") == 0.7f,
+                "a weather's own opacity wins, then its slider's, then Shadow opacity");
+
+            const auto sliderDefaults = user.parent_path() / L"slider-defaults.ini";
+            const auto sliderUser = user.parent_path() / L"slider-user.ini";
+            {
+                std::ofstream output(sliderDefaults, std::ios::binary);
+                output << "[Sliders]\r\nbShow02B52A=1\r\nbShow1CC186=1\r\n";
+            }
+            fs::remove(sliderUser);
+            Require(!Files::WriteSliderVisibility(sliderUser, sliderDefaults, { { "02B52A", true }, { "1CC186", true } }) &&
+                !fs::exists(sliderUser),
+                "all sliders shown as by default writes nothing");
+            Require(Files::WriteSliderVisibility(sliderUser, sliderDefaults, { { "02B52A", true }, { "1CC186", false } }) &&
+                GetPrivateProfileIntW(L"Sliders", L"bShow1CC186", -1, sliderUser.c_str()) == 0 &&
+                GetPrivateProfileIntW(L"Sliders", L"bShow02B52A", -1, sliderUser.c_str()) == -1,
+                "a hidden slider writes only its own switch");
+            Require(!Files::WriteSliderVisibility(sliderUser, sliderDefaults, { { "02B52A", true }, { "1CC186", false } }),
+                "unchanged visibility is not written again");
+            Require(Files::WriteSliderVisibility(sliderUser, sliderDefaults, { { "02B52A", true }, { "1CC186", true } }) &&
+                GetPrivateProfileIntW(L"Sliders", L"bShow1CC186", -1, sliderUser.c_str()) == 1,
+                "a slider that is used again is shown again");
+            fs::remove(sliderUser);
+            fs::remove(sliderDefaults);
         }
 
         const fs::path project = argv[1];
@@ -313,10 +403,33 @@ int main(int argc, char** argv)
             "bEnabled:CloudShadows", "fOpacity:CloudShadows", "bHotkeys:CloudShadows",
             "bWeatherOpacity:CloudShadows", "bWaterShadows:CloudShadows", "bNightShadows:CloudShadows",
             "fCurrentWeather:CloudShadows" };
-        for (const auto& weather : Files::kVanillaWeathers)
+        for (const auto& weather : Files::kVanillaWeathers) {
             expectedControls.insert("f" + std::string(weather.key) + ":Weather");
+            expectedControls.insert("bShow" + std::string(weather.key) + ":Sliders");
+        }
         Require(controls == expectedControls,
-            "MCM exposes the player controls, the vanilla weather sliders and the Development menu switch");
+            "MCM exposes the player controls, the vanilla weather sliders, their hidden switches and the Development menu switch");
+        {
+            // Each weather slider shows while weather-specific opacity (group 1)
+            // and its own hidden switch are both on.
+            std::map<std::string, int> switchGroup;
+            for (const auto& row : menu.at("content"))
+                if (row.value("type", "") == "hiddenSwitcher")
+                    switchGroup[row.at("id").get<std::string>()] = row.at("groupControl").get<int>();
+            for (const auto& row : menu.at("content")) {
+                const auto id = row.value("id", std::string{});
+                if (!id.ends_with(":Weather"))
+                    continue;
+                const auto key = id.substr(1, id.size() - 1 - std::string(":Weather").size());
+                const auto group = switchGroup.find("bShow" + key + ":Sliders");
+                Require(group != switchGroup.end() && group->second > 1 &&
+                    row.at("groupCondition") == nlohmann::json{ { "AND", { 1, group->second } } },
+                    "every weather slider depends on weather-specific opacity and its own hidden switch");
+                Require(GetPrivateProfileIntW(L"Sliders", (L"bShow" + std::wstring(key.begin(), key.end())).c_str(),
+                    -1, (project / "config/MCM/FO4CloudShadows/settings.ini").c_str()) == 1,
+                    "every weather slider is shown by default");
+            }
+        }
         for (const auto& row : menu.at("content")) if (row.contains("help")) {
             const auto help = row.at("help").get<std::string>();
             Require(!help.empty() && help.size() <= 64 && help.back() == '.' && help.find('\n') == std::string::npos &&
